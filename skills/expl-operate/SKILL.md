@@ -28,11 +28,23 @@ yourself — expl does. You only fix what blocks expl from continuing to explore
 
 | Agent | Role | CLI(s) | Replicas |
 | --- | --- | --- | --- |
-| explorer | exploration | claude_code ⇄ codex | 1 |
+| explorer | exploration (mainstream, `weight = 4`) | claude_code ⇄ codex | 1 |
+| fringe | exploration (niche + counterexamples, `weight = 1`) | claude_code ⇄ codex | 1 |
 | planner | planning | claude_code ⇄ codex | 1 |
 | executor | execution | cursor_agent (`--model claude-opus-5-5-high --force --trust --sandbox disabled`) | 1 |
 | evaluator | evaluation | claude_code ⇄ codex | 1 |
 
+- **Two kinds of exploration, routed by `weight`.** `explorer` enumerates the most
+  promising directions; `fringe` deliberately widens the frame — niche directions
+  inside the goal nobody asked for, inversions, and counterexamples (titles start
+  with `Fringe:` / `Counterexample:`). Agents of one role that declare `weight`
+  split that role's events: each event goes to exactly one of them (4:1 here), the
+  other acknowledges it as `routed to …`. Agents without `weight` get every event.
+  To add another exploration perspective, declare another exploration agent with a
+  `weight` and its own `instructions`.
+- **Explore wide, plan narrow.** Explorers list up to `breadth = 8` possibilities
+  without filtering by likelihood; the planner ranks weak or counterproductive steps
+  low and prunes only duplicates. `max_pending = 20` bounds the backlog.
 - **One replica per agent, on purpose.** The owner prefers slow exploration over
   bursts of token use. Do not raise `replicas` without being asked.
 - **Random revisits** (`revisit_cooldown = 600` on the explorer): when the explorer
@@ -40,7 +52,7 @@ yourself — expl does. You only fix what blocks expl from continuing to explore
   reaction, then explores again from a random starting point — the active origin,
   a completed step not yet in the trunk, or a counter-exploration goal
   (`node.revisited` in `expl event ls`). Starting points are revisited again and
-  again; each prompt lists the steps that already exist so new ones are different.
+  again (routed by weight like any exploration event); each prompt lists the steps that already exist so new ones are different.
   `max_pending` still pauses it. Raise the cooldown if token use is too high.
 - **Routing** (`[[agent.<name>.alternative]]`): each invocation starts at the next
   CLI in turn (per process, seeded by pid) and falls over to the other CLI when
@@ -72,6 +84,12 @@ nohup expl-ui -C "$PWD" > .expl/operator/expl-ui.log 2>&1 &   # the live graph w
 expl down -t 30                           # stop all (in-flight runs are interrupted and redelivered)
 expl run executor -d                      # one extra process of an agent
 ```
+
+`skills/expl-operate/scripts/rolling-restart.sh` restarts every process that runs
+an older binary than the installed `expl`, each when it is idle (or has just moved
+on to a new event), so in-flight agent runs are not thrown away. Use it after every
+`cargo install`. `skills/expl-operate/scripts/watch.sh` streams the log lines worth
+acting on (use it as a Monitor; `tail -F` misses processes started later on macOS).
 
 Check the UI is alive with `pgrep -fl expl-ui`; restart it with the line above if not.
 

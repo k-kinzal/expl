@@ -689,3 +689,65 @@ fn idle_exploration_revisits_random_starting_points() {
         .any(|text| text.contains("## Already proposed") && text.contains("- Write hello"));
     assert!(told, "no exploration prompt listed the existing steps");
 }
+
+#[test]
+fn weighted_agents_of_one_role_split_its_events() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let declaration = std::fs::read_to_string(repo.join("expl.toml")).expect("read");
+    let explorer = declaration
+        .split("\n[agent.")
+        .find(|section| section.starts_with("explorer]"))
+        .expect("explorer section")
+        .to_owned();
+    let contrarian = explorer.replacen("explorer]", "contrarian]", 1);
+    std::fs::write(
+        repo.join("expl.toml"),
+        format!(
+            "{}\n[agent.{}weight = 1\n",
+            declaration.replacen("max_pending = 6\n", "max_pending = 6\nweight = 1\n", 1),
+            contrarian.trim_end().to_owned() + "\n"
+        ),
+    )
+    .expect("declaration");
+    for title in ["One", "Two", "Three", "Four", "Five", "Six"] {
+        ok(repo, &["goal", "add", title]);
+    }
+    ok(repo, &["run", "explorer", "--exit-when-idle"]);
+    ok(repo, &["run", "contrarian", "--exit-when-idle"]);
+
+    // Each goal.added was explored by exactly one of the two agents (not
+    // by both), and both agents are done with every one of them.
+    for agent in ["explorer", "contrarian"] {
+        let deliveries = json_lines(&ok(
+            repo,
+            &[
+                "event",
+                "ls",
+                "--agent",
+                agent,
+                "--kind",
+                "goal.added",
+                "--format",
+                "json",
+            ],
+        ));
+        assert_eq!(deliveries.len(), 6);
+        assert!(
+            deliveries.iter().all(|e| e["delivery"] == "done"),
+            "{deliveries:?}"
+        );
+    }
+    // Forward explorations are journaled on the node they start from.
+    let runs = |agent: &str| {
+        node(repo, "1")["agent_runs"]
+            .as_array()
+            .expect("runs")
+            .iter()
+            .filter(|r| r["agent"] == agent)
+            .count()
+    };
+    let (explorer, contrarian) = (runs("explorer"), runs("contrarian"));
+    assert_eq!(explorer + contrarian, 6, "{explorer} + {contrarian}");
+    assert!(explorer > 0 && contrarian > 0, "{explorer} + {contrarian}");
+}

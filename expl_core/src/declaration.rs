@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::agent::DriverKind;
+use crate::event::EventId;
 use crate::project::Project;
 use crate::role::Role;
 
@@ -79,6 +80,14 @@ pub struct AgentDeclaration {
     pub instructions: Option<String>,
     /// Processes `expl up` keeps running.
     pub replicas: usize,
+    /// Share of its role's events. Agents of one role that declare a
+    /// weight split that role's events between them in proportion — each
+    /// event goes to exactly one of them — instead of each reacting to
+    /// every event. Agents without a weight react to every event of their
+    /// role. Use it to route one role across agents with different
+    /// instructions (e.g. a mainstream and a contrarian exploration).
+    #[serde(default)]
+    pub weight: Option<u32>,
     /// Exploration only: maximum steps proposed per reaction.
     #[serde(default)]
     pub breadth: Option<usize>,
@@ -252,6 +261,12 @@ replicas = 1
             {
                 return invalid(name, "`command` is empty");
             }
+            if agent.weight == Some(0) {
+                return invalid(
+                    name,
+                    "`weight` must be >= 1 (leave it out to receive every event)",
+                );
+            }
             match agent.role {
                 Role::Exploration => {
                     if agent.breadth.is_none_or(|b| b == 0) {
@@ -278,6 +293,32 @@ replicas = 1
         Ok(())
     }
 
+    /// When the agent named `agent` shares its role's events by weight,
+    /// the agent `event` is routed to (possibly `agent` itself); `None`
+    /// when `agent` declares no weight, i.e. it reacts to every event. The
+    /// choice depends only on the event and the declaration, so every
+    /// process of every agent agrees on it.
+    #[must_use]
+    pub fn route(&self, agent: &str, event: EventId) -> Option<&str> {
+        let role = self.agent.get(agent)?.role;
+        self.agent.get(agent)?.weight?;
+        let shares: Vec<(&str, u64)> = self
+            .agent
+            .iter()
+            .filter(|(_, a)| a.role == role)
+            .filter_map(|(name, a)| a.weight.map(|w| (name.as_str(), u64::from(w))))
+            .collect();
+        let total: u64 = shares.iter().map(|(_, w)| w).sum();
+        let mut point = spread(event.0 as u64) % total;
+        for (name, weight) in shares {
+            if point < weight {
+                return Some(name);
+            }
+            point -= weight;
+        }
+        None
+    }
+
     /// The agent named `name`.
     ///
     /// # Errors
@@ -288,6 +329,15 @@ replicas = 1
             .get(name)
             .ok_or_else(|| DeclarationError::UnknownAgent(name.to_owned()))
     }
+}
+
+/// `SplitMix64`: consecutive event ids land far apart, so routing by weight
+/// does not alternate in lockstep with the event log.
+fn spread(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
 }
 
 #[cfg(test)]
@@ -319,6 +369,35 @@ mod tests {
         let text = Declaration::TEMPLATE.replace("breadth = 3\n", "");
         let error = Declaration::parse(&text).expect_err("missing breadth");
         assert!(error.to_string().contains("breadth"), "{error}");
+    }
+
+    #[test]
+    fn weighted_agents_split_their_role_by_weight() {
+        let text = format!(
+            "{}\n[agent.contrarian]\nrole = \"exploration\"\ndriver = \"generic\"\n\
+             command = [\"x\"]\nreplicas = 1\nbreadth = 1\nmax_pending = 1\nweight = 1\n",
+            Declaration::TEMPLATE.replace("max_pending = 6\n", "max_pending = 6\nweight = 3\n")
+        );
+        let declaration = Declaration::parse(&text).expect("parses");
+        let mut counts = BTreeMap::new();
+        for id in 1..=4000 {
+            let explorer = declaration.route("explorer", EventId(id));
+            let contrarian = declaration.route("contrarian", EventId(id));
+            assert_eq!(explorer, contrarian, "every agent agrees on e{id}");
+            *counts.entry(explorer.expect("routed")).or_insert(0) += 1;
+        }
+        assert!((2800..3200).contains(&counts["explorer"]), "{counts:?}");
+        assert!((800..1200).contains(&counts["contrarian"]), "{counts:?}");
+        // Unweighted agents react to everything of their role.
+        assert_eq!(declaration.route("planner", EventId(1)), None);
+
+        let zero =
+            Declaration::TEMPLATE.replace("max_pending = 6\n", "max_pending = 6\nweight = 0\n");
+        let error = Declaration::parse(&zero).expect_err("zero weight");
+        assert!(
+            error.to_string().contains("`weight` must be >= 1"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -312,8 +312,8 @@ fn prompt(
     let task = match direction {
         Direction::Forward => format!(
             "## Task\n\n\
-             Propose up to {breadth} next steps that move this repository toward the goal{s} \
-             below. The working directory holds the repository as it is now; read it to ground \
+             Propose up to {breadth} possible next steps that could move this repository toward \
+             the goal{s} below. The working directory holds the repository as it is now; read it to ground \
              your proposals. Do not modify files.\n\n\
              ## Goal{s}\n\n{goals}",
             s = if goals.len() == 1 { "" } else { "s" },
@@ -322,8 +322,8 @@ fn prompt(
         Direction::Backward => format!(
             "## Task\n\n\
              The target below is a state this repository should reach. Work backward from it: \
-             propose up to {breadth} steps that must be realised immediately before the target \
-             can be reached. The working directory holds the repository as it is now; read it to \
+             propose up to {breadth} possible steps that could be realised immediately before \
+             the target is reached. The working directory holds the repository as it is now; read it to \
              ground your proposals. Do not modify files.\n\n\
              ## Target\n\n{target}",
             target = digest::goals(std::slice::from_ref(start)),
@@ -346,8 +346,11 @@ fn prompt(
          Guidelines:\n\
          - Each step must be a concrete, verifiable unit of work that can be completed in one \
            session.\n\
-         - Prefer genuinely different alternatives over one linear plan.\n\
-         - Propose fewer steps (even none) rather than weak ones.\n\
+         - Enumerate broadly: list every genuinely different possibility you can ground in \
+           the code, including uncertain, unconventional, or risky ones. Do not filter by \
+           likelihood; the steps are ranked and weeded out afterwards.\n\
+         - Prefer genuinely different alternatives over one linear plan, and never repeat a \
+           step that already exists.\n\
          {instructions}{response}",
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),

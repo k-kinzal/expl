@@ -17,7 +17,7 @@
 #   generic      — any command: prompt on stdin, JSON response on stdout
 #
 # Exploration, planning and evaluation are routed across Claude Code and
-# Codex: each invocation goes to the next CLI in turn and falls over to the
+# Codex (`[[agent.<name>.alternative]]`): each invocation goes to the next CLI in turn and falls over to the
 # other when one fails. Execution is Cursor Agent on Claude Opus 5.5.
 #
 # All agents share one cargo target directory so that every worktree does
@@ -34,6 +34,12 @@
 # starts again from there.
 trunk = "main"
 
+# Exploration is two agents routed by `weight` (each event goes to one of
+# them, 4:1): `explorer` searches where the goal promises the most;
+# `fringe` widens the frame — niche directions inside the goal nobody asked
+# for, and counterexamples that would work against it. Both enumerate
+# broadly; the planner ranks and weeds out.
+
 [agent.explorer]
 role = "exploration"
 driver = "claude_code"
@@ -41,16 +47,46 @@ command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
 env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
 replicas = 1
-breadth = 3
-max_pending = 6
+weight = 4
+breadth = 8
+max_pending = 20
 revisit_cooldown = 600
 instructions = """
-AGENTS.md describes the vision and architecture; propose steps that move expl toward it.
+AGENTS.md describes the vision and architecture. Enumerate the directions that look most
+promising for moving expl toward the goal: different mechanisms, different parts of the
+system, different trade-offs.
 Every step must change Rust code, tests, or configuration. Markdown files (*.md) are
 frozen: never propose a step whose purpose is to add, edit, or delete a .md file.
 """
 
 [[agent.explorer.alternative]]
+driver = "codex"
+command = ["codex"]
+args = ["--dangerously-bypass-approvals-and-sandbox"]
+
+[agent.fringe]
+role = "exploration"
+driver = "claude_code"
+command = ["claude"]
+args = ["--permission-mode", "bypassPermissions"]
+env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
+replicas = 1
+weight = 1
+breadth = 8
+max_pending = 20
+instructions = """
+AGENTS.md describes the vision and architecture. Explore the fringe of the problem space on
+purpose — what a mainstream search toward the goal would never propose:
+- niche directions that stay inside the goal's frame but nobody asked for;
+- unusual trade-offs, inversions of current design decisions, extreme simplifications;
+- counterexamples: changes that look plausible but would work against the goal. Say in the
+  objective which part of the goal they would harm and how evaluating them would show it.
+Start each title with "Fringe:" or "Counterexample:". Every step must still be a concrete,
+verifiable change to Rust code, tests, or configuration. Markdown files (*.md) are frozen:
+never propose a step whose purpose is to add, edit, or delete a .md file.
+"""
+
+[[agent.fringe.alternative]]
 driver = "codex"
 command = ["codex"]
 args = ["--dangerously-bypass-approvals-and-sandbox"]
@@ -64,8 +100,11 @@ env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
 replicas = 1
 instructions = """
 Markdown files (*.md) are frozen. Prune any step whose purpose is to add, edit, or delete a .md
-file. Prefer small, independently verifiable steps; join paths only when their changes are
-complementary.
+file. Exploration enumerates broadly on purpose: rank unlikely or counterproductive steps low
+instead of pruning them, and prune duplicates. Steps titled "Fringe:" are deliberate outliers
+and "Counterexample:" steps are expected to work against the goal — keep them at low priority
+unless the judgements give a reason to try one. Prefer small, independently verifiable steps;
+join paths only when their changes are complementary.
 """
 
 [[agent.planner.alternative]]

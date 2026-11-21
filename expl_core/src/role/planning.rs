@@ -266,8 +266,11 @@ fn prompt(
          stands now (the working directory), `superseded` ones are earlier states. Each origin \
          builds on the one before it and on the steps adopted into it, so their work is already \
          in. Steps that build on a superseded origin start from older code.\n\n\
-         Balance steps on paths whose judgements are improving with untried alternatives. Do \
-         not modify files in the working directory.\n\
+         Steps are enumerated broadly, so many are weak, niche, or may even work against a \
+         goal. Give those a low priority rather than pruning them, so the alternatives stay \
+         on the map; prune only steps that duplicate another or are already covered. Balance \
+         steps on paths whose judgements are improving with untried alternatives. Do not \
+         modify files in the working directory.\n\
          \n## Goals\n\n{goals}\n## Steps\n\n{graph}{instructions}{response}",
         goals = digest::numbered_goals(&graph.goals()?),
         graph = digest::graph(graph)?,
