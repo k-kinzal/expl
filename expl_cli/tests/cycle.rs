@@ -13,8 +13,10 @@ use std::time::{Duration, Instant};
 /// conflict) and sleeps while `@DIR@/slow` exists. Facing merge conflicts,
 /// execution resolves them, or claims to while `@DIR@/unresolvable`
 /// exists. Planning sleeps while `@DIR@/slow-planning` exists and answers
-/// with `@DIR@/plan.json` when present. Every prompt is kept in
-/// `@DIR@/prompts/` for inspection.
+/// with `@DIR@/plan.json` when present. Evaluation, which must not touch
+/// its worktree, writes `stray.txt` there while `@DIR@/eval-writes` exists
+/// and commits `sneaky.txt` while `@DIR@/eval-commits` exists. Every prompt
+/// is kept in `@DIR@/prompts/` for inspection.
 const AGENT: &str = r#"#!/bin/sh
 mkdir -p "@DIR@/prompts"
 cat > "@DIR@/prompts/$EXPL_ROLE-$$.txt"
@@ -58,6 +60,10 @@ execution)
   if [ -f "@DIR@/shared" ]; then echo "node $EXPL_NODE" > shared.txt; fi
   echo '{"succeeded":true,"summary":"wrote a file"}' ;;
 evaluation)
+  if [ -f "@DIR@/eval-writes" ]; then echo stray > stray.txt; fi
+  if [ -f "@DIR@/eval-commits" ]; then
+    echo sneaky > sneaky.txt && git add sneaky.txt && git commit -q -m sneaky
+  fi
   if ls node-*.txt > /dev/null 2>&1; then
     echo '{"evaluations":[{"goal":2,"satisfied":true,"score":90,"reason":"file exists"}]}'
   else
@@ -1218,4 +1224,99 @@ fn speculative_exploration_grows_past_steps_not_carried_out() {
         .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("prompt"))
         .any(|text| text.contains("## Assumed done") && text.contains("- Open step"));
     assert!(told, "no prompt assumed the open step done");
+}
+
+/// A completed step for the evaluator to judge, then the evaluator's
+/// reaction to it, evaluating with `marker` set when there is one.
+/// Returns the step, inspected.
+fn evaluate_a_completed_step(sandbox: &Sandbox, marker: Option<&str>) -> serde_json::Value {
+    let repo = &sandbox.repo;
+    ok(repo, &["goal", "add", "A file greets"]);
+    let step = ok(repo, &["node", "add", "Write a file", "--priority", "1"]);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    assert_eq!(node(repo, &step)["node"]["status"], "completed");
+    if let Some(marker) = marker {
+        sandbox.marker(marker, true);
+    }
+    ok(repo, &["run", "evaluator", "--exit-when-idle"]);
+    node(repo, &step)
+}
+
+/// The evaluator's runs on `step`, each checked to be a failure reported as
+/// a read-only violation naming `path`, in its journal and its log.
+fn assert_reported_violations(step: &serde_json::Value, path: &str) {
+    let runs: Vec<&serde_json::Value> = step["agent_runs"]
+        .as_array()
+        .expect("runs")
+        .iter()
+        .filter(|r| r["role"] == "evaluation")
+        .collect();
+    assert!(!runs.is_empty(), "{step}");
+    for run in runs {
+        assert_eq!(run["status"], "failed", "{run}");
+        let error = run["error"].as_str().expect("error");
+        assert!(
+            error.contains("modified its read-only worktree") && error.contains(path),
+            "{error}"
+        );
+        let log = std::fs::read_to_string(run["log_path"].as_str().expect("log")).expect("log");
+        assert!(log.contains(error), "{log}");
+    }
+}
+
+/// What the evaluator recorded: no verdicts on `step`, no `node.evaluated`,
+/// and its scratch worktrees are gone.
+fn assert_nothing_recorded(repo: &Path, step: &serde_json::Value) {
+    assert_eq!(step["evaluations"], serde_json::json!([]), "{step}");
+    let kinds: Vec<String> = json_lines(&ok(repo, &["event", "ls", "--format", "json"]))
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert!(!kinds.iter().any(|k| k == "node.evaluated"), "{kinds:?}");
+    let worktrees: Vec<String> = std::fs::read_dir(repo.join(".expl/worktrees"))
+        .expect("worktrees")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(worktrees, ["node-3"]);
+}
+
+#[test]
+fn an_evaluator_writing_into_its_scratch_is_reported_and_records_no_verdicts() {
+    let sandbox = sandbox();
+    let step = evaluate_a_completed_step(&sandbox, Some("eval-writes"));
+    assert_reported_violations(&step, "stray.txt");
+    assert_nothing_recorded(&sandbox.repo, &step);
+}
+
+#[test]
+fn an_evaluator_committing_in_its_scratch_is_reported() {
+    let sandbox = sandbox();
+    let step = evaluate_a_completed_step(&sandbox, Some("eval-commits"));
+    assert_reported_violations(&step, "sneaky.txt");
+    let error = step["agent_runs"]
+        .as_array()
+        .expect("runs")
+        .iter()
+        .find(|r| r["role"] == "evaluation")
+        .and_then(|r| r["error"].as_str())
+        .expect("error");
+    assert!(error.contains("HEAD moved from"), "{error}");
+    assert_nothing_recorded(&sandbox.repo, &step);
+    // The stray commit never reached a branch.
+    let subjects = git(&sandbox.repo, &["log", "--branches", "--format=%s"]);
+    assert!(!subjects.lines().any(|s| s == "sneaky"), "{subjects}");
+}
+
+#[test]
+fn a_clean_evaluation_records_its_verdicts() {
+    let sandbox = sandbox();
+    let step = evaluate_a_completed_step(&sandbox, None);
+    let runs = step["agent_runs"].as_array().expect("runs");
+    let evaluation = runs
+        .iter()
+        .find(|r| r["role"] == "evaluation")
+        .unwrap_or_else(|| panic!("no evaluation run: {runs:?}"));
+    assert_eq!(evaluation["status"], "succeeded", "{evaluation}");
+    assert_eq!(step["evaluations"][0]["score"], 90, "{step}");
+    assert_eq!(step["evaluations"][0]["satisfied"], true, "{step}");
 }

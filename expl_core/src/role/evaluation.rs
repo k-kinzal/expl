@@ -110,7 +110,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
         let tree = graph.goal_tree()?;
         let prompt = prompt(reaction, &goals, &tree, &schema);
         let response: Response =
-            reaction.invoke(graph, Some(id), scratch.path(), &prompt, &schema)?;
+            reaction.invoke_read_only(graph, Some(id), &scratch, &prompt, &schema)?;
         response
             .evaluations
             .into_iter()

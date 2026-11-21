@@ -58,4 +58,4 @@ pub use prompt::Prompt;
 pub use role::{Context, Direction, Reaction, Report, Role, RoleError};
 pub use store::StoreError;
 pub use trunk::{Advance, Trunk, TrunkError};
-pub use workspace::{ScratchWorkspace, Workspace, WorkspaceError, Workspaces};
+pub use workspace::{ScratchChanges, ScratchWorkspace, Workspace, WorkspaceError, Workspaces};

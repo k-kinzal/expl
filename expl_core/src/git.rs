@@ -156,6 +156,53 @@ impl Git {
         Ok(out.lines().map(str::to_owned).collect())
     }
 
+    /// Paths `git status --porcelain` reports in the working tree: staged,
+    /// modified, deleted, renamed (both names), conflicted, or untracked.
+    /// Ignored files are not reported.
+    ///
+    /// # Errors
+    ///
+    /// [`GitError`] when git fails.
+    pub fn status_paths(&self) -> Result<Vec<String>, GitError> {
+        let out = self.run(&["status", "--porcelain=v2", "-z", "--untracked-files=all"])?;
+        let mut records = out.split('\0').filter(|record| !record.is_empty());
+        let mut paths = Vec::new();
+        while let Some(record) = records.next() {
+            // Fields before the path: ordinary 8, renamed/copied 9,
+            // unmerged 10, untracked 1.
+            let fields = match record.as_bytes().first() {
+                Some(b'1') => 8,
+                Some(b'2') => 9,
+                Some(b'u') => 10,
+                Some(b'?') => 1,
+                _ => continue,
+            };
+            if let Some(path) = record.splitn(fields + 1, ' ').nth(fields) {
+                paths.push(path.to_owned());
+            }
+            if fields == 9
+                && let Some(original) = records.next()
+            {
+                paths.push(original.to_owned());
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Paths that differ between the trees of commits `from` and `to`.
+    ///
+    /// # Errors
+    ///
+    /// [`GitError`] when either does not name a commit.
+    pub fn diff_paths(&self, from: &str, to: &str) -> Result<Vec<String>, GitError> {
+        let out = self.run(&["diff", "--name-only", "-z", from, to])?;
+        Ok(out
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
     /// Whether `revision` names a commit in this repository.
     ///
     /// # Errors
@@ -199,5 +246,57 @@ impl Git {
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_paths_name_every_kind_of_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = Git::new(dir.path());
+        git.run(&["init", "-q"]).expect("init");
+        for (name, content) in [
+            ("kept", "k"),
+            ("edited", "e"),
+            ("gone", "g"),
+            ("moved", "m"),
+        ] {
+            std::fs::write(dir.path().join(name), content).expect("write");
+        }
+        std::fs::write(dir.path().join(".gitignore"), "ignored\n").expect("write");
+        git.run(&["add", "."]).expect("add");
+        git.run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "initial",
+        ])
+        .expect("commit");
+        let base = git.resolve_commit("HEAD").expect("head");
+        assert!(git.status_paths().expect("status").is_empty());
+
+        std::fs::write(dir.path().join("edited"), "changed").expect("write");
+        std::fs::remove_file(dir.path().join("gone")).expect("remove");
+        git.run(&["mv", "moved", "renamed"]).expect("mv");
+        std::fs::create_dir(dir.path().join("new dir")).expect("mkdir");
+        std::fs::write(dir.path().join("new dir/with space"), "n").expect("write");
+        std::fs::write(dir.path().join("ignored"), "i").expect("write");
+        let mut paths = git.status_paths().expect("status");
+        paths.sort();
+        assert_eq!(
+            paths,
+            ["edited", "gone", "moved", "new dir/with space", "renamed"]
+        );
+        assert_eq!(
+            git.diff_paths(&base, "HEAD").expect("diff"),
+            Vec::<String>::new()
+        );
     }
 }

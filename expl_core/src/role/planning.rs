@@ -166,7 +166,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     // works are left, with their events, to the next planning.
     let shown = graph.snapshot()?;
     let prompt = prompt(reaction, &shown, &schema);
-    let response: Response = reaction.invoke(graph, None, scratch.path(), &prompt, &schema)?;
+    let response: Response = reaction.invoke_read_only(graph, None, &scratch, &prompt, &schema)?;
     drop(scratch);
 
     let now = graph.nodes(&NodeFilter::default())?;
