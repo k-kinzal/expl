@@ -8,7 +8,7 @@
 //!
 //! | Role | Reacts to | Works in | Changes the graph by (events) |
 //! | --- | --- | --- | --- |
-//! | exploration | `goal.added`, `node.evaluated`, `origin.advanced` | scratch at the starting node | proposing steps (`node.proposed`) |
+//! | exploration | `goal.added`, `node.evaluated`, `origin.advanced`, `node.revisited` | scratch at the starting node | proposing steps (`node.proposed`) |
 //! | planning | `node.proposed`, `node.evaluated`, `node.failed`, `goal.retired`, `origin.advanced` | scratch at the origin | recording a plan, joins, priorities, prunes (`plan.recorded`, `node.planned`, `node.ready`, `node.pruned`) |
 //! | execution | `node.ready` | the step's own worktree | committing the step (`node.started`, `node.completed` / `node.failed`, successors' `node.ready`) |
 //! | evaluation | `node.completed`, `origin.advanced` | scratch at the step (or origin) | recording verdicts (`node.evaluated`) |
@@ -97,6 +97,7 @@ impl Role {
                 EventKind::GoalAdded,
                 EventKind::NodeEvaluated,
                 EventKind::OriginAdvanced,
+                EventKind::NodeRevisited,
             ],
             Self::Planning => &[
                 EventKind::NodeProposed,
@@ -116,6 +117,23 @@ impl Role {
     #[must_use]
     pub fn is_exclusive(self) -> bool {
         matches!(self, Self::Planning)
+    }
+
+    /// How long an idle process of `agent` waits after its last reaction
+    /// before revisiting a random [starting point](Graph::starting_points)
+    /// (`node.revisited`), if it revisits at all. Exploration does when
+    /// `revisit_cooldown` is declared: one exploration never exhausts a
+    /// node, so every starting point keeps growing new steps for as long as
+    /// the process runs (bounded by `max_pending`).
+    #[must_use]
+    pub fn revisit_cooldown(self, agent: &Agent) -> Option<std::time::Duration> {
+        match self {
+            Self::Exploration => agent
+                .declaration()
+                .revisit_cooldown
+                .map(std::time::Duration::from_secs),
+            Self::Planning | Self::Execution | Self::Evaluation => None,
+        }
     }
 
     /// Whether one reaction covers every event of this role recorded

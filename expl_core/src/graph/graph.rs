@@ -442,6 +442,27 @@ impl Graph {
         Ok(id)
     }
 
+    /// Record that `id` is to be explored from again (`node.revisited`).
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError::NodeNotFound`], or [`GraphError::NotInStatus`] when
+    /// `id` is not one of the [`starting_points`](Self::starting_points).
+    pub fn revisit(&mut self, id: NodeId) -> Result<(), GraphError> {
+        if !self.starting_points()?.iter().any(|n| n.id == id) {
+            self.node(id)?;
+            return Err(GraphError::NotInStatus {
+                node: id,
+                expected: "a starting point of exploration (the active origin, a completed \
+                           step not in the trunk, or an active counter-exploration goal)",
+            });
+        }
+        let tx = self.conn.savepoint()?;
+        emit(&tx, EventKind::NodeRevisited, Some(id))?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Add `source → target` to existing nodes.
     ///
     /// # Errors
@@ -812,6 +833,33 @@ impl Graph {
         })
     }
 
+    /// Every node exploration can start from again: the active origin,
+    /// each completed step whose work is not yet in the trunk (forward),
+    /// and each active counter-exploration goal (backward). Empty while
+    /// there are no active goals.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError`] on SQLite failure.
+    pub fn starting_points(&self) -> Result<Vec<Node>, GraphError> {
+        let goals = self.goals()?;
+        if goals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lineage = self.lineage()?;
+        let mut points = vec![self.origin()?];
+        points.extend(
+            self.nodes(&NodeFilter {
+                kinds: vec![NodeKind::Step],
+                statuses: vec![NodeStatus::Completed],
+            })?
+            .into_iter()
+            .filter(|step| !lineage.in_trunk(step.id)),
+        );
+        points.extend(goals.into_iter().filter(|g| g.counter_exploration));
+        Ok(points)
+    }
+
     /// Steps awaiting execution (`proposed` + `planned`).
     ///
     /// # Errors
@@ -1124,6 +1172,55 @@ mod tests {
             .into_iter()
             .map(|e| (e.kind, e.node.map(|n| n.0)))
             .collect()
+    }
+
+    #[test]
+    fn starting_points_are_realised_nodes_and_counter_goals() {
+        let mut graph = Graph::in_memory().expect("graph");
+        let origin = graph
+            .create_origin("origin", Some("main"), "abc")
+            .expect("origin");
+        assert!(graph.starting_points().expect("points").is_empty());
+        let goal = graph.add_goal("goal", "do it", false).expect("goal");
+        let counter = graph.add_goal("counter", "back", true).expect("counter");
+        let a = graph.propose_step("a", "a", &[origin], &[goal]).expect("a");
+        let b = graph.propose_step("b", "b", &[origin], &[goal]).expect("b");
+        graph.plan_step(a, 1).expect("plan");
+        assert!(graph.claim(a, false).expect("claim"));
+        graph
+            .set_branch(a, "expl/node-a", Some("def"))
+            .expect("branch");
+        graph.complete(a, "done").expect("complete");
+
+        let ids: Vec<NodeId> = graph
+            .starting_points()
+            .expect("points")
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(ids, [origin, a, counter]);
+
+        graph.revisit(a).expect("revisit a");
+        graph.revisit(counter).expect("revisit counter");
+        assert!(matches!(
+            graph.revisit(b),
+            Err(GraphError::NotInStatus { node, .. }) if node == b
+        ));
+        assert!(matches!(
+            graph.revisit(goal),
+            Err(GraphError::NotInStatus { .. })
+        ));
+        let revisits: Vec<_> = kinds(&graph)
+            .into_iter()
+            .filter(|(kind, _)| *kind == EventKind::NodeRevisited)
+            .collect();
+        assert_eq!(
+            revisits,
+            [
+                (EventKind::NodeRevisited, Some(a.0)),
+                (EventKind::NodeRevisited, Some(counter.0))
+            ]
+        );
     }
 
     #[test]
