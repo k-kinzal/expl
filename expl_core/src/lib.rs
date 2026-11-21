@@ -45,8 +45,9 @@ pub use agent::{Agent, AgentDriver, AgentError, AgentRun, DriverKind};
 pub use declaration::{AgentDeclaration, CliDeclaration, Declaration, DeclarationError};
 pub use event::{Delivery, Event, EventId, EventKind, Inbox, InboxError, LeaseToken};
 pub use graph::{
-    AgentRunId, AgentRunRecord, AgentRunStatus, Edge, Epoch, Evaluation, Graph, GraphError,
-    Lineage, NewOrigin, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Plan, PlannedPath,
+    AgentRunId, AgentRunRecord, AgentRunStatus, Edge, Epoch, Evaluation, GoalTree, Graph,
+    GraphError, Lineage, NewOrigin, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Plan,
+    PlannedPath,
 };
 pub use process::{
     Interrupt, Process, ProcessActivity, ProcessError, ProcessId, ProcessObserver, ProcessOptions,

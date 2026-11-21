@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::event::{Event, EventId, EventKind};
 use crate::graph::{
-    AgentRunId, AgentRunRecord, AgentRunStatus, Edge, Evaluation, GraphError, Lineage,
+    AgentRunId, AgentRunRecord, AgentRunStatus, Edge, Evaluation, GoalTree, GraphError, Lineage,
     NewEvaluation, NewOrigin, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Plan, PlanId,
     PlannedPath, Snapshot,
 };
@@ -190,7 +190,9 @@ fn reaches(conn: &Connection, from: NodeId, to: NodeId) -> Result<bool, GraphErr
 fn connect_in(conn: &Connection, source: NodeId, target: NodeId) -> Result<(), GraphError> {
     let source_node = node_in(conn, source)?;
     let target_node = node_in(conn, target)?;
-    if !source_node.can_precede() {
+    // A goal precedes only the goals it is a subgoal of.
+    let subgoal = source_node.kind == NodeKind::Goal && target_node.kind == NodeKind::Goal;
+    if !source_node.can_precede() && !subgoal {
         return Err(GraphError::InvalidEndpoint {
             node: source,
             kind: source_node.kind,
@@ -405,18 +407,30 @@ impl Graph {
         Ok(Some(id))
     }
 
-    /// Add an active goal. Records `goal.added`.
+    /// Add an active goal — a subgoal of `parents` when there are any (see
+    /// [`GoalTree`]). Records `goal.added`.
     ///
     /// # Errors
     ///
-    /// [`GraphError`] on SQLite failure.
+    /// [`GraphError::NotInStatus`] when a parent is not an active goal;
+    /// [`GraphError`] on SQLite failure. Nothing is recorded then.
     pub fn add_goal(
         &mut self,
         title: &str,
         objective: &str,
         counter_exploration: bool,
+        parents: &[NodeId],
     ) -> Result<NodeId, GraphError> {
         let tx = self.write()?;
+        for parent in parents {
+            let node = node_in(&tx, *parent)?;
+            if node.kind != NodeKind::Goal || node.status != NodeStatus::Active {
+                return Err(GraphError::NotInStatus {
+                    node: *parent,
+                    expected: "an active goal",
+                });
+            }
+        }
         let id = Self::insert_node(
             &tx,
             NodeKind::Goal,
@@ -425,6 +439,9 @@ impl Graph {
             objective,
             counter_exploration,
         )?;
+        for parent in parents {
+            connect_in(&tx, id, *parent)?;
+        }
         emit(&tx, EventKind::GoalAdded, Some(id))?;
         tx.commit()?;
         Ok(id)
@@ -896,6 +913,19 @@ impl Graph {
         Ok(count as usize)
     }
 
+    /// Which goals are subgoals of which.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError`] on SQLite failure.
+    pub fn goal_tree(&self) -> Result<GoalTree, GraphError> {
+        let goals = self.nodes(&NodeFilter {
+            kinds: vec![NodeKind::Goal],
+            statuses: Vec::new(),
+        })?;
+        Ok(GoalTree::of(&goals, &self.edges()?))
+    }
+
     /// Every edge.
     ///
     /// # Errors
@@ -1219,7 +1249,7 @@ mod tests {
         let origin = graph
             .create_origin("origin", Some("main"), "abc")
             .expect("origin");
-        let goal = graph.add_goal("goal", "do it", false).expect("goal");
+        let goal = graph.add_goal("goal", "do it", false, &[]).expect("goal");
         (graph, origin, goal)
     }
 
@@ -1233,14 +1263,53 @@ mod tests {
     }
 
     #[test]
+    fn subgoals_serve_their_goals() {
+        let (mut graph, origin, goal) = seeded();
+        let sub = graph
+            .add_goal("sub", "a route", false, &[goal])
+            .expect("subgoal");
+        let subsub = graph
+            .add_goal("subsub", "a finer route", true, &[sub])
+            .expect("subsubgoal");
+        let tree = graph.goal_tree().expect("tree");
+        assert_eq!(tree.ancestors(subsub), [sub, goal]);
+        // A step toward a subgoal heads for the goals it serves too.
+        let step = graph
+            .propose_step("s", "s", &[origin], &[subsub])
+            .expect("step");
+        let reached: Vec<NodeId> = graph
+            .goals_reachable_from(step)
+            .expect("reachable")
+            .iter()
+            .map(|g| g.id)
+            .collect();
+        assert_eq!(reached, [goal, sub, subsub]);
+        // Only goals can be parents, and a goal never precedes a step.
+        assert!(matches!(
+            graph.add_goal("bad", "bad", false, &[step]),
+            Err(GraphError::NotInStatus { node, .. }) if node == step
+        ));
+        assert!(matches!(
+            graph.connect(goal, step),
+            Err(GraphError::InvalidEndpoint { .. })
+        ));
+        assert!(matches!(
+            graph.connect(goal, subsub),
+            Err(GraphError::Cycle { .. })
+        ));
+    }
+
+    #[test]
     fn starting_points_are_realised_or_failed_steps_and_counter_goals() {
         let mut graph = Graph::in_memory().expect("graph");
         let origin = graph
             .create_origin("origin", Some("main"), "abc")
             .expect("origin");
         assert!(graph.starting_points().expect("points").is_empty());
-        let goal = graph.add_goal("goal", "do it", false).expect("goal");
-        let counter = graph.add_goal("counter", "back", true).expect("counter");
+        let goal = graph.add_goal("goal", "do it", false, &[]).expect("goal");
+        let counter = graph
+            .add_goal("counter", "back", true, &[])
+            .expect("counter");
         let a = graph.propose_step("a", "a", &[origin], &[goal]).expect("a");
         let b = graph.propose_step("b", "b", &[origin], &[goal]).expect("b");
         graph.plan_step(a, 1).expect("plan");
@@ -1536,7 +1605,7 @@ mod tests {
         ));
         // Adopted work does not inherit the goals explored after it.
         let next = graph.propose_step("e", "e", &[second], &[]).expect("e");
-        let other = graph.add_goal("other", "other", false).expect("goal");
+        let other = graph.add_goal("other", "other", false, &[]).expect("goal");
         graph.connect(next, other).expect("edge");
         assert_eq!(
             ids(graph.goals_reachable_from(adopted).expect("goals")),

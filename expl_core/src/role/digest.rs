@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-use crate::graph::{Evaluation, Node, NodeId, NodeKind, Snapshot};
+use crate::graph::{Evaluation, GoalTree, Node, NodeId, NodeKind, Snapshot};
 
 /// Longest excerpt of free text (outcomes, reasons) quoted per node.
 const EXCERPT: usize = 600;
@@ -46,17 +46,44 @@ pub(crate) fn goals(goals: &[Node]) -> String {
     out
 }
 
-/// Goals with the ids a response refers to them by.
-pub(crate) fn numbered_goals(goals: &[Node]) -> String {
+/// What a subgoal is, said once wherever subgoals are listed.
+pub(crate) const SUBGOALS: &str = "A goal marked \"subgoal of\" is a hypothesis about a route \
+     toward the goals it serves: a stage or precondition expected to bring them within reach. \
+     Work toward a subgoal counts toward the goals it serves, but those can be reached without \
+     it, and several subgoals of one goal are alternative routes, not a checklist.\n";
+
+/// Goals with the ids a response refers to them by, subgoals indented under
+/// the goals they serve.
+pub(crate) fn numbered_goals(goals: &[Node], tree: &GoalTree) -> String {
     if goals.is_empty() {
         return "(none)\n".to_owned();
     }
+    let refs: Vec<&Node> = goals.iter().collect();
+    let shown: Vec<NodeId> = goals.iter().map(|g| g.id).collect();
     let mut out = String::new();
-    for goal in goals {
-        let _ = writeln!(out, "- [{}] {}", goal.id, goal.title);
-        if !goal.objective.trim().is_empty() {
-            let _ = writeln!(out, "  {}", excerpt(&goal.objective));
+    let mut nested = false;
+    for goal in tree.ordered(&refs) {
+        let depth = tree
+            .ancestors(goal.id)
+            .iter()
+            .filter(|a| shown.contains(a))
+            .count()
+            .min(tree.depth(goal.id));
+        let indent = "  ".repeat(depth);
+        let _ = write!(out, "{indent}- [{}] {}", goal.id.0, goal.title);
+        let parents = tree.parents(goal.id);
+        if !parents.is_empty() {
+            nested = true;
+            let list: Vec<String> = parents.iter().map(|p| format!("[{}]", p.0)).collect();
+            let _ = write!(out, " (subgoal of {})", list.join(", "));
         }
+        out.push('\n');
+        if !goal.objective.trim().is_empty() {
+            let _ = writeln!(out, "{indent}  {}", excerpt(&goal.objective));
+        }
+    }
+    if nested {
+        let _ = write!(out, "\n{SUBGOALS}");
     }
     out
 }
@@ -99,6 +126,9 @@ pub(crate) fn graph(snapshot: &Snapshot) -> String {
         }
         if node.kind == NodeKind::Goal {
             let _ = writeln!(out, "    reached from: {}", ids(after.get(&node.id)));
+            if let Some(served) = before.get(&node.id) {
+                let _ = writeln!(out, "    subgoal of: {}", ids(Some(served)));
+            }
         } else {
             let _ = writeln!(
                 out,

@@ -432,7 +432,7 @@ mod tests {
         let origin = graph
             .create_origin("o", Some("main"), "abc")
             .expect("origin");
-        let goal = graph.add_goal("g", "g", false).expect("goal"); // e1 goal.added
+        let goal = graph.add_goal("g", "g", false, &[]).expect("goal"); // e1 goal.added
         graph.propose_step("a", "a", &[origin], &[goal]).expect("a"); // e2
         graph.propose_step("b", "b", &[origin], &[goal]).expect("b"); // e3
         Fixture {

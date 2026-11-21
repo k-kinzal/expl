@@ -38,6 +38,7 @@ mod edge;
 mod error;
 mod evaluation;
 // Defining module named for the concept it defines — the path echo is deliberate.
+mod goals;
 mod graph;
 mod lineage;
 mod node;
@@ -48,6 +49,7 @@ pub use agent_run::{AgentRunId, AgentRunRecord, AgentRunStatus};
 pub use edge::Edge;
 pub use error::GraphError;
 pub use evaluation::{Evaluation, NewEvaluation};
+pub use goals::GoalTree;
 pub use graph::Graph;
 pub use lineage::{Epoch, Lineage, NewOrigin};
 pub use node::{Node, NodeFilter, NodeId, NodeKind, NodeStatus};

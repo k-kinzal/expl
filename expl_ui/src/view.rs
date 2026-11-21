@@ -19,8 +19,10 @@
 //!   satisfies the goal (or the step is selected), so the picture shows
 //!   reached goals rather than intentions.
 //! - **Goals** are listed top right, with where the trunk stands on each
-//!   and the best candidate not adopted yet. Selecting a goal focuses the
-//!   graph on it: what leads to it, and what was judged against it.
+//!   and the best candidate not adopted yet, subgoals indented under the
+//!   goals they serve (and joined to them by a faint line in the graph).
+//!   Selecting a goal focuses the graph on it: what leads to it, and what
+//!   was judged against it.
 //! - **The trunk's history** is listed bottom right: each origin, newest
 //!   first, with what was adopted into it.
 //! - **Agents are dots** bottom left, one per process, grouped by agent:
@@ -70,6 +72,8 @@ const CLICK_SLOP: f32 = 4.0;
 /// Corner panels.
 const DETAIL_W: f32 = 360.0;
 const GOALS_W: f32 = 290.0;
+/// How far each level of subgoals is indented in the goals panel.
+const SUBGOAL_INDENT: f32 = 14.0;
 const TRUNK_W: f32 = 320.0;
 /// Origins listed in the trunk panel.
 const TRUNK_ROWS: usize = 6;
@@ -396,6 +400,10 @@ impl ExplView {
                 // Work taken into the trunk.
                 (_, NodeKind::Origin) => {
                     theme::alpha(theme::text(), if selected { 0.6 } else { 0.3 })
+                }
+                // A subgoal and the goal it serves.
+                (NodeKind::Goal, NodeKind::Goal) => {
+                    theme::alpha(theme::text(), if selected { 0.6 } else { 0.25 })
                 }
                 (_, NodeKind::Goal) => {
                     let satisfied = self
@@ -847,6 +855,8 @@ impl ExplView {
             })
             .children(goals.into_iter().map(|goal| {
                 let active = goal.status == NodeStatus::Active;
+                // Subgoals sit indented under the goals they serve.
+                let indent = small_f32(self.snapshot.goal_tree.depth(goal.id)) * SUBGOAL_INDENT;
                 let selected = lens.selected == Some(goal.id);
                 let trunk = self.snapshot.trunk_verdict(goal.id).map(|(_, e)| e);
                 let best = self.snapshot.best_open(goal.id);
@@ -877,6 +887,7 @@ impl ExplView {
                     .flex()
                     .items_center()
                     .gap_3()
+                    .pl(px(indent))
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, Self::press(goal.id, true, cx))
                     .child(marker)

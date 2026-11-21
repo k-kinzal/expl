@@ -25,8 +25,8 @@ use std::collections::BTreeSet;
 
 use crate::event::EventId;
 use crate::graph::{
-    Graph, GraphError, Node, NodeFilter, NodeId, NodeKind, NodeStatus, PlanId, PlannedPath,
-    Snapshot,
+    GoalTree, Graph, GraphError, Node, NodeFilter, NodeId, NodeKind, NodeStatus, PlanId,
+    PlannedPath, Snapshot,
 };
 use crate::prompt::Prompt;
 use crate::role::{Reaction, Report, RoleError, digest};
@@ -282,10 +282,13 @@ fn prompt(reaction: &Reaction<'_>, shown: &Snapshot, schema: &serde_json::Value)
          Steps are enumerated broadly, so many are weak, niche, or may even work against a \
          goal. Give those a low priority rather than pruning them, so the alternatives stay \
          on the map; prune only steps that duplicate another or are already covered. Balance \
-         steps on paths whose judgements are improving with untried alternatives. Do not \
-         modify files in the working directory.\n\
+         steps on paths whose judgements are improving with untried alternatives. Subgoals \
+         are hypotheses about routes toward the goals they serve: favour paths through the \
+         most promising subgoals, keep alternatives to them alive, and remember that a goal \
+         can be reached without any of its subgoals. Do not modify files in the working \
+         directory.\n\
          \n## Goals\n\n{goals}\n## Steps\n\n{graph}{instructions}{response}",
-        goals = digest::numbered_goals(&shown.goals()),
+        goals = digest::numbered_goals(&shown.goals(), &GoalTree::of(&shown.nodes, &shown.edges)),
         graph = digest::graph(shown),
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),

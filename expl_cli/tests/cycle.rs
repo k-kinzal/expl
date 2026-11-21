@@ -22,6 +22,8 @@ case "$EXPL_ROLE" in
 exploration)
   if grep -q '^## Map' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
     cat "@DIR@/survey.json"
+  elif [ "$EXPL_EVENT" = goal.added ] && grep -q 'subgoal of' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
+    echo '{"nodes":[{"title":"Aim at the top goal","objective":"x","before":[2]},{"title":"Aim at the subgoal","objective":"y","before":[]}]}'
   elif [ "$EXPL_EVENT" = goal.added ]; then
     echo '{"nodes":[{"title":"Write hello","objective":"Create hello.txt"}]}'
   elif [ "$EXPL_EVENT" = node.failed ]; then
@@ -1052,4 +1054,58 @@ fn a_graph_wide_exploration_surveys_and_attaches_anywhere() {
     let over = node(repo, &id("Start over"));
     assert_eq!(over["predecessors"], serde_json::json!([1]));
     assert_eq!(over["successors"], serde_json::json!([2]));
+}
+
+#[test]
+fn subgoals_nest_and_each_proposal_picks_what_it_heads_for() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    ok(repo, &["goal", "add", "Say hello"]);
+    ok(repo, &["goal", "add", "A greeting file", "--under", "2"]);
+    ok(repo, &["goal", "add", "An empty one first", "--under", "3"]);
+    let bad = expl(repo, &["goal", "add", "Nowhere", "--under", "99"]);
+    assert!(!bad.status.success(), "a subgoal of a missing goal");
+
+    let goals = json_lines(&ok(repo, &["goal", "ls", "--format", "json"]));
+    let listed: Vec<(i64, serde_json::Value)> = goals
+        .iter()
+        .map(|g| (g["id"].as_i64().expect("id"), g["under"].clone()))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (2, serde_json::json!([])),
+            (3, serde_json::json!([2])),
+            (4, serde_json::json!([3]))
+        ]
+    );
+
+    // Exploring toward a new subgoal shows the goals it serves, and each
+    // proposal heads where it says: the top goal, or (saying nothing) the
+    // subgoal itself.
+    ok(repo, &["run", "explorer", "--exit-when-idle"]);
+    let steps = json_lines(&ok(repo, &["node", "ls", "--format", "json"]));
+    let heads = |title: &str| -> std::collections::BTreeSet<String> {
+        steps
+            .iter()
+            .filter(|n| n["title"] == title)
+            .map(|n| node(repo, &n["id"].to_string())["successors"].to_string())
+            .collect()
+    };
+    assert_eq!(heads("Write hello"), ["[2]".to_owned()].into());
+    assert_eq!(heads("Aim at the top goal"), ["[2]".to_owned()].into());
+    assert_eq!(
+        heads("Aim at the subgoal"),
+        ["[3]".to_owned(), "[4]".to_owned()].into()
+    );
+    let prompts = sandbox.dir.path().join("prompts");
+    let told = std::fs::read_dir(&prompts)
+        .expect("prompts")
+        .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("prompt"))
+        .any(|text| {
+            text.contains("[4] An empty one first (subgoal of [3])")
+                && text.contains("[2] Say hello")
+                && text.contains("alternative routes")
+        });
+    assert!(told, "no exploration prompt showed the subgoal in its tree");
 }

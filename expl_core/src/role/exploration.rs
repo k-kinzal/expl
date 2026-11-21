@@ -80,6 +80,9 @@ struct Response {
 struct ProposedNode {
     title: String,
     objective: String,
+    /// The goals it heads for (forward exploration only).
+    #[serde(default)]
+    before: Vec<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,7 +114,7 @@ fn survey_schema() -> serde_json::Value {
                         "title": {"type": "string", "description": "Short imperative name of the step."},
                         "objective": {"type": "string", "description": "What the step must achieve, concretely enough to be done in one session and checked afterwards."},
                         "after": {"type": "array", "items": {"type": "integer"}, "description": "Ids of the nodes it builds on: the origin, or completed steps. Several ids join their work; empty means the origin."},
-                        "before": {"type": "array", "items": {"type": "integer"}, "description": "Ids of the goals it heads toward; empty means every goal listed."}
+                        "before": {"type": "array", "items": {"type": "integer"}, "description": "Ids of the goals it heads toward — a subgoal, a goal directly, or several; empty for the default named in the task."}
                     }
                 }
             }
@@ -119,26 +122,138 @@ fn survey_schema() -> serde_json::Value {
     })
 }
 
-fn schema() -> serde_json::Value {
+/// The response schema; with `aiming`, each proposal names the goals it
+/// heads for.
+fn schema(aiming: bool) -> serde_json::Value {
+    let mut item = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "objective"],
+        "properties": {
+            "title": {"type": "string", "description": "Short imperative name of the step."},
+            "objective": {"type": "string", "description": "What the step must achieve, concretely enough to be done in one session and checked afterwards."}
+        }
+    });
+    if aiming {
+        item["required"] = json!(["title", "objective", "before"]);
+        item["properties"]["before"] = json!({
+            "type": "array",
+            "items": {"type": "integer"},
+            "description": "Ids of the goals the step heads toward; empty for the default named in the task."
+        });
+    }
     json!({
         "type": "object",
         "additionalProperties": false,
         "required": ["nodes"],
         "properties": {
-            "nodes": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["title", "objective"],
-                    "properties": {
-                        "title": {"type": "string", "description": "Short imperative name of the step."},
-                        "objective": {"type": "string", "description": "What the step must achieve, concretely enough to be done in one session and checked afterwards."}
-                    }
-                }
-            }
+            "nodes": {"type": "array", "items": item}
         }
     })
+}
+
+/// The goals an exploration heads for, and the ones a proposal that names
+/// none of them heads for.
+struct Aim {
+    goals: Vec<Node>,
+    default: Vec<NodeId>,
+}
+
+impl Aim {
+    /// Just `goal` (backward exploration).
+    fn single(goal: &Node) -> Self {
+        Self {
+            goals: vec![goal.clone()],
+            default: vec![goal.id],
+        }
+    }
+
+    /// A goal just added, with the goals it serves for context; proposals
+    /// head for it unless they say otherwise.
+    fn at(graph: &Graph, goal: &Node) -> Result<Self, RoleError> {
+        let ancestors = graph.goal_tree()?.ancestors(goal.id);
+        let mut goals = vec![goal.clone()];
+        goals.extend(
+            graph
+                .goals()?
+                .into_iter()
+                .filter(|g| ancestors.contains(&g.id)),
+        );
+        Ok(Self {
+            goals,
+            default: vec![goal.id],
+        })
+    }
+
+    /// Every active goal; proposals that name none head for the top-level
+    /// goals, tied to no subgoal.
+    fn everywhere(graph: &Graph) -> Result<Self, RoleError> {
+        let goals = graph.goals()?;
+        let ids: Vec<NodeId> = goals.iter().map(|g| g.id).collect();
+        let default = graph.goal_tree()?.roots(&ids);
+        Ok(Self { goals, default })
+    }
+
+    /// The active goals `start` leads to (a subgoal brings the goals it
+    /// serves); proposals that name none head for the most specific of
+    /// them. From the origin, or a step that leads to no active goal:
+    /// [`everywhere`](Self::everywhere).
+    fn from(graph: &Graph, start: &Node) -> Result<Self, RoleError> {
+        if start.kind == NodeKind::Origin {
+            return Self::everywhere(graph);
+        }
+        let goals: Vec<Node> = graph
+            .goals_reachable_from(start.id)?
+            .into_iter()
+            .filter(|goal| goal.status == NodeStatus::Active)
+            .collect();
+        if goals.is_empty() {
+            return Self::everywhere(graph);
+        }
+        let ids: Vec<NodeId> = goals.iter().map(|g| g.id).collect();
+        let default = graph.goal_tree()?.leaves(&ids);
+        Ok(Self { goals, default })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.goals.is_empty()
+    }
+
+    /// The goals a proposal naming `named` heads for: those of its aim it
+    /// names, else the default.
+    fn resolve(&self, named: &[i64]) -> Vec<NodeId> {
+        let mut before: Vec<NodeId> = Vec::new();
+        for id in named.iter().map(|id| NodeId(*id)) {
+            if self.goals.iter().any(|g| g.id == id) && !before.contains(&id) {
+                before.push(id);
+            }
+        }
+        if before.is_empty() {
+            before.clone_from(&self.default);
+        }
+        before
+    }
+
+    /// The goals as a forward task lists them, and how a proposal says
+    /// which it heads for.
+    fn describe(&self, graph: &Graph) -> Result<String, RoleError> {
+        let tree = graph.goal_tree()?;
+        let mut out = digest::numbered_goals(&self.goals, &tree);
+        if self.goals.len() > 1 {
+            let default: Vec<String> = self
+                .default
+                .iter()
+                .map(|id| format!("[{}]", id.0))
+                .collect();
+            let _ = write!(
+                out,
+                "\nFor each step, list in `before` the ids of the goals it heads toward — a \
+                 subgoal, a goal directly, or several. Leave it empty to head for {}.\n",
+                default.join(", ")
+            );
+        }
+        Ok(out)
+    }
 }
 
 pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, RoleError> {
@@ -155,21 +270,16 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
                 )));
             }
             let origin = graph.origin()?;
-            let goals = [subject.clone()];
-            let mut explorations = vec![explore(
-                reaction,
-                graph,
-                Direction::Forward,
-                &origin,
-                &goals,
-            )?];
+            let aim = Aim::at(graph, &subject)?;
+            let mut explorations =
+                vec![explore(reaction, graph, Direction::Forward, &origin, &aim)?];
             if subject.counter_exploration {
                 explorations.push(explore(
                     reaction,
                     graph,
                     Direction::Backward,
                     &subject,
-                    &goals,
+                    &Aim::single(&subject),
                 )?);
             }
             explorations
@@ -181,8 +291,8 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
                     subject.id, subject.status, subject.kind
                 )));
             }
-            let goals = graph.goals()?;
-            if goals.is_empty() {
+            let aim = Aim::everywhere(graph)?;
+            if aim.is_empty() {
                 return Ok(Reaction::ignore("no active goals"));
             }
             let mut explorations = vec![explore(
@@ -190,15 +300,15 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
                 graph,
                 Direction::Forward,
                 &subject,
-                &goals,
+                &aim,
             )?];
-            for goal in goals.iter().filter(|g| g.counter_exploration) {
+            for goal in aim.goals.iter().filter(|g| g.counter_exploration) {
                 explorations.push(explore(
                     reaction,
                     graph,
                     Direction::Backward,
                     goal,
-                    std::slice::from_ref(goal),
+                    &Aim::single(goal),
                 )?);
             }
             explorations
@@ -213,22 +323,21 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
             if subject.status == NodeStatus::Failed {
                 vec![explore_failure(reaction, graph, &subject)?]
             } else if subject.kind == NodeKind::Goal {
-                let goals = [subject.clone()];
                 vec![explore(
                     reaction,
                     graph,
                     Direction::Backward,
                     &subject,
-                    &goals,
+                    &Aim::single(&subject),
                 )?]
             } else {
-                let goals = goals_from(graph, &subject)?;
+                let aim = Aim::from(graph, &subject)?;
                 vec![explore(
                     reaction,
                     graph,
                     Direction::Forward,
                     &subject,
-                    &goals,
+                    &aim,
                 )?]
             }
         }
@@ -239,8 +348,8 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
                     subject.id, subject.status, subject.kind
                 )));
             }
-            let goals = goals_from(graph, &subject)?;
-            if goals.is_empty() {
+            let aim = Aim::from(graph, &subject)?;
+            if aim.is_empty() {
                 return Ok(Reaction::ignore("no active goals"));
             }
             vec![explore(
@@ -248,7 +357,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
                 graph,
                 Direction::Forward,
                 &subject,
-                &goals,
+                &aim,
             )?]
         }
         EventKind::NodeFailed => {
@@ -277,20 +386,6 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
         }
     };
     Ok(Report::Exploration { explorations })
-}
-
-/// The active goals a step leads to, or every active goal when it leads
-/// to none (the origin, or a step whose goals were retired).
-fn goals_from(graph: &Graph, start: &Node) -> Result<Vec<Node>, RoleError> {
-    let goals: Vec<Node> = graph
-        .goals_reachable_from(start.id)?
-        .into_iter()
-        .filter(|goal| goal.status == NodeStatus::Active)
-        .collect();
-    if goals.is_empty() {
-        return Ok(graph.goals()?);
-    }
-    Ok(goals)
 }
 
 /// Most steps an exploration is told already exist.
@@ -375,14 +470,14 @@ fn explore(
     graph: &mut Graph,
     direction: Direction,
     start: &Node,
-    goals: &[Node],
+    aim: &Aim,
 ) -> Result<ExplorationReport, RoleError> {
     let origin = graph.origin()?;
     let backward = direction == Direction::Backward;
-    let (ground, after, before): (&Node, Vec<NodeId>, Vec<NodeId>) = if backward {
-        (&origin, vec![origin.id], vec![start.id])
+    let (ground, after): (&Node, Vec<NodeId>) = if backward {
+        (&origin, vec![origin.id])
     } else {
-        (start, vec![start.id], goals.iter().map(|g| g.id).collect())
+        (start, vec![start.id])
     };
     let breadth = breadth(reaction);
     let known = if backward {
@@ -407,12 +502,12 @@ fn explore(
              the goal{s} below. The working directory holds the repository as it is now; read it to ground \
              your proposals. Do not modify files.\n\n\
              ## Goal{s}\n\n{goals}{judged}",
-            s = if goals.len() == 1 { "" } else { "s" },
-            goals = digest::goals(goals),
+            s = if aim.goals.len() == 1 { "" } else { "s" },
+            goals = aim.describe(graph)?,
             judged = judgement(graph, start)?,
         )
     };
-    let schema = schema();
+    let schema = schema(!backward);
     let prompt = prompt(reaction, &task, &known, &schema);
     let scratch = reaction.context().workspaces().scratch(ground)?;
     let response: Response =
@@ -426,6 +521,11 @@ fn explore(
         rejected: Vec::new(),
     };
     for proposal in response.nodes.into_iter().take(breadth) {
+        let before = if backward {
+            vec![start.id]
+        } else {
+            aim.resolve(&proposal.before)
+        };
         record(
             graph,
             &mut report,
@@ -488,7 +588,7 @@ fn explore_failure(
     let lineage = graph.lineage()?;
     let predecessors = graph.predecessors(failed.id)?;
     let base = realised_base(&lineage, &origin, &predecessors.iter().collect::<Vec<_>>());
-    let goals = goals_from(graph, failed)?;
+    let aim = Aim::from(graph, failed)?;
     let ground = match base.as_slice() {
         [only] if *only != origin.id => graph.node(*only)?,
         _ => origin.clone(),
@@ -535,17 +635,16 @@ fn explore_failure(
          modify files.\n\n\
          ## Failed step\n\n{attempt}\n\
          ## Goal{s}\n\n{goals}",
-        s = if goals.len() == 1 { "" } else { "s" },
-        goals = digest::goals(&goals),
+        s = if aim.goals.len() == 1 { "" } else { "s" },
+        goals = aim.describe(graph)?,
     );
-    let schema = schema();
+    let schema = schema(true);
     let prompt = prompt(reaction, &task, &known, &schema);
     let scratch = reaction.context().workspaces().scratch(&ground)?;
     let response: Response =
         reaction.invoke(graph, Some(failed.id), scratch.path(), &prompt, &schema)?;
     drop(scratch);
 
-    let before: Vec<NodeId> = goals.iter().map(|g| g.id).collect();
     let mut report = ExplorationReport {
         direction: Direction::Failure,
         from: failed.id,
@@ -559,7 +658,7 @@ fn explore_failure(
             &proposal.title,
             &proposal.objective,
             &base,
-            &before,
+            &aim.resolve(&proposal.before),
         );
     }
     Ok(report)
@@ -574,18 +673,18 @@ fn survey_on(
     subject: &Node,
 ) -> Result<Report, RoleError> {
     let event = reaction.event();
-    let goals = if event.kind == EventKind::GoalAdded {
+    let aim = if event.kind == EventKind::GoalAdded {
         if subject.status != NodeStatus::Active {
             return Ok(Reaction::ignore(format!(
                 "goal {} is {}",
                 subject.id, subject.status
             )));
         }
-        vec![subject.clone()]
+        Aim::at(graph, subject)?
     } else {
-        graph.goals()?
+        Aim::everywhere(graph)?
     };
-    if goals.is_empty() {
+    if aim.is_empty() {
         return Ok(Reaction::ignore("no active goals"));
     }
     if let Some(last) = graph.last_success(reaction.agent().name())?
@@ -596,7 +695,7 @@ fn survey_on(
         )));
     }
     Ok(Report::Exploration {
-        explorations: vec![survey(reaction, graph, &goals)?],
+        explorations: vec![survey(reaction, graph, &aim)?],
     })
 }
 
@@ -605,7 +704,7 @@ fn survey_on(
 fn survey(
     reaction: &Reaction<'_>,
     graph: &mut Graph,
-    goals: &[Node],
+    aim: &Aim,
 ) -> Result<ExplorationReport, RoleError> {
     let origin = graph.origin()?;
     let lineage = graph.lineage()?;
@@ -629,8 +728,8 @@ fn survey(
          the origin; read it to ground your proposals. Do not modify files.\n\n\
          ## Goals\n\n{goals}\n\
          ## Map\n\n{map}",
-        origin = origin.id,
-        goals = digest::numbered_goals(goals),
+        origin = origin.id.0,
+        goals = aim.describe(graph)?,
         map = digest::graph(&snapshot),
     );
     let schema = survey_schema();
@@ -640,7 +739,6 @@ fn survey(
         reaction.invoke(graph, None, scratch.path(), &prompt, &schema)?;
     drop(scratch);
 
-    let all_goals: Vec<NodeId> = goals.iter().map(|g| g.id).collect();
     let mut report = ExplorationReport {
         direction: Direction::Survey,
         from: origin.id,
@@ -654,16 +752,7 @@ fn survey(
             .filter_map(|id| snapshot.node(NodeId(*id)))
             .collect();
         let after = realised_base(&lineage, &origin, &named);
-        let mut before: Vec<NodeId> = proposal
-            .before
-            .iter()
-            .map(|id| NodeId(*id))
-            .filter(|id| all_goals.contains(id))
-            .collect();
-        before.dedup();
-        if before.is_empty() {
-            before.clone_from(&all_goals);
-        }
+        let before = aim.resolve(&proposal.before);
         record(
             graph,
             &mut report,

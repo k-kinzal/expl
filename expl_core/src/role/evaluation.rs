@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::event::EventKind;
-use crate::graph::{Graph, NewEvaluation, Node, NodeId, NodeKind, NodeStatus};
+use crate::graph::{GoalTree, Graph, NewEvaluation, Node, NodeId, NodeKind, NodeStatus};
 use crate::prompt::Prompt;
 use crate::role::{Reaction, Report, RoleError, digest};
 
@@ -107,7 +107,8 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
         Vec::new()
     } else {
         let schema = schema();
-        let prompt = prompt(reaction, &goals, &schema);
+        let tree = graph.goal_tree()?;
+        let prompt = prompt(reaction, &goals, &tree, &schema);
         let response: Response =
             reaction.invoke(graph, Some(id), scratch.path(), &prompt, &schema)?;
         response
@@ -139,14 +140,19 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
 
 /// The prompt: the goals to judge against — not the step, its report, or
 /// the path that led to it. The working directory is the evidence.
-fn prompt(reaction: &Reaction<'_>, goals: &[Node], schema: &serde_json::Value) -> Prompt {
+fn prompt(
+    reaction: &Reaction<'_>,
+    goals: &[Node],
+    tree: &GoalTree,
+    schema: &serde_json::Value,
+) -> Prompt {
     Prompt::from(format!(
         "## Task\n\n\
          Judge the repository in the working directory, as it is, against each goal below. \
          Inspect the code and run builds and tests as needed. Do not modify files. Return one \
          evaluation per goal, referring to it by the number in brackets.\n\n\
          ## Goals\n\n{goals}{instructions}{response}",
-        goals = digest::numbered_goals(goals),
+        goals = digest::numbered_goals(goals, tree),
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),
     ))
