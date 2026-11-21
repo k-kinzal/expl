@@ -248,17 +248,28 @@ impl<'a> Process<'a> {
                     }
                 }
             }
-            if let Some(reason) = role.pause(self.agent, &graph)? {
-                processes.set_activity(self.id, Some(&reason))?;
-                observer.observe(&ProcessActivity::Paused(&reason));
+            // While paused, only what a human just asked for gets through.
+            let paused = role.pause(self.agent, &graph)?;
+            let kinds = if paused.is_some() {
+                role.unpausable()
+            } else {
+                role.reactions()
+            };
+            let leased = if kinds.is_empty() {
+                None
+            } else {
+                inbox.lease(kinds, self.id, role.is_exclusive())?
+            };
+            if let (Some(reason), None) = (&paused, &leased) {
+                processes.set_activity(self.id, Some(reason))?;
+                observer.observe(&ProcessActivity::Paused(reason));
                 if options.exit_when_idle {
                     return Ok(format!("idle ({reason})"));
                 }
                 thread::sleep(POLL * 4);
                 continue;
             }
-            let Some(delivery) = inbox.lease(role.reactions(), self.id, role.is_exclusive())?
-            else {
+            let Some(delivery) = leased else {
                 if options.exit_when_idle {
                     return Ok("idle".to_owned());
                 }

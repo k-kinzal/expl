@@ -145,6 +145,17 @@ impl Role {
         matches!(self, Self::Planning)
     }
 
+    /// The events an agent of this role reacts to even while it is
+    /// [paused](Self::pause): a goal a human just added is explored at
+    /// once, however long the backlog.
+    #[must_use]
+    pub fn unpausable(self) -> &'static [EventKind] {
+        match self {
+            Self::Exploration => &[EventKind::GoalAdded],
+            Self::Planning | Self::Execution | Self::Evaluation => &[],
+        }
+    }
+
     /// Why an agent of this role should not lease events right now, if it
     /// should not. Exploration pauses while `max_pending` steps await
     /// execution, so proposals cannot outrun execution.

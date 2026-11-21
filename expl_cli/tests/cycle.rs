@@ -893,3 +893,48 @@ fn weighted_agents_of_one_role_split_its_events() {
     assert_eq!(explorer + contrarian, 6, "{explorer} + {contrarian}");
     assert!(explorer > 0 && contrarian > 0, "{explorer} + {contrarian}");
 }
+
+#[test]
+fn a_new_goal_is_explored_even_while_exploration_is_paused() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let declaration = std::fs::read_to_string(repo.join("expl.toml")).expect("read");
+    std::fs::write(
+        repo.join("expl.toml"),
+        declaration.replacen("max_pending = 6", "max_pending = 1", 1),
+    )
+    .expect("declaration");
+    ok(repo, &["goal", "add", "First"]);
+    // A pending step: the backlog is at max_pending, exploration pauses.
+    ok(repo, &["node", "add", "Waiting", "--before", "2"]);
+    ok(repo, &["goal", "add", "Second"]);
+    ok(repo, &["run", "explorer", "--exit-when-idle"]);
+    // Both goal.added events were explored despite the pause.
+    let deliveries = json_lines(&ok(
+        repo,
+        &[
+            "event",
+            "ls",
+            "--agent",
+            "explorer",
+            "--kind",
+            "goal.added",
+            "--format",
+            "json",
+        ],
+    ));
+    assert_eq!(deliveries.len(), 2);
+    assert!(
+        deliveries.iter().all(|e| e["delivery"] == "done"),
+        "{deliveries:?}"
+    );
+    // …and the process then went idle on the pause.
+    let exited = json_lines(&ok(repo, &["ps", "-a", "--format", "json"]));
+    assert!(
+        exited.iter().any(|p| p["exit_reason"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("idle (paused")),
+        "{exited:?}"
+    );
+}
