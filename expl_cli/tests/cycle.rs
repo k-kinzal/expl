@@ -1281,6 +1281,119 @@ fn weighted_agents_of_one_role_split_its_events() {
     assert!(explorer > 0 && contrarian > 0, "{explorer} + {contrarian}");
 }
 
+/// `base` with a `contrarian` exploration beside the `explorer`, the two
+/// sharing the role by weight, nearly every event routed to `favored`.
+fn weighted_declaration(base: &str, favored: &str) -> String {
+    let weight = |agent: &str| if agent == favored { 1_000_000 } else { 1 };
+    let explorer = base
+        .split("\n[agent.")
+        .find(|section| section.starts_with("explorer]"))
+        .expect("explorer section");
+    let contrarian = explorer.replacen("explorer]", "contrarian]", 1);
+    format!(
+        "{}\n[agent.{}\nweight = {}\n",
+        base.replacen(
+            "breadth = 3\n",
+            &format!("breadth = 3\nweight = {}\n", weight("explorer")),
+            1
+        ),
+        contrarian.trim_end(),
+        weight("contrarian")
+    )
+}
+
+#[test]
+fn weighted_assignments_hold_across_declarations_and_restarts() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let base = std::fs::read_to_string(repo.join("expl.toml")).expect("read");
+    let favor = |agent: &str| {
+        std::fs::write(repo.join("expl.toml"), weighted_declaration(&base, agent))
+            .expect("declaration");
+    };
+    let add_goals = |prefix: &str| {
+        for i in 0..4 {
+            ok(repo, &["goal", "add", &format!("{prefix} {i}")]);
+        }
+    };
+    let settled = |agent: &str, goals: usize| {
+        let deliveries = json_lines(&ok(
+            repo,
+            &[
+                "event",
+                "ls",
+                "--agent",
+                agent,
+                "--kind",
+                "goal.added",
+                "--format",
+                "json",
+            ],
+        ));
+        deliveries.len() == goals && deliveries.iter().all(|e| e["delivery"] == "done")
+    };
+
+    // Overlapping processes, each of which loaded weights that route
+    // nearly every event to itself, race for the same goals.
+    favor("explorer");
+    let explorer = ok(repo, &["run", "explorer", "-d"]);
+    let running = |name: &str| json(&ok(repo, &["process", "inspect", name]))["state"] == "running";
+    wait_until("the explorer to start", || running(&explorer));
+    favor("contrarian");
+    let contrarian = ok(repo, &["run", "contrarian", "-d"]);
+    wait_until("the contrarian to start", || running(&contrarian));
+    add_goals("Overlap");
+    wait_until("both agents to settle every goal", || {
+        settled("explorer", 4) && settled("contrarian", 4)
+    });
+    ok(repo, &["down", "--time", "5"]);
+
+    // After a restart, each agent loads weights that route nearly every
+    // event to itself again, but the first to route an event decides.
+    add_goals("Explorer first");
+    favor("explorer");
+    ok(repo, &["run", "explorer", "--exit-when-idle"]);
+    favor("contrarian");
+    ok(repo, &["run", "contrarian", "--exit-when-idle"]);
+    // …and with weights that route every event away from itself, an agent
+    // still reacts to what was assigned to it.
+    add_goals("Explorer routes away");
+    ok(repo, &["run", "explorer", "--exit-when-idle"]);
+    favor("explorer");
+    ok(repo, &["run", "contrarian", "--exit-when-idle"]);
+    assert!(settled("explorer", 12) && settled("contrarian", 12));
+
+    // Every goal was explored exactly once, by the agent it is assigned to.
+    let db = rusqlite::Connection::open(repo.join(".expl/expl.db")).expect("db");
+    let mut statement = db
+        .prepare(
+            "SELECT e.id, s.agent, \
+             (SELECT group_concat(r.agent) FROM agent_runs r WHERE r.event_id = e.id) \
+             FROM events e LEFT JOIN assignments s \
+             ON s.role = 'exploration' AND s.event_id = e.id \
+             WHERE e.kind = 'goal.added' ORDER BY e.id",
+        )
+        .expect("prepare");
+    let rows: Vec<(i64, Option<String>, Option<String>)> = statement
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(rows.len(), 12, "{rows:?}");
+    for (event, assigned, ran) in &rows {
+        assert!(assigned.is_some(), "e{event} was never assigned: {rows:?}");
+        assert_eq!(assigned, ran, "e{event}: {rows:?}");
+    }
+    let assigned = |range: std::ops::Range<usize>| -> Vec<&str> {
+        rows[range]
+            .iter()
+            .filter_map(|(_, a, _)| a.as_deref())
+            .collect()
+    };
+    assert_eq!(assigned(4..8), vec!["explorer"; 4], "{rows:?}");
+    assert_eq!(assigned(8..12), vec!["contrarian"; 4], "{rows:?}");
+}
+
 #[test]
 fn a_failed_step_grows_new_hypotheses_in_its_place() {
     let sandbox = sandbox();

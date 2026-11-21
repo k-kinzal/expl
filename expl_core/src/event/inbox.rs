@@ -7,6 +7,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::event::{Event, EventId, EventKind};
 use crate::graph::NodeId;
 use crate::process::ProcessId;
+use crate::role::Role;
 use crate::store::{self, EPOCH, NOW, StoreError};
 
 /// How long a delivery stays leased without renewal. A process renews the
@@ -498,6 +499,52 @@ impl Inbox {
         Ok(count as usize)
     }
 
+    /// The one agent of `role` that `event` is assigned to, among the
+    /// agents sharing the role by weight: the assignment already recorded,
+    /// or else `proposed`, recorded now. The first process to route an
+    /// event decides, atomically, and every later call — from any process,
+    /// whatever weights it loaded, before or after a restart — returns that
+    /// same agent, so exactly one weighted agent reacts to the event.
+    /// Assign before reacting to an event or acknowledging it as routed
+    /// elsewhere.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failure.
+    pub fn assign(
+        &self,
+        role: Role,
+        event: EventId,
+        proposed: &str,
+    ) -> Result<String, rusqlite::Error> {
+        self.conn.query_row(
+            "INSERT INTO assignments (role, event_id, agent) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (role, event_id) DO UPDATE SET agent = assignments.agent \
+             RETURNING agent",
+            params![role.as_str(), event.0, proposed],
+            |r| r.get(0),
+        )
+    }
+
+    /// The agent of `role` that `event` was assigned to, if it was.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failure.
+    pub fn assignment(
+        &self,
+        role: Role,
+        event: EventId,
+    ) -> Result<Option<String>, rusqlite::Error> {
+        self.conn
+            .query_row(
+                "SELECT agent FROM assignments WHERE role = ?1 AND event_id = ?2",
+                params![role.as_str(), event.0],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
     /// The delivery status of `event` for this agent, if it was ever
     /// delivered.
     ///
@@ -856,6 +903,71 @@ mod tests {
         );
         planner_1.ack(&first, None).expect("ack");
         assert_eq!(planner_1.backlog(PROPOSED).expect("backlog"), 0);
+    }
+
+    #[test]
+    fn the_first_assignment_of_an_event_stands() {
+        let f = fixture();
+        let event = EventId(1);
+        // Processes of two agents propose different recipients at once,
+        // as if they had loaded different weights.
+        let owners: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let db = f.db.clone();
+                    scope.spawn(move || {
+                        let (agent, proposed) = if i % 2 == 0 {
+                            ("explorer", "contrarian")
+                        } else {
+                            ("contrarian", "explorer")
+                        };
+                        Inbox::open(&db, agent)
+                            .expect("inbox")
+                            .assign(Role::Exploration, event, proposed)
+                            .expect("assign")
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect()
+        });
+        let first = owners[0].clone();
+        assert!(owners.iter().all(|o| *o == first), "{owners:?}");
+
+        // After a restart, with yet other weights, the record still stands.
+        let reopened = Inbox::open(&f.db, "explorer").expect("inbox");
+        let other = if first == "explorer" {
+            "contrarian"
+        } else {
+            "explorer"
+        };
+        assert_eq!(
+            reopened
+                .assign(Role::Exploration, event, other)
+                .expect("assign"),
+            first
+        );
+        assert_eq!(
+            reopened
+                .assignment(Role::Exploration, event)
+                .expect("assignment"),
+            Some(first)
+        );
+        // Each role assigns its events on its own.
+        assert_eq!(
+            reopened
+                .assignment(Role::Planning, event)
+                .expect("assignment"),
+            None
+        );
+        assert_eq!(
+            reopened
+                .assign(Role::Planning, event, "planner")
+                .expect("assign"),
+            "planner"
+        );
     }
 
     #[test]
