@@ -48,13 +48,4 @@ pub enum RoleError {
         /// What changed, naming the changed paths.
         changes: ScratchChanges,
     },
-    /// The agent's response does not decode into the role's contract.
-    #[error("{role} response does not match its schema: {source}")]
-    Response {
-        /// The role.
-        role: &'static str,
-        /// Decode error.
-        #[source]
-        source: serde_json::Error,
-    },
 }
