@@ -1,0 +1,46 @@
+# expl declaration. See README.md and `expl --help`..
+
+# Agents available to this project. `kind` selects the driver:
+#   claude_code — `claude --print --output-format json --json-schema ...`
+#   codex       — `codex exec --output-schema ... --output-last-message ...`
+#   generic     — any command: prompt on stdin, JSON response on stdout
+#
+# Agents run unattended inside expl-owned git worktrees, so the default
+# below lets Claude Code edit files and run commands without asking.
+[agent.claude]
+kind = "claude_code"
+command = ["claude"]
+args = ["--permission-mode", "bypassPermissions"]
+
+# Which agent carries each role. `instructions` is appended to the role's
+# built-in prompt.
+[role.explorer]
+agent = "claude"
+instructions = "AGENTS.md describes the vision and architecture; propose steps that move expl toward it."
+
+[role.planner]
+agent = "claude"
+
+[role.executor]
+agent = "claude"
+instructions = """
+This repository is expl itself (Rust workspace: expl_core, expl_cli). Follow AGENTS.md:
+keep its nouns and responsibilities, document public items, keep errors typed (thiserror).
+Before finishing, `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` must pass;
+report succeeded=false if they do not.
+"""
+
+[role.evaluator]
+agent = "claude"
+instructions = """
+Run `cargo clippy --all-targets` and `cargo test`. A goal is never satisfied by a branch on
+which either fails. Judge naming and responsibilities against AGENTS.md as part of quality.
+"""
+
+[run]
+# Nodes executed (and evaluated) concurrently, each in its own worktree.
+parallelism = 2
+# Maximum nodes proposed by one exploration.
+breadth = 3
+# Exploration pauses while this many nodes await execution.
+max_pending = 6

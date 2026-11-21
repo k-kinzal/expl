@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = [
+    "expl_core",
+    "expl_cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/k-kinzal/expl"
+authors = ["expl contributors"]
+
+# Policy (inherited from iter): `anyhow` is test-only. Library and binary code
+# carry typed `thiserror` errors so every failure has a named category.
+[workspace.dependencies]
+expl_core = { path = "expl_core", version = "0.1.0" }
+
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rusqlite = { version = "0.43", features = ["bundled"] }
+clap = { version = "4", features = ["derive", "env"] }
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "deny"
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+trivial_numeric_casts = "deny"
+let_underscore_drop = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+todo = "deny"
+unimplemented = "deny"
+wildcard_enum_match_arm = "deny"
+# Module names mirror domain nouns even when a type shares the same noun.
+module_inception = "allow"
+# Several APIs take owned values to match builder ergonomics.
+needless_pass_by_value = "allow"
+# Role and CLI workflows are clearer kept as single functions.
+too_many_lines = "allow"
+# Numeric narrowing is permitted at SQLite and display boundaries.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"

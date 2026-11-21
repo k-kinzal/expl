@@ -1,0 +1,11 @@
+# Rust build output
+/target/
+
+# expl local state (graph database, worktrees, logs)
+/.expl/
+
+# Editors and OS metadata
+.DS_Store
+.idea/
+.vscode/
+*.swp
