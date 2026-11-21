@@ -58,3 +58,17 @@ while processes run; if state must be repaired, `expl down` first and keep a cop
 
 - Agents could only use one CLI, and Cursor Agent had no driver. Added the
   `cursor_agent` driver and `[[agent.<name>.alternative]]` routing (rotate + failover).
+- Exploration only reacted to events, so a starting point was explored once and
+  then never again. Added `node.revisited`: an idle explorer revisits a random
+  starting point after `revisit_cooldown` seconds, and exploration prompts list the
+  existing steps (section "Already proposed") so repeats grow new alternatives.
+- Exploration was narrow (`breadth = 3`, and the prompt told agents to drop weak
+  ideas), and several agents of one role all reacted to every event. Exploration now
+  enumerates broadly, planning ranks risky steps low instead of pruning them, and
+  `weight` routes a role's events between agents (mainstream `explorer` / `fringe`).
+- Joins whose merge conflicted always failed: the agent resolved the markers but git
+  still listed the files as unmerged. Fixed by adopting #3 (`Workspace::resume`
+  concludes the merge after checking the markers are gone).
+- A newly declared agent receives every past event of its role (its backlog starts
+  at the whole history). With `weight` it reacts only to its share; expect a few
+  catch-up explorations after adding one.

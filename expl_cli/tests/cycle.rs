@@ -7,9 +7,11 @@ use std::time::{Duration, Instant};
 
 /// One script plays every role. Exploration proposes a step only for a new
 /// goal, so the graph settles; execution writes a file named after its node
-/// and sleeps while `@DIR@/slow` exists. Planning answers with
-/// `@DIR@/plan.json` when present. Every prompt is kept in `@DIR@/prompts/`
-/// for inspection.
+/// (and `shared.txt` too while `@DIR@/shared` exists, so joined steps
+/// conflict) and sleeps while `@DIR@/slow` exists. Facing merge conflicts,
+/// execution resolves them, or claims to while `@DIR@/unresolvable`
+/// exists. Planning answers with `@DIR@/plan.json` when present. Every
+/// prompt is kept in `@DIR@/prompts/` for inspection.
 const AGENT: &str = r#"#!/bin/sh
 mkdir -p "@DIR@/prompts"
 cat > "@DIR@/prompts/$EXPL_ROLE-$$.txt"
@@ -28,7 +30,16 @@ planning)
   fi ;;
 execution)
   while [ -f "@DIR@/slow" ]; do sleep 0.2; done
+  conflicted=$(git diff --name-only --diff-filter=U)
+  if [ -n "$conflicted" ]; then
+    if [ ! -f "@DIR@/unresolvable" ]; then
+      for f in $conflicted; do echo resolved > "$f"; done
+    fi
+    echo '{"succeeded":true,"summary":"resolved conflicts"}'
+    exit 0
+  fi
   echo "node $EXPL_NODE" > "node-$EXPL_NODE.txt"
+  if [ -f "@DIR@/shared" ]; then echo "node $EXPL_NODE" > shared.txt; fi
   echo '{"succeeded":true,"summary":"wrote a file"}' ;;
 evaluation)
   if ls node-*.txt > /dev/null 2>&1; then
@@ -53,12 +64,33 @@ impl Drop for Sandbox {
 
 impl Sandbox {
     fn slow(&self, on: bool) {
-        let marker = self.dir.path().join("slow");
+        self.marker("slow", on);
+    }
+
+    fn marker(&self, name: &str, on: bool) {
+        let marker = self.dir.path().join(name);
         if on {
             std::fs::write(marker, "").expect("marker");
         } else {
             std::fs::remove_file(marker).expect("marker");
         }
+    }
+
+    /// `parents` steps, each writing `shared.txt` its own way, and a step
+    /// joining them all in order.
+    fn conflicting_join(&self, parents: usize) -> (Vec<String>, String) {
+        let repo = &self.repo;
+        ok(repo, &["goal", "add", "Everything combined"]);
+        self.marker("shared", true);
+        let parents: Vec<String> = (0..parents)
+            .map(|i| ok(repo, &["node", "add", &format!("P{i}"), "--priority", "1"]))
+            .collect();
+        let mut args = vec!["node", "add", "Join", "--priority", "1"];
+        for parent in &parents {
+            args.extend(["--after", parent.as_str()]);
+        }
+        let join = ok(repo, &args);
+        (parents, join)
     }
 }
 
@@ -305,6 +337,79 @@ fn completed_predecessors_make_joined_steps_ready() {
             "{expected} missing from {files}"
         );
     }
+}
+
+#[test]
+fn conflicting_joins_merge_every_predecessor() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let (parents, join) = sandbox.conflicting_join(3);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+
+    // The first merge conflicts, and so does the next; each is resolved
+    // and merging resumes before the step itself is worked on.
+    let step = node(repo, &join);
+    assert_eq!(step["node"]["status"], "completed", "{step}");
+    let tip = step["node"]["head_commit"].as_str().expect("tip");
+    let branch = format!("expl/node-{join}");
+    assert_eq!(git(repo, &["rev-parse", &branch]), tip);
+    for parent in &parents {
+        let commit = node(repo, parent)["node"]["head_commit"]
+            .as_str()
+            .expect("commit")
+            .to_owned();
+        git(repo, &["merge-base", "--is-ancestor", &commit, tip]);
+    }
+    let files = git(repo, &["ls-tree", "--name-only", &branch]);
+    for id in parents.iter().chain([&join]) {
+        let expected = format!("node-{id}.txt");
+        assert!(
+            files.lines().any(|f| f == expected),
+            "{expected} missing from {files}"
+        );
+    }
+    assert_eq!(
+        git(repo, &["show", &format!("{branch}:shared.txt")]),
+        format!("node {join}")
+    );
+    // Two resolutions, then the step's own work.
+    let runs = step["agent_runs"].as_array().expect("runs");
+    assert_eq!(runs.len(), 3, "{runs:?}");
+    assert!(runs.iter().all(|r| r["status"] == "succeeded"), "{runs:?}");
+    let resolutions = std::fs::read_dir(sandbox.dir.path().join("prompts"))
+        .expect("prompts")
+        .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("prompt"))
+        .filter(|text| text.contains("conflicts in: shared.txt"))
+        .count();
+    assert_eq!(resolutions, 2);
+}
+
+#[test]
+fn unresolved_conflicts_fail_the_step() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let (parents, join) = sandbox.conflicting_join(2);
+    sandbox.marker("unresolvable", true);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+
+    for parent in &parents {
+        assert_eq!(node(repo, parent)["node"]["status"], "completed");
+    }
+    // The agent claims success, but the conflict markers are still there:
+    // the step fails before its own work starts.
+    let step = node(repo, &join);
+    assert_eq!(step["node"]["status"], "failed", "{step}");
+    let outcome = step["node"]["outcome"].as_str().expect("outcome");
+    assert!(outcome.contains("shared.txt"), "{outcome}");
+    assert_eq!(step["agent_runs"].as_array().expect("runs").len(), 1);
+    let events = json_lines(&ok(repo, &["event", "ls", "--format", "json"]));
+    let about_join: Vec<&str> = events
+        .iter()
+        .filter(|e| e["node"].as_i64() == join.parse().ok())
+        .filter_map(|e| e["kind"].as_str())
+        .collect();
+    assert!(about_join.contains(&"node.failed"), "{about_join:?}");
+    assert!(!about_join.contains(&"node.completed"), "{about_join:?}");
 }
 
 #[test]
@@ -633,4 +738,66 @@ fn idle_exploration_revisits_random_starting_points() {
         .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("prompt"))
         .any(|text| text.contains("## Already proposed") && text.contains("- Write hello"));
     assert!(told, "no exploration prompt listed the existing steps");
+}
+
+#[test]
+fn weighted_agents_of_one_role_split_its_events() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let declaration = std::fs::read_to_string(repo.join("expl.toml")).expect("read");
+    let explorer = declaration
+        .split("\n[agent.")
+        .find(|section| section.starts_with("explorer]"))
+        .expect("explorer section")
+        .to_owned();
+    let contrarian = explorer.replacen("explorer]", "contrarian]", 1);
+    std::fs::write(
+        repo.join("expl.toml"),
+        format!(
+            "{}\n[agent.{}weight = 1\n",
+            declaration.replacen("max_pending = 6\n", "max_pending = 6\nweight = 1\n", 1),
+            contrarian.trim_end().to_owned() + "\n"
+        ),
+    )
+    .expect("declaration");
+    for title in ["One", "Two", "Three", "Four", "Five", "Six"] {
+        ok(repo, &["goal", "add", title]);
+    }
+    ok(repo, &["run", "explorer", "--exit-when-idle"]);
+    ok(repo, &["run", "contrarian", "--exit-when-idle"]);
+
+    // Each goal.added was explored by exactly one of the two agents (not
+    // by both), and both agents are done with every one of them.
+    for agent in ["explorer", "contrarian"] {
+        let deliveries = json_lines(&ok(
+            repo,
+            &[
+                "event",
+                "ls",
+                "--agent",
+                agent,
+                "--kind",
+                "goal.added",
+                "--format",
+                "json",
+            ],
+        ));
+        assert_eq!(deliveries.len(), 6);
+        assert!(
+            deliveries.iter().all(|e| e["delivery"] == "done"),
+            "{deliveries:?}"
+        );
+    }
+    // Forward explorations are journaled on the node they start from.
+    let runs = |agent: &str| {
+        node(repo, "1")["agent_runs"]
+            .as_array()
+            .expect("runs")
+            .iter()
+            .filter(|r| r["agent"] == agent)
+            .count()
+    };
+    let (explorer, contrarian) = (runs("explorer"), runs("contrarian"));
+    assert_eq!(explorer + contrarian, 6, "{explorer} + {contrarian}");
+    assert!(explorer > 0 && contrarian > 0, "{explorer} + {contrarian}");
 }

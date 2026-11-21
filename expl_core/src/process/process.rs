@@ -270,6 +270,9 @@ impl<'a> Process<'a> {
                     .is_some_and(|cooldown| last_reaction.elapsed() >= cooldown)
                     && revisit_at_random(&mut graph)?
                 {
+                    // The cooldown runs from the revisit, wherever routing
+                    // sends it, so a role revisits once per cooldown.
+                    last_reaction = Instant::now();
                     waiting = false;
                     continue;
                 }
@@ -281,6 +284,27 @@ impl<'a> Process<'a> {
                 continue;
             };
             waiting = false;
+            // Agents sharing a role by weight react only to the events
+            // routed to them; the others are theirs to acknowledge.
+            if let Some(owner) = self
+                .context
+                .declaration()
+                .route(self.agent.name(), delivery.event.id)
+                .filter(|owner| *owner != self.agent.name())
+            {
+                let report = Report::Ignored {
+                    reason: format!("routed to `{owner}`"),
+                };
+                if holding(inbox.ack(&delivery, Some(&report.summary())))?.is_some() {
+                    observer.observe(&ProcessActivity::Reacted {
+                        delivery: &delivery,
+                        report: &report,
+                    });
+                } else {
+                    observer.observe(&ProcessActivity::LeaseLost(&delivery));
+                }
+                continue;
+            }
             processes.set_activity(self.id, Some(&format!("reacting to {}", delivery.event)))?;
             observer.observe(&ProcessActivity::Reacting(&delivery));
 
