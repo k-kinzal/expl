@@ -42,7 +42,9 @@ pub mod trunk;
 pub mod workspace;
 
 pub use agent::{Agent, AgentDriver, AgentError, AgentRun, DriverKind};
-pub use declaration::{AgentDeclaration, CliDeclaration, Declaration, DeclarationError};
+pub use declaration::{
+    AgentDeclaration, CliDeclaration, Declaration, DeclarationError, Timeout, TimeoutError,
+};
 pub use event::{Delivery, Event, EventId, EventKind, Inbox, InboxError, LeaseToken};
 pub use graph::{
     AgentRunId, AgentRunRecord, AgentRunStatus, Edge, Epoch, Evaluation, Graph, GraphError,

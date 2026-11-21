@@ -49,9 +49,10 @@ impl Context {
     ///
     /// # Errors
     ///
-    /// [`DeclarationError::UnknownAgent`].
+    /// [`DeclarationError::UnknownAgent`], or
+    /// [`DeclarationError::Timeout`] for an unusable `timeout`.
     pub fn agent(&self, name: &str) -> Result<Agent, DeclarationError> {
-        Ok(Agent::from_declaration(name, self.declaration.agent(name)?))
+        Agent::from_declaration(name, self.declaration.agent(name)?)
     }
 
     /// A fresh connection to the project's graph.

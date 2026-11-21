@@ -1,5 +1,7 @@
 //! [`AgentError`].
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 /// An agent invocation did not yield a usable response.
@@ -22,6 +24,13 @@ pub enum AgentError {
     /// The process was asked to stop; the invocation was cut short.
     #[error("agent invocation interrupted")]
     Interrupted,
+    /// The CLI outran its declared `timeout` and was stopped. Unlike
+    /// [`Interrupted`](Self::Interrupted), this is a failure of the CLI.
+    #[error("agent timed out after {}", humantime::format_duration(*after))]
+    TimedOut {
+        /// The `timeout` it outran.
+        after: Duration,
+    },
     /// The agent finished but its response is not the requested shape.
     #[error("agent response is unusable: {0}")]
     InvalidResponse(String),
