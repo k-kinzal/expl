@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -30,6 +30,15 @@ use crate::role::Role;
 /// How long an interrupted or timed-out invocation gets to exit after
 /// SIGTERM.
 const TERMINATION_GRACE: Duration = Duration::from_secs(5);
+
+/// How long children an exited CLI left behind get to exit after SIGTERM
+/// before they are killed.
+const LEFTOVER_GRACE: Duration = Duration::from_secs(2);
+
+/// How long the output is still read once the CLI and its process group are
+/// gone. A process that escaped the group can hold the pipes open forever;
+/// past this bound, whatever was read so far is the output.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// One request to invoke an agent: what to say, where, and where to log.
 #[derive(Debug, Clone, Copy)]
@@ -264,9 +273,10 @@ impl Agent {
             .map(|pipe| tee(pipe, Arc::clone(&log), "[stderr] "));
 
         let end = wait(&mut child, invocation.interrupt, deadline.map(|(at, _)| at))?;
-        let join = |handle: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>| {
-            handle
-                .map(|h| h.join().unwrap_or_else(|_| Ok(Vec::new())))
+        let reaped = matches!(end, End::Exited(_)) && reap_group(child.id());
+        let drained_by = Instant::now() + DRAIN_GRACE;
+        let join = |tee: Option<Tee>| {
+            tee.map(|tee| tee.finish(drained_by))
                 .transpose()
                 .map(Option::unwrap_or_default)
         };
@@ -278,11 +288,19 @@ impl Agent {
             stdout: join(stdout)?,
             stderr: join(stderr)?,
         };
-        feeder.join().unwrap_or(Ok(()))?;
+        if let Some(fed) = join_by(feeder, drained_by) {
+            fed.unwrap_or(Ok(()))?;
+        }
         {
             let mut log = log
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if reaped {
+                writeln!(
+                    log,
+                    "=== note: the CLI exited leaving processes behind; its process group was killed ==="
+                )?;
+            }
             match end {
                 End::Exited(status) => writeln!(log, "=== exit: {status} ===")?,
                 End::Interrupted => writeln!(log, "=== interrupted ===")?,
@@ -342,8 +360,9 @@ fn wait(
     }
 }
 
-/// Send `signal` to the process group led by `pid`.
-fn signal_group(pid: u32, signal: &str) {
+/// Send `signal` to the process group led by `pid`; `true` when the group
+/// still had a member to receive it.
+fn signal_group(pid: u32, signal: &str) -> bool {
     // Best effort: the group may already be gone.
     Command::new("kill")
         .arg(signal)
@@ -352,36 +371,103 @@ fn signal_group(pid: u32, signal: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .ok();
+        .is_ok_and(|status| status.success())
+}
+
+/// Stop whatever is left of the process group led by the exited CLI `pid`
+/// (TERM, then KILL after a grace period), so background children cannot
+/// hold its pipes open. `true` when there was something to stop.
+fn reap_group(pid: u32) -> bool {
+    if !signal_group(pid, "-TERM") {
+        return false;
+    }
+    let grace = Instant::now() + LEFTOVER_GRACE;
+    while Instant::now() < grace {
+        if !signal_group(pid, "-0") {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    signal_group(pid, "-KILL");
+    true
+}
+
+/// Join `handle` if its thread finishes by `deadline`; otherwise leave it
+/// running detached and return `None`.
+fn join_by<T>(handle: thread::JoinHandle<T>, deadline: Instant) -> Option<thread::Result<T>> {
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Some(handle.join())
+}
+
+/// A thread copying a child pipe into the shared log, and what it has
+/// captured so far.
+struct Tee {
+    handle: thread::JoinHandle<std::io::Result<()>>,
+    captured: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Tee {
+    /// The captured output once the pipe closes, or what was captured by
+    /// `deadline` if it is still held open then.
+    fn finish(self, deadline: Instant) -> std::io::Result<Vec<u8>> {
+        if let Some(Ok(result)) = join_by(self.handle, deadline) {
+            result?;
+        }
+        let mut captured = self
+            .captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(std::mem::take(&mut *captured))
+    }
 }
 
 /// Copy a child pipe into the shared log line by line while buffering it.
-fn tee(
-    pipe: impl Read + Send + 'static,
-    log: Arc<Mutex<File>>,
-    prefix: &'static str,
-) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
-    thread::spawn(move || {
-        let mut reader = BufReader::new(pipe);
-        let mut captured = Vec::new();
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            if reader.read_until(b'\n', &mut line)? == 0 {
-                break;
-            }
-            captured.extend_from_slice(&line);
+fn tee(pipe: impl Read + Send + 'static, log: Arc<Mutex<File>>, prefix: &'static str) -> Tee {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let buffer = Arc::clone(&captured);
+    let handle = thread::spawn(move || {
+        let mut pipe = pipe;
+        let mut chunk = [0_u8; 8192];
+        let mut pending = Vec::new();
+        let write_line = |line: &[u8]| -> std::io::Result<()> {
             let mut log = log
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             log.write_all(prefix.as_bytes())?;
-            log.write_all(&line)?;
+            log.write_all(line)?;
             if !line.ends_with(b"\n") {
                 log.write_all(b"\n")?;
             }
+            Ok(())
+        };
+        loop {
+            let read = match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(&chunk[..read]);
+            pending.extend_from_slice(&chunk[..read]);
+            while let Some(end) = pending.iter().position(|&b| b == b'\n') {
+                write_line(&pending[..=end])?;
+                pending.drain(..=end);
+            }
         }
-        Ok(captured)
-    })
+        if !pending.is_empty() {
+            write_line(&pending)?;
+        }
+        Ok(())
+    });
+    Tee { handle, captured }
 }
 
 #[cfg(test)]
@@ -527,6 +613,51 @@ timeout = 1
                 && text.contains("falling over to the next CLI");
         }
         assert!(fell_over, "no invocation fell over from the timed-out CLI");
+    }
+
+    #[test]
+    fn background_children_holding_the_pipes_are_reaped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("run.log");
+        let pid_file = dir.path().join("pid");
+        let text = format!(
+            r#"
+[agent.a]
+role = "planning"
+driver = "generic"
+command = ["sh", "-c", "echo '{{\"ok\":true}}'; sleep 60 & echo $! > {}"]
+replicas = 1
+"#,
+            pid_file.display()
+        );
+        let started = Instant::now();
+        let run = invoke(&agent(&text), &log).expect("run");
+        assert_eq!(run.response["ok"], true);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            std::fs::read_to_string(&log)
+                .expect("log")
+                .contains("its process group was killed"),
+        );
+
+        let sleeper = std::fs::read_to_string(&pid_file).expect("pid");
+        let alive = || {
+            Command::new("kill")
+                .args(["-0", sleeper.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .expect("kill")
+                .success()
+        };
+        let gone_by = Instant::now() + Duration::from_secs(3);
+        while alive() && Instant::now() < gone_by {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(), "background child {} survived", sleeper.trim());
     }
 
     fn agent_text_all_failing() -> String {
