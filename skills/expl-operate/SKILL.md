@@ -62,7 +62,9 @@ yourself — expl does. You only fix what blocks expl from continuing to explore
 - All agents share `CARGO_TARGET_DIR=/Users/ab/Projects/expl/.expl/cargo-target`
   so worktrees do not rebuild gpui from scratch. Builds serialise on cargo's lock;
   that is expected, not a hang.
-- The `expl` binary on PATH is `~/.cargo/bin/expl` (installed from `main`).
+- The `expl` binary on PATH is `~/.cargo/bin/expl`, installed from `main` with
+  `skills/expl-operate/scripts/install.sh [--ui]` (builds in `target/`, then
+  copy-and-rename: plain `cp` over a binary makes macOS kill every later launch).
   Running processes keep the binary they started with until restarted.
 
 ## Where things are
@@ -81,6 +83,9 @@ yourself — expl does. You only fix what blocks expl from continuing to explore
 ```sh
 expl up                                   # idempotent: tops every agent up to `replicas`
 nohup expl-ui -C "$PWD" > .expl/operator/expl-ui.log 2>&1 &   # the live graph window
+# UI controls: scroll zooms around the pointer, drag pans, +/- zoom, f fits, 0 resets.
+# Adopted work is drawn as a branch merging into the trunk spine; merge origins have
+# a halo and a "+N" in their label.
 expl down -t 30                           # stop all (in-flight runs are interrupted and redelivered)
 expl run executor -d                      # one extra process of an agent
 ```
@@ -88,7 +93,7 @@ expl run executor -d                      # one extra process of an agent
 `skills/expl-operate/scripts/rolling-restart.sh` restarts every process that runs
 an older binary than the installed `expl`, each when it is idle (or has just moved
 on to a new event), so in-flight agent runs are not thrown away. Use it after every
-`cargo install`. `skills/expl-operate/scripts/watch.sh` streams the log lines worth
+install of a new binary. `skills/expl-operate/scripts/watch.sh` streams the log lines worth
 acting on (use it as a Monitor; `tail -F` misses processes started later on macOS).
 
 Check the UI is alive with `pgrep -fl expl-ui`; restart it with the line above if not.

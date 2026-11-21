@@ -16,8 +16,11 @@ installed=$(stat -f %m "$binary")
 state="$(mktemp -d "${TMPDIR:-/tmp}/expl-restart-XXXX")"
 trap 'rm -rf "$state"' EXIT
 
+expl --version >/dev/null || { echo "the installed expl does not run" >&2; exit 2; }
+
 while true; do
   stale=0
+  listing="$(expl ps --format json)" || { echo "expl ps failed" >&2; exit 2; }
   while IFS=$'\t' read -r name started activity; do
     [ -n "$name" ] || continue
     [ "$started" -ge "$installed" ] && continue
@@ -34,7 +37,7 @@ while true; do
       echo "$(date -u +%FT%TZ) restarting $name (${activity:-idle})"
       expl stop "$name" -t 30 >/dev/null && expl up >/dev/null 2>&1
     fi
-  done < <(expl ps --format json | python3 -c '
+  done < <(printf '%s\n' "$listing" | python3 -c '
 import json, sys
 from datetime import datetime
 for line in sys.stdin:

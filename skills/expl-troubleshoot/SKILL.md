@@ -36,6 +36,8 @@ ls -t .expl/logs | head                      # newest agent runs
 | nothing `ready` although steps are `planned` | predecessors not completed, or planner never prioritised them | `expl path ls`, `expl event ls --agent planner` |
 | merged into main but `expl origin ls` shows no new origin | no process is running, or trunk branch mismatch | `expl up`; `trunk = "main"` in `expl.toml`; the process log shows `cannot follow the trunk: …` |
 | `worktree add` / `branch -D` errors | leftover worktree or branch from a crash | `git worktree prune`; inspect `.expl/worktrees`; never delete `expl/node-*` branches of completed steps |
+| `expl` prints nothing and exits (even `--version`) | the binary was overwritten in place with `cp`; macOS kills it (invalid code signature) | reinstall with `skills/expl-operate/scripts/install.sh` (copy + rename) |
+| stray `.../cargo-target/debug/expl -C /var/folders/.../T/.tmp*/repo run …` processes | test sandboxes whose processes outlived an interrupted `cargo test` | kill them: `pkill -f 'cargo-target/debug/expl -C /private/var/folders'` |
 | builds look hung | cargo waits on the shared target dir lock | expected with several agents; check `ps aux | grep cargo` before suspecting a hang |
 
 ## Fixing expl's code
@@ -45,9 +47,11 @@ ls -t .expl/logs | head                      # newest agent runs
    add or extend a test under `expl_core`/`expl_cli` that fails without it.
 3. Gate: `cargo fmt --all --check && cargo clippy --all-targets && cargo test`.
 4. Commit to `main` with a `fix:` message (with the Co-Authored-By trailer).
-5. `cargo install --locked --path expl_cli` (and `--path expl_ui` if the UI changed),
-   then `expl down -t 30 && expl up` so processes run the fix. Restart `expl-ui` if
-   it was rebuilt.
+5. `skills/expl-operate/scripts/install.sh` (`--ui` too if the UI changed). Never
+   `cargo install` (rebuilds gpui from scratch, 20+ minutes) and never plain `cp`
+   over the binary (macOS then kills every launch: invalid code signature). Then
+   `skills/expl-operate/scripts/rolling-restart.sh` so processes run the fix.
+   Restart `expl-ui` if it was rebuilt.
 6. Retry what the bug broke (`expl node retry <id>`), and watch one full cycle.
 
 The DB schema lives in `expl_core/src/store.rs`. Never hand-edit `.expl/expl.db`
