@@ -13,7 +13,8 @@ use crate::graph::{
     NewEvaluation, NewOrigin, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Plan, PlanId,
     PlannedPath, Snapshot,
 };
-use crate::store::{self, NOW};
+use crate::process;
+use crate::store::{self, EPOCH, NOW};
 
 const NODE_COLUMNS: &str = "id, kind, status, title, objective, priority, counter_exploration, \
                             branch, head_commit, outcome, created_at, updated_at";
@@ -164,6 +165,20 @@ fn emit_if_ready(conn: &Connection, id: NodeId) -> Result<(), GraphError> {
         emit(conn, EventKind::NodeReady, Some(id))?;
     }
     Ok(())
+}
+
+/// SQL condition on a node `n`: a running step whose `node.ready` no live
+/// process holds an unexpired lease on.
+fn orphaned() -> String {
+    format!(
+        "n.kind = 'step' AND n.status = 'running' AND NOT EXISTS ( \
+             SELECT 1 FROM deliveries d JOIN events e ON e.id = d.event_id \
+             WHERE e.node_id = n.id AND e.kind = '{ready}' AND d.status = 'leased' \
+             AND d.leased_until >= {EPOCH} \
+             AND d.process_id IN (SELECT id FROM processes WHERE {live}))",
+        ready = EventKind::NodeReady.as_str(),
+        live = process::live(),
+    )
 }
 
 fn current_origin_in(conn: &Connection) -> Result<Option<NodeId>, GraphError> {
@@ -667,6 +682,47 @@ impl Graph {
             [id.0],
         )?;
         Ok(())
+    }
+
+    /// Running steps that no live process is executing: no live process
+    /// holds an unexpired lease on a `node.ready` delivery about them. Their
+    /// execution was abandoned, and nothing may ever take it up again.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError`] on SQLite failure.
+    pub fn orphans(&self) -> Result<Vec<Node>, GraphError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {NODE_COLUMNS} FROM nodes n WHERE {orphaned} ORDER BY id",
+            orphaned = orphaned()
+        ))?;
+        let rows = stmt.query_map([], node_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Give an [orphaned](Self::orphans) step back to the plan and record
+    /// `node.ready` again when it can run, so execution is delivered it
+    /// anew. `false`, changing nothing, when the step is not orphaned (any
+    /// more): it settled, or a live process took it up.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError`] on SQLite failure.
+    pub fn unclaim_orphan(&mut self, id: NodeId) -> Result<bool, GraphError> {
+        let tx = self.write()?;
+        let changed = tx.execute(
+            &format!(
+                "UPDATE nodes AS n SET status = 'planned', updated_at = {NOW} \
+                 WHERE n.id = ?1 AND {orphaned}",
+                orphaned = orphaned()
+            ),
+            [id.0],
+        )?;
+        if changed == 1 {
+            emit_if_ready(&tx, id)?;
+        }
+        tx.commit()?;
+        Ok(changed == 1)
     }
 
     /// Record the branch (and, when known, the tip commit) holding a node.

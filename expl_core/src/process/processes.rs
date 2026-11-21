@@ -18,6 +18,16 @@ pub const STARTUP_SECONDS: i64 = 30;
 const EXPIRED: &str =
     "status = 'created' AND COALESCE(start_by, 0) < CAST(strftime('%s','now') AS INTEGER)";
 
+/// SQL condition on a `processes` row: the process is believed alive, as
+/// [`ProcessRecord::is_live`] tells from its record — running and beating,
+/// or created and within its startup deadline.
+pub(crate) fn live() -> String {
+    format!(
+        "((status = 'running' AND COALESCE({EPOCH} - heartbeat_at, 0) <= {STALE_SECONDS}) \
+         OR (status = 'created' AND COALESCE(start_by, 0) >= {EPOCH}))"
+    )
+}
+
 const COLUMNS: &str = "id, name, agent, pid, status, detached, log_path, stop_requested, \
                        activity, exit_reason, created_at, finished_at, \
                        COALESCE(CAST(strftime('%s','now') AS INTEGER) - heartbeat_at, 0), \

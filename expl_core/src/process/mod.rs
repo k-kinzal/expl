@@ -24,5 +24,6 @@ pub use interrupt::Interrupt;
 pub use process::{
     MAX_ATTEMPTS, Process, ProcessActivity, ProcessError, ProcessObserver, ProcessOptions,
 };
+pub(crate) use processes::live;
 pub use processes::{HEARTBEAT_SECONDS, Processes, STALE_SECONDS, STARTUP_SECONDS};
 pub use record::{ProcessId, ProcessRecord, ProcessState, ProcessStatus};

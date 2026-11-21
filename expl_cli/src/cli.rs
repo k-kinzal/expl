@@ -4,7 +4,7 @@
 //! with Docker's verbs, and the familiar short forms are top-level aliases:
 //!
 //! ```text
-//! Setup:      expl init
+//! Setup:      expl init · expl doctor [--fix]
 //! Graph:      expl goal add|ls|retire
 //!             expl node ls|inspect|add|retry|prune|logs
 //! Trunk:      expl origin ls   (the trunk itself moves with git)
@@ -68,6 +68,18 @@ pub(crate) enum Command {
                       exclude .expl/ from git, and record the origin node at the base commit."
     )]
     Init(InitArgs),
+    /// Check the graph against git.
+    #[command(
+        long_about = "Report where the graph and git disagree, and exit non-zero if they do: \
+                      completed or failed steps whose branch or head commit is missing or is not \
+                      the branch tip; running steps no live process holds a lease for; origins \
+                      whose commit no longer exists; node worktrees still registered for steps \
+                      that are settled or unknown. With --fix, repair what is safe: orphaned \
+                      running steps are unclaimed so they are delivered again, and stale \
+                      worktree registrations are pruned (a worktree with changes is kept). \
+                      The rest is left to you."
+    )]
+    Doctor(DoctorArgs),
     /// Manage goals.
     #[command(subcommand)]
     Goal(GoalCommand),
@@ -130,6 +142,18 @@ pub(crate) struct InitArgs {
     /// (default: the branch checked out, or `--base` when it names one).
     #[arg(long, value_name = "BRANCH")]
     pub(crate) trunk: Option<String>,
+}
+
+/// `expl doctor`.
+#[derive(Debug, Args)]
+pub(crate) struct DoctorArgs {
+    /// Repair what is safe: unclaim orphaned running steps so they are
+    /// redelivered, and prune stale worktree registrations.
+    #[arg(long)]
+    pub(crate) fix: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = ListingFormat::Table)]
+    pub(crate) format: ListingFormat,
 }
 
 /// `expl origin ...`.

@@ -20,6 +20,7 @@
 //!   table behind `expl ps`.
 //! - [`workspace`] — node worktrees and scratch worktrees.
 //! - [`trunk`] — following the default branch: the origin moves with it.
+//! - [`doctor`] — checking the graph against git, and the safe repairs.
 //! - [`project`], [`declaration`], [`store`] — where it all lives, what the
 //!   operator wrote, and the database file.
 //!
@@ -30,6 +31,7 @@
 
 pub mod agent;
 pub mod declaration;
+pub mod doctor;
 pub mod event;
 pub mod git;
 pub mod graph;
@@ -43,6 +45,7 @@ pub mod workspace;
 
 pub use agent::{Agent, AgentDriver, AgentError, AgentRun, DriverKind};
 pub use declaration::{AgentDeclaration, CliDeclaration, Declaration, DeclarationError};
+pub use doctor::{Doctor, DoctorError, Inconsistency, Repair};
 pub use event::{Delivery, Event, EventId, EventKind, Inbox, InboxError, LeaseToken};
 pub use graph::{
     AgentRunId, AgentRunRecord, AgentRunStatus, Edge, Epoch, Evaluation, GoalTree, Graph,
