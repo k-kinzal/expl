@@ -2,6 +2,7 @@
 
 mod agent;
 mod candidate;
+mod doctor;
 mod event;
 mod goal;
 mod graph;
@@ -32,6 +33,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<(), CliError> {
     };
     match cli.command {
         Command::Init(args) => init::init(&start, &args),
+        Command::Doctor(args) => doctor::doctor(&start, &args),
         Command::Goal(command) => goal::goal(&start, command),
         Command::Node(command) => node::node(&start, command),
         Command::Graph(GraphCommand::Show(args)) => graph::show(&start, &args),

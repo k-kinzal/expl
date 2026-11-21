@@ -213,6 +213,53 @@ impl Workspaces {
         })
     }
 
+    /// The node worktrees registered with git: each node with the path its
+    /// worktree is registered at, whether or not the directory still
+    /// exists. Scratch worktrees are not node worktrees.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Git`] when git fails.
+    pub fn registered(&self) -> Result<Vec<(NodeId, PathBuf)>, WorkspaceError> {
+        let mut registered = Vec::new();
+        for path in self.repository.worktrees()? {
+            let node = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("node-"))
+                .and_then(|id| id.parse().ok())
+                .map(NodeId);
+            if let Some(node) = node
+                && path
+                    .parent()
+                    .is_some_and(|parent| same_dir(parent, &self.root))
+            {
+                registered.push((node, path));
+            }
+        }
+        Ok(registered)
+    }
+
+    /// Drop the registration of the node worktree at `path`, keeping its
+    /// branch: a registration whose directory is gone is pruned, and a
+    /// worktree that still exists is removed only when it is clean and
+    /// unlocked, so no uncommitted work is lost.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Git`] when git refuses (the worktree has changes
+    /// or is locked) or fails.
+    pub fn unregister(&self, path: &Path) -> Result<(), WorkspaceError> {
+        let _guard = lock(&self.lock)?;
+        if path.exists() {
+            let path_text = path.display().to_string();
+            self.repository.run(&["worktree", "remove", &path_text])?;
+        } else {
+            self.repository.run(&["worktree", "prune"])?;
+        }
+        Ok(())
+    }
+
     /// Remove `node`'s worktree and branch, if present.
     ///
     /// # Errors
@@ -460,6 +507,16 @@ impl Drop for ScratchWorkspace {
             self.repository.run(&["worktree", "prune"]).ok();
         }
     }
+}
+
+/// Whether `a` and `b` name the same directory; git reports worktree paths
+/// with symbolic links resolved.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (a.canonicalize(), b.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 /// Whether the file at `path` still holds a git conflict marker. A path

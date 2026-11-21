@@ -3,7 +3,8 @@
 use expl_core::agent::AgentError;
 use expl_core::git::GitError;
 use expl_core::{
-    DeclarationError, GraphError, ProcessError, ProjectError, RoleError, StoreError, WorkspaceError,
+    DeclarationError, DoctorError, GraphError, ProcessError, ProjectError, RoleError, StoreError,
+    WorkspaceError,
 };
 use thiserror::Error;
 
@@ -53,6 +54,12 @@ pub(crate) enum CliError {
     /// Agent.
     #[error(transparent)]
     Agent(#[from] AgentError),
+    /// Checking the graph against git.
+    #[error(transparent)]
+    Doctor(#[from] DoctorError),
+    /// `expl doctor` found the graph and git disagreeing.
+    #[error("the graph and git disagree in {0} place(s)")]
+    Inconsistent(usize),
     /// Filesystem or terminal I/O.
     #[error("{context}: {source}")]
     Io {
@@ -83,7 +90,8 @@ impl CliError {
                 | GraphError::NotInStatus { .. }
                 | GraphError::Cycle { .. },
             )
-            | Self::Process(ProcessError::NotAdoptable(_)) => exit::USER,
+            | Self::Process(ProcessError::NotAdoptable(_))
+            | Self::Inconsistent(_) => exit::USER,
             Self::Declaration(_) | Self::Role(RoleError::Declaration(_)) => exit::CONFIG,
             Self::Project(ProjectError::Io { .. })
             | Self::Store(_)
@@ -94,6 +102,7 @@ impl CliError {
             | Self::Role(_)
             | Self::Process(_)
             | Self::Agent(_)
+            | Self::Doctor(_)
             | Self::Io { .. } => exit::RUNTIME,
         }
     }

@@ -214,6 +214,22 @@ impl Git {
         self.test(&["rev-parse", "--verify", "--quiet", &spec])
     }
 
+    /// The paths of every worktree registered with the repository, the main
+    /// one first, as git records them — whether or not their directories
+    /// still exist.
+    ///
+    /// # Errors
+    ///
+    /// [`GitError`] when git fails.
+    pub fn worktrees(&self) -> Result<Vec<PathBuf>, GitError> {
+        let out = self.run(&["worktree", "list", "--porcelain", "-z"])?;
+        Ok(out
+            .split('\0')
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .map(PathBuf::from)
+            .collect())
+    }
+
     /// The tree that merging `theirs` into `ours` would produce, without
     /// touching any worktree or index; `None` when the merge conflicts.
     /// Histories without a common ancestor merge from the empty tree.
