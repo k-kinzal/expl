@@ -37,30 +37,51 @@ yourself — expl does. You only fix what blocks expl from continuing to explore
 | --- | --- | --- | --- |
 | explorer | exploration (mainstream, `weight = 4`) | claude_code ⇄ codex | 1 |
 | fringe | exploration (niche + counterexamples, `weight = 1`) | claude_code ⇄ codex | 1 |
+| surveyor | exploration across the whole graph (`scope = "graph"`, `weight = 1`) | claude_code ⇄ codex | 1 |
 | planner | planning | claude_code ⇄ codex | 1 |
 | executor | execution | cursor_agent (`--model claude-opus-5-5-high --force --trust --sandbox disabled`) | 1 |
 | evaluator | evaluation | claude_code ⇄ codex | 1 |
 
-- **Two kinds of exploration, routed by `weight`.** `explorer` enumerates the most
-  promising directions; `fringe` deliberately widens the frame — niche directions
-  inside the goal nobody asked for, inversions, and counterexamples (titles start
-  with `Fringe:` / `Counterexample:`). Agents of one role that declare `weight`
+- **Three kinds of exploration, routed by `weight` (4:1:1).** `explorer` enumerates
+  the most promising directions from a node; `fringe` deliberately widens the frame
+  from a node — niche directions inside the goal nobody asked for, inversions, and
+  counterexamples (titles start with `Fringe:` / `Counterexample:`); `surveyor`
+  (`scope = "graph"`) sees the whole map and attaches each proposal wherever it
+  fits — gaps, joins of separate paths, patterns across failures (titles start with
+  `Survey:`). A survey covers every event older than itself, so the surveyor skips
+  them ("the whole graph was surveyed at …").
+- **Failures grow hypotheses.** `node.failed` (and revisits of a failed step) make
+  exploration propose new steps in its place: same base, same goals, told what went
+  wrong and where the attempt's branch is (`explored past the failure from #N`). Agents of one role that declare `weight`
   split that role's events: each event goes to exactly one of them (4:1 here), the
   other acknowledges it as `routed to …`. Agents without `weight` get every event.
   To add another exploration perspective, declare another exploration agent with a
   `weight` and its own `instructions`.
 - **Explore wide, plan narrow.** Explorers list up to `breadth = 8` possibilities
   without filtering by likelihood; the planner ranks weak or counterproductive steps
-  low and prunes only duplicates. `max_pending = 20` bounds the backlog.
+  low and prunes only duplicates. There is no backlog limit, on the owner's
+  instruction: a new candidate can change what is most promising, and crowding is
+  planning's problem to solve, not a reason to stop exploring.
 - **One replica per agent, on purpose.** The owner prefers slow exploration over
   bursts of token use. Do not raise `replicas` without being asked.
 - **Random revisits** (`revisit_cooldown = 600` on the explorer): when the explorer
   has no event to react to, it waits until 10 minutes have passed since its last
   reaction, then explores again from a random starting point — the active origin,
-  a completed step not yet in the trunk, or a counter-exploration goal
+  a completed step not yet in the trunk, a failed step, or a counter-exploration goal
   (`node.revisited` in `expl event ls`). Starting points are revisited again and
   again (routed by weight like any exploration event); each prompt lists the steps that already exist so new ones are different.
-  `max_pending` still pauses it. Raise the cooldown if token use is too high.
+  Raise the cooldown if token use is too high — it is the only brake on
+  exploration besides execution's pace.
+- **Exploring ahead** (`speculate = true` on explorer and fringe — an experiment the
+  owner wants to judge by its results): revisits also pick steps not carried out
+  yet; exploring one assumes it (and the open steps under it) succeeds and proposes
+  what comes next (`explored ahead from #N`, prompt section `## Assumed done`). The
+  tree then grows deep before execution catches up. Only revisits do this, so the
+  cooldown bounds it.
+- **Rebasing is planning's call.** When the trunk moves, no step moves with it;
+  the planner lists in `rebases` the open steps that should start from the new
+  origin (`rebased …` in its log line), keeps the rest on the code they were
+  proposed for, or prunes them.
 - **Routing** (`[[agent.<name>.alternative]]`): each invocation starts at the next
   CLI in turn (per process, seeded by pid) and falls over to the other CLI when
   one fails (usage limit, outage, unusable reply). A run log shows which CLI ran
@@ -125,21 +146,28 @@ Typical rhythm: look every few minutes; act when (a) a candidate appears or a st
 scores high → `expl-adopt`; (b) a delivery failed, a process exited, or nothing has
 moved for long → `expl-troubleshoot`.
 
-Note: exploration pauses itself while `max_pending` (20) steps wait for execution
-(`paused: N steps pending` in `expl ps`). That is back-pressure, not a bug. A newly
-added goal is still explored at once while paused (`goal.added` is unpausable).
+Exploration is never paused by the backlog (there is no `max_pending`).
 
 ## Goals
 
 ```sh
-expl goal ls -a
-expl goal add "TITLE" --objective "measurable condition" [--counter]
+expl goal ls -a                     # tree order; UNDER = the goals a subgoal serves
+expl goal add "TITLE" --objective "measurable condition" [--counter] [--under GOAL]...
 expl goal retire <id>
 ```
 
 Write objectives as checkable conditions (tests pass, behaviour X observable).
 Add new goals only when the owner asks or when the vision goal clearly needs a
 sharper sub-perspective; say so to the owner when you do.
+
+**Subgoals** (`--under GOAL`, nestable) are hypotheses about a route toward a goal:
+"if this held, the goal would be within reach". Only people set them — the owner or
+you, the controller; exploration never creates them. Add one when exploration has
+made a route visible (several steps circling the same precondition, or a promising
+cluster worth judging as a unit). Subgoals of one goal are alternatives that order
+work, not a checklist; each is evaluated at every origin like any goal, so a
+"missed" subgoal can come back. Exploration may target a subgoal, its goal, or
+neither. Tell the owner whenever you add or retire one.
 
 ## Steering without editing code
 
