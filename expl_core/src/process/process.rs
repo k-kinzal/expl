@@ -191,6 +191,9 @@ impl<'a> Process<'a> {
         let mut followed: Option<Instant> = None;
         let mut unfollowed: Option<String> = None;
         let mut waiting = false;
+        // Starts the first cooldown: a fresh process reacts to its backlog
+        // before it wanders.
+        let mut last_reaction = Instant::now();
         loop {
             if self.interrupt.is_raised() {
                 return Ok("stopped".to_owned());
@@ -227,6 +230,17 @@ impl<'a> Process<'a> {
             else {
                 if options.exit_when_idle {
                     return Ok("idle".to_owned());
+                }
+                // Nothing to react to: after its cooldown, an exploration
+                // explores again from a starting point picked at random,
+                // explored before or not.
+                if role
+                    .revisit_cooldown(self.agent)
+                    .is_some_and(|cooldown| last_reaction.elapsed() >= cooldown)
+                    && revisit_at_random(&mut graph)?
+                {
+                    waiting = false;
+                    continue;
                 }
                 if !waiting {
                     processes.set_activity(self.id, Some("waiting for events"))?;
@@ -283,10 +297,51 @@ impl<'a> Process<'a> {
                     });
                 }
             }
+            last_reaction = Instant::now();
             processes.set_activity(self.id, None)?;
             if options.once {
                 return Ok("reacted to one event".to_owned());
             }
         }
+    }
+}
+
+/// Record `node.revisited` for a random starting point; `false` when
+/// there is none (no active goals).
+fn revisit_at_random(graph: &mut Graph) -> Result<bool, ProcessError> {
+    let points = graph.starting_points()?;
+    if points.is_empty() {
+        return Ok(false);
+    }
+    graph.revisit(points[random_below(points.len())].id)?;
+    Ok(true)
+}
+
+/// A number in `0..bound` (`bound` > 0), random enough to spread
+/// explorations over the starting points.
+fn random_below(bound: usize) -> usize {
+    use std::hash::{BuildHasher, Hasher};
+    // `RandomState` is seeded randomly per instance.
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    (hasher.finish() % bound as u64) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn random_below_stays_in_bounds_and_spreads() {
+        let mut seen = [0usize; 4];
+        for _ in 0..400 {
+            seen[random_below(4)] += 1;
+        }
+        assert!(seen.iter().all(|&n| n > 0), "{seen:?}");
+        assert_eq!(random_below(1), 0);
     }
 }

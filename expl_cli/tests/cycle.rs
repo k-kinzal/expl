@@ -530,3 +530,57 @@ fn the_origin_follows_the_trunk() {
     let log = ok(repo, &["logs", planner["name"].as_str().expect("name")]);
     assert!(log.contains("trunk main moved to"), "{log}");
 }
+
+#[test]
+fn idle_exploration_revisits_random_starting_points() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let declaration = std::fs::read_to_string(repo.join("expl.toml")).expect("read");
+    assert!(
+        declaration.contains("revisit_cooldown = 600"),
+        "{declaration}"
+    );
+    std::fs::write(
+        repo.join("expl.toml"),
+        declaration.replacen("revisit_cooldown = 600", "revisit_cooldown = 0", 1),
+    )
+    .expect("declaration");
+    ok(repo, &["goal", "add", "Say hello", "--counter"]);
+    // A process that exits when idle never revisits.
+    ok(repo, &["run", "explorer", "--exit-when-idle"]);
+    let revisits = |repo: &Path| {
+        json_lines(&ok(
+            repo,
+            &[
+                "event",
+                "ls",
+                "--kind",
+                "node.revisited",
+                "--format",
+                "json",
+            ],
+        ))
+    };
+    assert!(revisits(repo).is_empty());
+
+    // A long-running one keeps exploring from random starting points (the
+    // origin, or the counter-exploration goal), the same ones again and
+    // again, and tells the agent what already exists there.
+    ok(repo, &["run", "explorer", "-d"]);
+    wait_until("several revisits", || revisits(repo).len() >= 4);
+    ok(repo, &["down", "--time", "5"]);
+    let nodes: std::collections::BTreeSet<i64> = revisits(repo)
+        .iter()
+        .filter_map(|e| e["node"].as_i64())
+        .collect();
+    assert!(
+        !nodes.is_empty() && nodes.iter().all(|n| [1, 2].contains(n)),
+        "revisited {nodes:?}"
+    );
+    let prompts = sandbox.dir.path().join("prompts");
+    let told = std::fs::read_dir(&prompts)
+        .expect("prompts")
+        .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("prompt"))
+        .any(|text| text.contains("## Already proposed") && text.contains("- Write hello"));
+    assert!(told, "no exploration prompt listed the existing steps");
+}
