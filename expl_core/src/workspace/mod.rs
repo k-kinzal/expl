@@ -3,9 +3,11 @@
 //! A node *is* a branch (`expl/node-<id>`). Execution gets the node's own
 //! [`Workspace`]: that branch checked out in its own worktree under
 //! `.expl/worktrees/`, started from its predecessors (the first one's tip,
-//! merged with the others when paths join; conflicts are left for the
-//! executing agent). Whatever the agent leaves there is committed as the
-//! branch tip.
+//! merged with the others in order when paths join). A conflicting merge is
+//! left in the worktree to be resolved; [`Workspace::resume`] then concludes
+//! it and merges the remaining predecessors, so the branch contains every
+//! predecessor before the step's own work begins. Whatever the agent leaves
+//! there is committed as the branch tip.
 //!
 //! Roles that only read (exploration, planning, evaluation) get a
 //! [`ScratchWorkspace`]: a detached worktree at a node's commit, private to

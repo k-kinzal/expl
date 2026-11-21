@@ -7,6 +7,12 @@
 //! now run) or `node.failed`. A failed run still commits its work so it can
 //! be inspected.
 //!
+//! When joining paths conflicts, the agent first resolves each conflicting
+//! merge on its own, and the remaining predecessors are merged after it;
+//! the step's work starts only once all of them are in. A conflict left
+//! unresolved fails the step, and so does a tip that does not contain
+//! every predecessor's commit.
+//!
 //! Each ready step is its own event, so as many steps run at once as there
 //! are execution processes.
 
@@ -87,50 +93,88 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     }
 
     let branch = Workspaces::branch_name(id);
-    let workspace = match reaction.context().workspaces().create(&node, &predecessors) {
+    let mut workspace = match reaction.context().workspaces().create(&node, &predecessors) {
         Ok(workspace) => workspace,
         Err(error) => return fail(graph, &node, &branch, None, error.to_string()),
     };
     graph.set_branch(id, &branch, None)?;
 
     let schema = schema();
-    let prompt = prompt(reaction, &node, &workspace, &schema);
-    let result: Result<Response, RoleError> =
-        reaction.invoke(graph, Some(id), workspace.path(), &prompt, &schema);
-    let (succeeded, summary) = match result {
-        Ok(response) => (response.succeeded, response.summary),
-        Err(error @ RoleError::Agent(AgentError::Interrupted)) => {
-            // Stopping, not failing: give the step back so the redelivered
-            // event can claim it again.
-            graph.unclaim(id)?;
-            return Err(error);
+    while !workspace.is_joined() {
+        let prompt = resolution_prompt(reaction, &node, &workspace, &schema);
+        let (resolved, summary) = invoke(reaction, graph, id, &workspace, &prompt, &schema)?;
+        if !resolved {
+            return fail(
+                graph,
+                &node,
+                &branch,
+                None,
+                format!("merge conflicts were not resolved: {summary}"),
+            );
         }
-        Err(error @ (RoleError::Agent(_) | RoleError::Response { .. })) => {
-            (false, format!("execution agent failed: {error}"))
+        if let Err(error) = workspace.resume() {
+            return fail(graph, &node, &branch, None, format!("{summary}\n\n{error}"));
         }
-        Err(error) => {
-            graph.fail(id, &error.to_string())?;
-            return Err(error);
-        }
-    };
+    }
 
+    let prompt = prompt(reaction, &node, &schema);
+    let (succeeded, summary) = invoke(reaction, graph, id, &workspace, &prompt, &schema)?;
     let message = format!("{}\n\n{}", node.title, summary);
     let head = match workspace.commit(&message) {
         Ok(head) => head,
         Err(error) => return fail(graph, &node, &branch, None, format!("{summary}\n\n{error}")),
     };
     graph.set_branch(id, &branch, Some(&head))?;
-    if succeeded {
-        graph.complete(id, &summary)?;
-        Ok(Report::Execution(ExecutionReport {
-            node: id,
-            status: NodeStatus::Completed,
-            branch,
-            head_commit: Some(head),
-            summary,
-        }))
-    } else {
-        fail(graph, &node, &branch, Some(head), summary)
+    if !succeeded {
+        return fail(graph, &node, &branch, Some(head), summary);
+    }
+    if let Err(error) = workspace.verify_predecessors(&head) {
+        return fail(
+            graph,
+            &node,
+            &branch,
+            Some(head),
+            format!("{summary}\n\n{error}"),
+        );
+    }
+    graph.complete(id, &summary)?;
+    Ok(Report::Execution(ExecutionReport {
+        node: id,
+        status: NodeStatus::Completed,
+        branch,
+        head_commit: Some(head),
+        summary,
+    }))
+}
+
+/// Invoke the agent once in the step's worktree: whether it reports
+/// success, and its summary. An agent that fails or answers malformed
+/// counts as reporting failure.
+fn invoke(
+    reaction: &Reaction<'_>,
+    graph: &mut Graph,
+    id: NodeId,
+    workspace: &Workspace,
+    prompt: &Prompt,
+    schema: &serde_json::Value,
+) -> Result<(bool, String), RoleError> {
+    let result: Result<Response, RoleError> =
+        reaction.invoke(graph, Some(id), workspace.path(), prompt, schema);
+    match result {
+        Ok(response) => Ok((response.succeeded, response.summary)),
+        Err(error @ RoleError::Agent(AgentError::Interrupted)) => {
+            // Stopping, not failing: give the step back so the redelivered
+            // event can claim it again.
+            graph.unclaim(id)?;
+            Err(error)
+        }
+        Err(error @ (RoleError::Agent(_) | RoleError::Response { .. })) => {
+            Ok((false, format!("execution agent failed: {error}")))
+        }
+        Err(error) => {
+            graph.fail(id, &error.to_string())?;
+            Err(error)
+        }
     }
 }
 
@@ -151,27 +195,37 @@ fn fail(
     }))
 }
 
-/// The prompt: the step's own title and objective, and the conflicts left
-/// in its worktree — nothing about the graph, the goals, or other steps.
-fn prompt(
+/// The prompt for resolving one predecessor merge: the conflicted files and
+/// the step they prepare for — nothing about the graph, the goals, or other
+/// steps.
+fn resolution_prompt(
     reaction: &Reaction<'_>,
     node: &Node,
     workspace: &Workspace,
     schema: &serde_json::Value,
 ) -> Prompt {
-    let conflicts = if workspace.conflicts().is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\nThe working directory has unresolved merge conflicts in: {}. Resolve them first \
-             by removing every conflict marker; do not conclude the merge yourself.\n",
-            workspace.conflicts().join(", ")
-        )
-    };
+    Prompt::from(format!(
+        "## Task\n\nCombine earlier work before starting on: {title}\n\n\
+         Merging earlier work into the working directory left conflicts in: {conflicts}. \
+         Resolve every conflict so that the intent of both sides is kept, and remove every \
+         conflict marker. Do only this: do not start on the task above yet, leave your changes \
+         uncommitted, and do not conclude or abort the merge.\n\
+         {instructions}\nReport `succeeded: false` honestly if a conflict cannot be resolved.\n\
+         {response}",
+        title = node.title,
+        conflicts = workspace.conflicts().join(", "),
+        instructions = super::instructions_section(reaction.agent()),
+        response = super::response_section(schema),
+    ))
+}
+
+/// The prompt: the step's own title and objective — nothing about the
+/// graph, the goals, or other steps.
+fn prompt(reaction: &Reaction<'_>, node: &Node, schema: &serde_json::Value) -> Prompt {
     Prompt::from(format!(
         "## Task\n\n{title}\n\n{objective}\n\n\
          Do the work in the working directory: edit files, run builds and tests, and verify the \
-         objective. Leave your changes uncommitted, and do not switch branches.\n{conflicts}\
+         objective. Leave your changes uncommitted, and do not switch branches.\n\
          {instructions}\nReport `succeeded: false` honestly if the objective is not achieved.\n\
          {response}",
         title = node.title,

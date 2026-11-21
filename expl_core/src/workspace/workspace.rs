@@ -1,5 +1,6 @@
 //! [`Workspaces`], [`Workspace`], and [`ScratchWorkspace`].
 
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,7 +28,14 @@ pub struct Workspace {
     path: PathBuf,
     branch: String,
     lock: PathBuf,
-    /// Files left conflicted by joining predecessor branches.
+    /// Every predecessor commit the branch starts from.
+    predecessors: Vec<String>,
+    /// The predecessor commit whose merge waits for its conflicts to be
+    /// resolved.
+    merging: Option<String>,
+    /// Predecessor commits still to be merged after `merging`, in order.
+    pending: VecDeque<String>,
+    /// Files left conflicted by the merge of `merging`.
     conflicts: Vec<String>,
 }
 
@@ -81,7 +89,11 @@ impl Workspaces {
         self.root.join(format!("node-{}", node.0))
     }
 
-    /// A fresh worktree for `node`, starting from its predecessors. Any
+    /// A fresh worktree for `node`, starting from its predecessors: the
+    /// first one's tip, merged with the others in order. Merging stops at
+    /// the first conflict, which is left in the worktree
+    /// ([`Workspace::conflicts`]); once it is resolved,
+    /// [`Workspace::resume`] merges the remaining predecessors. Any
     /// previous worktree and branch of the node (an earlier attempt) are
     /// discarded first.
     ///
@@ -116,34 +128,18 @@ impl Workspaces {
                 .run(&["worktree", "add", "-b", &branch, &path_text, base])?;
         }
 
-        let git = Git::new(&path);
-        let identity = identity_args(&git)?;
-        let mut conflicts = Vec::new();
-        for commit in joins {
-            let mut args: Vec<&str> = identity.iter().map(String::as_str).collect();
-            args.extend(["merge", "--no-ff", "--no-edit", commit.as_str()]);
-            match git.run(&args) {
-                Ok(_) => {}
-                Err(error @ GitError::Failed { .. }) => {
-                    let unmerged = git.unmerged_paths()?;
-                    if unmerged.is_empty() {
-                        return Err(error.into());
-                    }
-                    // Leave the conflict for the agent; further joins cannot
-                    // start until this merge is concluded.
-                    conflicts = unmerged;
-                    break;
-                }
-                Err(error @ GitError::Spawn(_)) => return Err(error.into()),
-            }
-        }
-        Ok(Workspace {
+        let mut workspace = Workspace {
             node: node.id,
             path,
             branch,
             lock: self.lock.clone(),
-            conflicts,
-        })
+            pending: joins.iter().cloned().collect(),
+            predecessors: commits,
+            merging: None,
+            conflicts: Vec::new(),
+        };
+        workspace.merge_pending()?;
+        Ok(workspace)
     }
 
     /// A private detached worktree at `node`'s commit.
@@ -227,10 +223,112 @@ impl Workspace {
         &self.branch
     }
 
-    /// Files left conflicted when predecessor branches were joined.
+    /// Files left conflicted by the predecessor merge in progress; empty
+    /// once every predecessor is merged.
     #[must_use]
     pub fn conflicts(&self) -> &[String] {
         &self.conflicts
+    }
+
+    /// Whether every predecessor is merged into the worktree.
+    #[must_use]
+    pub fn is_joined(&self) -> bool {
+        self.merging.is_none() && self.pending.is_empty()
+    }
+
+    /// Conclude the predecessor merge whose [conflicts](Self::conflicts)
+    /// were resolved in the worktree, then merge the remaining
+    /// predecessors until the next conflict or until all are merged.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::UnresolvedConflicts`] when a conflicted file still
+    /// holds conflict markers; [`WorkspaceError::MergeAbandoned`] when the
+    /// merge was aborted instead of resolved; [`WorkspaceError::Git`] when
+    /// git fails other than by a merge conflict.
+    pub fn resume(&mut self) -> Result<(), WorkspaceError> {
+        let Some(commit) = self.merging.clone() else {
+            return self.merge_pending();
+        };
+        let git = Git::new(&self.path);
+        let mut unresolved = Vec::new();
+        for path in &self.conflicts {
+            if has_conflict_markers(&self.path.join(path))? {
+                unresolved.push(path.clone());
+            }
+        }
+        if !unresolved.is_empty() {
+            return Err(WorkspaceError::UnresolvedConflicts(unresolved));
+        }
+
+        let expected = git.resolve_commit(&commit)?;
+        let merge_head = match git.run(&["rev-parse", "-q", "--verify", "MERGE_HEAD"]) {
+            Ok(head) => Some(head),
+            Err(GitError::Failed { .. }) => None,
+            Err(error @ GitError::Spawn(_)) => return Err(error.into()),
+        };
+        if merge_head.as_deref() == Some(expected.as_str()) {
+            git.run(&["add", "-A"])?;
+            let identity = identity_args(&git)?;
+            let mut args: Vec<&str> = identity.iter().map(String::as_str).collect();
+            args.extend(["commit", "--no-edit"]);
+            let _guard = lock(&self.lock)?;
+            git.run(&args)?;
+        } else if !git.is_ancestor(&expected, "HEAD")? {
+            return Err(WorkspaceError::MergeAbandoned(commit));
+        }
+        let unmerged = git.unmerged_paths()?;
+        if !unmerged.is_empty() {
+            return Err(WorkspaceError::UnresolvedConflicts(unmerged));
+        }
+        self.merging = None;
+        self.conflicts.clear();
+        self.merge_pending()
+    }
+
+    /// Check that every predecessor commit is an ancestor of `tip`.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::PredecessorNotMerged`] naming the first
+    /// predecessor commit `tip` does not contain; [`WorkspaceError::Git`]
+    /// when git fails.
+    pub fn verify_predecessors(&self, tip: &str) -> Result<(), WorkspaceError> {
+        let git = Git::new(&self.path);
+        for commit in &self.predecessors {
+            if !git.is_ancestor(commit, tip)? {
+                return Err(WorkspaceError::PredecessorNotMerged {
+                    commit: commit.clone(),
+                    tip: tip.to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Merge the pending predecessors in order, stopping at the first
+    /// conflict and leaving it in the worktree.
+    fn merge_pending(&mut self) -> Result<(), WorkspaceError> {
+        let git = Git::new(&self.path);
+        let identity = identity_args(&git)?;
+        while let Some(commit) = self.pending.pop_front() {
+            let mut args: Vec<&str> = identity.iter().map(String::as_str).collect();
+            args.extend(["merge", "--no-ff", "--no-edit", commit.as_str()]);
+            match git.run(&args) {
+                Ok(_) => {}
+                Err(error @ GitError::Failed { .. }) => {
+                    let unmerged = git.unmerged_paths()?;
+                    if unmerged.is_empty() {
+                        return Err(error.into());
+                    }
+                    self.merging = Some(commit);
+                    self.conflicts = unmerged;
+                    return Ok(());
+                }
+                Err(error @ GitError::Spawn(_)) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     /// Commit everything in the worktree as the branch tip and return the
@@ -239,8 +337,15 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// [`WorkspaceError::UnresolvedConflicts`] when conflicts remain.
+    /// [`WorkspaceError::JoinIncomplete`] while predecessors are not all
+    /// merged; [`WorkspaceError::UnresolvedConflicts`] when conflicts
+    /// remain.
     pub fn commit(&self, message: &str) -> Result<String, WorkspaceError> {
+        if !self.is_joined() {
+            return Err(WorkspaceError::JoinIncomplete(
+                self.merging.iter().chain(&self.pending).cloned().collect(),
+            ));
+        }
         let git = Git::new(&self.path);
         let unmerged = git.unmerged_paths()?;
         if !unmerged.is_empty() {
@@ -281,6 +386,20 @@ impl Drop for ScratchWorkspace {
             self.repository.run(&["worktree", "prune"]).ok();
         }
     }
+}
+
+/// Whether the file at `path` still holds a git conflict marker. A path
+/// that is gone or is not a file was resolved by removing it.
+fn has_conflict_markers(path: &Path) -> Result<bool, WorkspaceError> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let content = std::fs::read(path)?;
+    Ok(content.split(|&byte| byte == b'\n').any(|line| {
+        [b"<<<<<<<", b"|||||||", b">>>>>>>"]
+            .iter()
+            .any(|marker| line.starts_with(*marker))
+    }))
 }
 
 /// `-c user.name=… -c user.email=…` when the repository has no identity
