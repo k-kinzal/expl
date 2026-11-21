@@ -16,11 +16,12 @@
 //! `origin.advanced` means the trunk moved: a human merged into the
 //! default branch, and a process following it recorded the new origin. Exploration starts again from the new origin,
 //! evaluation judges where the trunk now stands against every goal, and
-//! planning re-plans the steps that were moved onto it.
+//! planning decides which steps that have not started move onto it.
 //!
 //! Exploration has a [`Direction`]: forward from a realised node toward the
 //! goals, backward from a goal — **counter-exploration**, done when the
-//! goal asks for it — past a failed step (new hypotheses in its place), or,
+//! goal asks for it — past a failed step (new hypotheses in its place),
+//! ahead of a step not carried out yet (assuming it succeeds), or,
 //! for an agent declared with `scope = "graph"`, across the whole graph.
 //!
 //! Roles never print and never decide *when* they run: a
@@ -55,7 +56,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::Agent;
 use crate::event::EventKind;
-use crate::graph::{Graph, GraphError};
+use crate::graph::Graph;
 
 /// One of the four responsibilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -127,7 +128,8 @@ impl Role {
     /// (`node.revisited`), if it revisits at all. Exploration does when
     /// `revisit_cooldown` is declared: one exploration never exhausts a
     /// node, so every starting point keeps growing new steps for as long as
-    /// the process runs (bounded by `max_pending`).
+    /// the process runs. Exploration is never held back by how many steps
+    /// wait: crowding is planning's to sort out.
     #[must_use]
     pub fn revisit_cooldown(self, agent: &Agent) -> Option<std::time::Duration> {
         match self {
@@ -146,36 +148,6 @@ impl Role {
     #[must_use]
     pub fn coalesces(self) -> bool {
         matches!(self, Self::Planning)
-    }
-
-    /// The events an agent of this role reacts to even while it is
-    /// [paused](Self::pause): a goal a human just added is explored at
-    /// once, however long the backlog.
-    #[must_use]
-    pub fn unpausable(self) -> &'static [EventKind] {
-        match self {
-            Self::Exploration => &[EventKind::GoalAdded],
-            Self::Planning | Self::Execution | Self::Evaluation => &[],
-        }
-    }
-
-    /// Why an agent of this role should not lease events right now, if it
-    /// should not. Exploration pauses while `max_pending` steps await
-    /// execution, so proposals cannot outrun execution.
-    ///
-    /// # Errors
-    ///
-    /// [`GraphError`] on graph failure.
-    pub fn pause(self, agent: &Agent, graph: &Graph) -> Result<Option<String>, GraphError> {
-        match self {
-            Self::Exploration => {
-                let limit = agent.declaration().max_pending.unwrap_or(usize::MAX);
-                let pending = graph.pending_count()?;
-                Ok((pending >= limit)
-                    .then(|| format!("paused: {pending} steps pending (max_pending = {limit})")))
-            }
-            Self::Planning | Self::Execution | Self::Evaluation => Ok(None),
-        }
     }
 
     /// React to the reaction's event.
@@ -210,6 +182,8 @@ pub enum Direction {
     Backward,
     /// From a failed step: new hypotheses in its place.
     Failure,
+    /// Past a step not carried out yet, assuming it succeeds.
+    Ahead,
     /// Across the whole graph at once, from no particular node.
     Survey,
 }
@@ -220,6 +194,7 @@ impl fmt::Display for Direction {
             Self::Forward => "forward",
             Self::Backward => "backward",
             Self::Failure => "past the failure",
+            Self::Ahead => "ahead",
             Self::Survey => "across the graph",
         })
     }
@@ -292,11 +267,12 @@ impl Report {
                 .collect::<Vec<_>>()
                 .join("; "),
             Self::Planning(p) => format!(
-                "plan {}: {} path(s), planned {}, joined {}, pruned {}",
+                "plan {}: {} path(s), planned {}, joined {}, rebased {}, pruned {}",
                 p.plan.0,
                 p.paths,
                 ids(&p.planned),
                 ids(&p.joined),
+                ids(&p.rebased),
                 ids(&p.pruned)
             ),
             Self::Execution(e) => format!(

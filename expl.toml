@@ -49,7 +49,7 @@ env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
 replicas = 1
 weight = 4
 breadth = 8
-max_pending = 20
+speculate = true
 revisit_cooldown = 600
 instructions = """
 AGENTS.md describes the vision and architecture. Enumerate the directions that look most
@@ -73,7 +73,7 @@ env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
 replicas = 1
 weight = 1
 breadth = 8
-max_pending = 20
+speculate = true
 instructions = """
 AGENTS.md describes the vision and architecture. Explore the fringe of the problem space on
 purpose — what a mainstream search toward the goal would never propose:
@@ -101,7 +101,6 @@ env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
 replicas = 1
 weight = 1
 breadth = 8
-max_pending = 20
 instructions = """
 AGENTS.md describes the vision and architecture. You see the whole map at once: look for what
 explorations from single nodes cannot see — goals or parts of goals no path covers, separate

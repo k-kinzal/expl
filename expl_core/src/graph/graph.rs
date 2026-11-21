@@ -327,10 +327,9 @@ impl Graph {
     ///
     /// The new origin builds on the previous origin and on every adopted
     /// step, so the lineage — what was chosen, and when — stays in the
-    /// graph. Steps that have not started yet (`proposed`, `planned`) and
-    /// build on an earlier origin are moved onto the new one: exploration
-    /// continues from where the trunk is now. Completed and failed steps
-    /// keep their base; they remain candidates for later adoption.
+    /// graph. Every step keeps its base: whether one that has not started
+    /// moves onto the new origin is planning's call ([`rebase`](Self::rebase)),
+    /// since not every step still makes sense on newer code.
     ///
     /// # Errors
     ///
@@ -376,30 +375,6 @@ impl Graph {
             tx.execute(
                 "INSERT OR IGNORE INTO edges (source_id, target_id) VALUES (?1, ?2)",
                 params![source.0, id.0],
-            )?;
-        }
-        let open: Vec<(i64, i64)> = {
-            let mut stmt = tx.prepare(
-                "SELECT e.source_id, e.target_id FROM edges e \
-                 JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id \
-                 WHERE s.kind = 'origin' AND s.id <> ?1 AND t.kind = 'step' \
-                 AND t.status IN ('proposed', 'planned')",
-            )?;
-            stmt.query_map([id.0], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<Result<_, _>>()?
-        };
-        for (source, target) in open {
-            // A step that some adopted work builds on cannot move after it.
-            if reaches(&tx, NodeId(target), id)? {
-                continue;
-            }
-            tx.execute(
-                "DELETE FROM edges WHERE source_id = ?1 AND target_id = ?2",
-                params![source, target],
-            )?;
-            tx.execute(
-                "INSERT OR IGNORE INTO edges (source_id, target_id) VALUES (?1, ?2)",
-                params![id.0, target],
             )?;
         }
         emit(&tx, EventKind::OriginAdvanced, Some(id))?;
@@ -485,14 +460,16 @@ impl Graph {
     /// # Errors
     ///
     /// [`GraphError::NodeNotFound`], or [`GraphError::NotInStatus`] when
-    /// `id` is not one of the [`starting_points`](Self::starting_points).
-    pub fn revisit(&mut self, id: NodeId) -> Result<(), GraphError> {
-        if !self.starting_points()?.iter().any(|n| n.id == id) {
+    /// `id` is not one of the [`starting_points`](Self::starting_points)
+    /// (with steps not carried out yet when `ahead`).
+    pub fn revisit(&mut self, id: NodeId, ahead: bool) -> Result<(), GraphError> {
+        if !self.starting_points(ahead)?.iter().any(|n| n.id == id) {
             self.node(id)?;
             return Err(GraphError::NotInStatus {
                 node: id,
                 expected: "a starting point of exploration (the active origin, a completed \
-                           step not in the trunk, or an active counter-exploration goal)",
+                           or failed step not in the trunk, an open step when exploring \
+                           ahead, or an active counter-exploration goal)",
             });
         }
         let tx = self.write()?;
@@ -508,6 +485,50 @@ impl Graph {
     /// [`GraphError::InvalidEndpoint`] or [`GraphError::Cycle`].
     pub fn connect(&mut self, source: NodeId, target: NodeId) -> Result<(), GraphError> {
         connect_in(&self.conn, source, target)
+    }
+
+    /// Move a step that has not started off the superseded origins it
+    /// builds on, onto the active origin: its work will start from the code
+    /// as it is now. `false` when it builds on no superseded origin (nothing
+    /// to move).
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError::NotInStatus`] unless `step` is a proposed or planned
+    /// step; [`GraphError::Cycle`] when work adopted into the active origin
+    /// builds on it. Nothing changes then.
+    pub fn rebase(&mut self, step: NodeId) -> Result<bool, GraphError> {
+        let tx = self.write()?;
+        let node = node_in(&tx, step)?;
+        if node.kind != NodeKind::Step
+            || !matches!(node.status, NodeStatus::Proposed | NodeStatus::Planned)
+        {
+            return Err(GraphError::NotInStatus {
+                node: step,
+                expected: "a proposed or planned step",
+            });
+        }
+        let origin = current_origin_in(&tx)?.ok_or(GraphError::NoOrigin)?;
+        let stale: Vec<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT e.source_id FROM edges e JOIN nodes s ON s.id = e.source_id \
+                 WHERE e.target_id = ?1 AND s.kind = 'origin' AND s.id <> ?2",
+            )?;
+            stmt.query_map(params![step.0, origin.0], |r| r.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        if stale.is_empty() {
+            return Ok(false);
+        }
+        for source in stale {
+            tx.execute(
+                "DELETE FROM edges WHERE source_id = ?1 AND target_id = ?2",
+                params![source, step.0],
+            )?;
+        }
+        connect_in(&tx, origin, step)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Make the open step `target` also build on `sources`: planning's way
@@ -873,14 +894,15 @@ impl Graph {
 
     /// Every node exploration can start from again: the active origin,
     /// each completed step whose work is not yet in the trunk (forward),
-    /// each failed step (new hypotheses in its place), and each active
-    /// counter-exploration goal (backward). Empty while there are no
-    /// active goals.
+    /// each failed step (new hypotheses in its place), each active
+    /// counter-exploration goal (backward) and, when `ahead`, each step not
+    /// carried out yet (explored assuming it succeeds). Empty while there
+    /// are no active goals.
     ///
     /// # Errors
     ///
     /// [`GraphError`] on SQLite failure.
-    pub fn starting_points(&self) -> Result<Vec<Node>, GraphError> {
+    pub fn starting_points(&self, ahead: bool) -> Result<Vec<Node>, GraphError> {
         let goals = self.goals()?;
         if goals.is_empty() {
             return Ok(Vec::new());
@@ -890,7 +912,16 @@ impl Graph {
         points.extend(
             self.nodes(&NodeFilter {
                 kinds: vec![NodeKind::Step],
-                statuses: vec![NodeStatus::Completed, NodeStatus::Failed],
+                statuses: if ahead {
+                    vec![
+                        NodeStatus::Proposed,
+                        NodeStatus::Planned,
+                        NodeStatus::Completed,
+                        NodeStatus::Failed,
+                    ]
+                } else {
+                    vec![NodeStatus::Completed, NodeStatus::Failed]
+                },
             })?
             .into_iter()
             .filter(|step| !lineage.in_trunk(step.id)),
@@ -1305,7 +1336,7 @@ mod tests {
         let origin = graph
             .create_origin("origin", Some("main"), "abc")
             .expect("origin");
-        assert!(graph.starting_points().expect("points").is_empty());
+        assert!(graph.starting_points(false).expect("points").is_empty());
         let goal = graph.add_goal("goal", "do it", false, &[]).expect("goal");
         let counter = graph
             .add_goal("counter", "back", true, &[])
@@ -1324,21 +1355,21 @@ mod tests {
         graph.fail(c, "did not compile").expect("fail");
 
         let ids: Vec<NodeId> = graph
-            .starting_points()
+            .starting_points(false)
             .expect("points")
             .iter()
             .map(|n| n.id)
             .collect();
         assert_eq!(ids, [origin, a, c, counter]);
 
-        graph.revisit(a).expect("revisit a");
-        graph.revisit(counter).expect("revisit counter");
+        graph.revisit(a, false).expect("revisit a");
+        graph.revisit(counter, false).expect("revisit counter");
         assert!(matches!(
-            graph.revisit(b),
+            graph.revisit(b, false),
             Err(GraphError::NotInStatus { node, .. }) if node == b
         ));
         assert!(matches!(
-            graph.revisit(goal),
+            graph.revisit(goal, false),
             Err(GraphError::NotInStatus { .. })
         ));
         let revisits: Vec<_> = kinds(&graph)
@@ -1352,6 +1383,15 @@ mod tests {
                 (EventKind::NodeRevisited, Some(counter.0))
             ]
         );
+        // Exploring ahead, steps not carried out yet are starting points too.
+        let ahead: Vec<NodeId> = graph
+            .starting_points(true)
+            .expect("points")
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(ahead, [origin, a, b, c, counter]);
+        graph.revisit(b, true).expect("revisit b ahead");
     }
 
     #[test]
@@ -1538,7 +1578,7 @@ mod tests {
     }
 
     #[test]
-    fn advancing_supersedes_the_origin_and_moves_open_steps() {
+    fn advancing_supersedes_the_origin_and_planning_rebases_open_steps() {
         let (mut graph, first, goal) = seeded();
         let adopted = graph.propose_step("a", "a", &[first], &[goal]).expect("a");
         let left = graph.propose_step("b", "b", &[first], &[goal]).expect("b");
@@ -1586,11 +1626,21 @@ mod tests {
             ids(graph.predecessors(second).expect("preds")),
             [first, adopted]
         );
-        // The open step now starts from the new origin; completed work and
-        // what builds on it keep their base.
-        assert_eq!(ids(graph.predecessors(open).expect("preds")), [second]);
+        // Every step keeps its base when the trunk moves.
+        assert_eq!(ids(graph.predecessors(open).expect("preds")), [first]);
         assert_eq!(ids(graph.predecessors(left).expect("preds")), [first]);
         assert_eq!(ids(graph.predecessors(later).expect("preds")), [left]);
+        // Planning may move a step that has not started onto the new origin;
+        // a step on no superseded origin has nothing to move, and only open
+        // steps move.
+        assert!(graph.rebase(open).expect("rebase"));
+        assert_eq!(ids(graph.predecessors(open).expect("preds")), [second]);
+        assert!(!graph.rebase(open).expect("nothing left to move"));
+        assert!(!graph.rebase(later).expect("builds on a step"));
+        assert!(matches!(
+            graph.rebase(left),
+            Err(GraphError::NotInStatus { .. })
+        ));
         assert_eq!(
             kinds(&graph).last(),
             Some(&(EventKind::OriginAdvanced, Some(second.0)))

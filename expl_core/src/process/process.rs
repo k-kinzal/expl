@@ -53,8 +53,6 @@ pub struct ProcessOptions {
 pub enum ProcessActivity<'a> {
     /// The process adopted its record.
     Started(&'a ProcessRecord),
-    /// Leasing is paused (e.g. too many steps pending).
-    Paused(&'a str),
     /// The trunk moved and the origin followed it.
     Followed(&'a Advance),
     /// The trunk cannot be followed (reported once per distinct reason).
@@ -248,28 +246,8 @@ impl<'a> Process<'a> {
                     }
                 }
             }
-            // While paused, only what a human just asked for gets through.
-            let paused = role.pause(self.agent, &graph)?;
-            let kinds = if paused.is_some() {
-                role.unpausable()
-            } else {
-                role.reactions()
-            };
-            let leased = if kinds.is_empty() {
-                None
-            } else {
-                inbox.lease(kinds, self.id, role.is_exclusive())?
-            };
-            if let (Some(reason), None) = (&paused, &leased) {
-                processes.set_activity(self.id, Some(reason))?;
-                observer.observe(&ProcessActivity::Paused(reason));
-                if options.exit_when_idle {
-                    return Ok(format!("idle ({reason})"));
-                }
-                thread::sleep(POLL * 4);
-                continue;
-            }
-            let Some(delivery) = leased else {
+            let Some(delivery) = inbox.lease(role.reactions(), self.id, role.is_exclusive())?
+            else {
                 if options.exit_when_idle {
                     return Ok("idle".to_owned());
                 }
@@ -279,7 +257,10 @@ impl<'a> Process<'a> {
                 if role
                     .revisit_cooldown(self.agent)
                     .is_some_and(|cooldown| last_reaction.elapsed() >= cooldown)
-                    && revisit_at_random(&mut graph)?
+                    && revisit_at_random(
+                        &mut graph,
+                        self.agent.declaration().speculate == Some(true),
+                    )?
                 {
                     // The cooldown runs from the revisit, wherever routing
                     // sends it, so a role revisits once per cooldown.
@@ -405,14 +386,15 @@ impl<'a> Process<'a> {
     }
 }
 
-/// Record `node.revisited` for a random starting point; `false` when
-/// there is none (no active goals).
-fn revisit_at_random(graph: &mut Graph) -> Result<bool, ProcessError> {
-    let points = graph.starting_points()?;
+/// Record `node.revisited` for a random starting point (steps not carried
+/// out yet among them when exploring `ahead`); `false` when there is none
+/// (no active goals).
+fn revisit_at_random(graph: &mut Graph, ahead: bool) -> Result<bool, ProcessError> {
+    let points = graph.starting_points(ahead)?;
     if points.is_empty() {
         return Ok(false);
     }
-    graph.revisit(points[random_below(points.len())].id)?;
+    graph.revisit(points[random_below(points.len())].id, ahead)?;
     Ok(true)
 }
 

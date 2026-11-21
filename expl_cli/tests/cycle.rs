@@ -26,6 +26,8 @@ exploration)
     echo '{"nodes":[{"title":"Aim at the top goal","objective":"x","before":[2]},{"title":"Aim at the subgoal","objective":"y","before":[]}]}'
   elif [ "$EXPL_EVENT" = goal.added ]; then
     echo '{"nodes":[{"title":"Write hello","objective":"Create hello.txt"}]}'
+  elif grep -q '^## Assumed done' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
+    echo '{"nodes":[{"title":"After the open step","objective":"z","before":[]}]}'
   elif [ "$EXPL_EVENT" = node.failed ]; then
     echo '{"nodes":[{"title":"Write hello in smaller steps","objective":"Create an empty hello.txt"}]}'
   else
@@ -737,9 +739,23 @@ fn the_origin_follows_the_trunk() {
     assert_eq!(lineage[1]["origin"]["status"], "active");
     assert_eq!(lineage[1]["adopted"], serde_json::json!([3]));
     let second = lineage[1]["origin"]["id"].to_string();
-    // The step that had not started moves onto the new origin; B stays a
-    // candidate on the old one.
+    // Every step keeps its base when the trunk moves: B stays a candidate
+    // on the old origin, and so does the step that had not started — until
+    // planning moves it onto the new one.
+    assert_eq!(node(repo, &open)["predecessors"], serde_json::json!([1]));
+    assert_eq!(node(repo, &b)["predecessors"], serde_json::json!([1]));
+    let plan = sandbox.dir.path().join("plan.json");
+    std::fs::write(
+        &plan,
+        format!(
+            r#"{{"summary":"move it","paths":[],"priorities":[],"prunes":[],"joins":[],"rebases":[{open},{b}]}}"#
+        ),
+    )
+    .expect("plan");
+    ok(repo, &["run", "planner", "--exit-when-idle"]);
+    std::fs::remove_file(&plan).expect("plan");
     assert_eq!(node(repo, &open)["predecessors"], serde_json::json!([6]));
+    // B is completed: only steps that have not started move.
     assert_eq!(node(repo, &b)["predecessors"], serde_json::json!([1]));
 
     // The trunk is judged against the goals, and exploration starts again
@@ -781,10 +797,11 @@ fn the_origin_follows_the_trunk() {
     assert_eq!(lineage.len(), 3);
     assert_eq!(lineage[2]["origin"]["title"], "Squash B");
     assert_eq!(lineage[2]["adopted"], serde_json::json!([4]));
-    // The process that noticed says so in its log.
+    // The process that noticed (the latest planner) says so in its log.
     let planner = json_lines(&ok(repo, &["ps", "-a", "--format", "json"]))
         .into_iter()
-        .find(|p| p["agent"] == "planner")
+        .filter(|p| p["agent"] == "planner")
+        .max_by_key(|p| p["id"].as_i64())
         .expect("a planner process");
     let log = ok(repo, &["logs", planner["name"].as_str().expect("name")]);
     assert!(log.contains("trunk main moved to"), "{log}");
@@ -859,7 +876,7 @@ fn weighted_agents_of_one_role_split_its_events() {
         repo.join("expl.toml"),
         format!(
             "{}\n[agent.{}weight = 1\n",
-            declaration.replacen("max_pending = 6\n", "max_pending = 6\nweight = 1\n", 1),
+            declaration.replacen("breadth = 3\n", "breadth = 3\nweight = 1\n", 1),
             contrarian.trim_end().to_owned() + "\n"
         ),
     )
@@ -904,51 +921,6 @@ fn weighted_agents_of_one_role_split_its_events() {
     let (explorer, contrarian) = (runs("explorer"), runs("contrarian"));
     assert_eq!(explorer + contrarian, 6, "{explorer} + {contrarian}");
     assert!(explorer > 0 && contrarian > 0, "{explorer} + {contrarian}");
-}
-
-#[test]
-fn a_new_goal_is_explored_even_while_exploration_is_paused() {
-    let sandbox = sandbox();
-    let repo = &sandbox.repo;
-    let declaration = std::fs::read_to_string(repo.join("expl.toml")).expect("read");
-    std::fs::write(
-        repo.join("expl.toml"),
-        declaration.replacen("max_pending = 6", "max_pending = 1", 1),
-    )
-    .expect("declaration");
-    ok(repo, &["goal", "add", "First"]);
-    // A pending step: the backlog is at max_pending, exploration pauses.
-    ok(repo, &["node", "add", "Waiting", "--before", "2"]);
-    ok(repo, &["goal", "add", "Second"]);
-    ok(repo, &["run", "explorer", "--exit-when-idle"]);
-    // Both goal.added events were explored despite the pause.
-    let deliveries = json_lines(&ok(
-        repo,
-        &[
-            "event",
-            "ls",
-            "--agent",
-            "explorer",
-            "--kind",
-            "goal.added",
-            "--format",
-            "json",
-        ],
-    ));
-    assert_eq!(deliveries.len(), 2);
-    assert!(
-        deliveries.iter().all(|e| e["delivery"] == "done"),
-        "{deliveries:?}"
-    );
-    // …and the process then went idle on the pause.
-    let exited = json_lines(&ok(repo, &["ps", "-a", "--format", "json"]));
-    assert!(
-        exited.iter().any(|p| p["exit_reason"]
-            .as_str()
-            .unwrap_or("")
-            .starts_with("idle (paused")),
-        "{exited:?}"
-    );
 }
 
 #[test]
@@ -1108,4 +1080,54 @@ fn subgoals_nest_and_each_proposal_picks_what_it_heads_for() {
                 && text.contains("alternative routes")
         });
     assert!(told, "no exploration prompt showed the subgoal in its tree");
+}
+
+#[test]
+fn speculative_exploration_grows_past_steps_not_carried_out() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let declaration = std::fs::read_to_string(repo.join("expl.toml")).expect("read");
+    std::fs::write(
+        repo.join("expl.toml"),
+        declaration.replacen(
+            "revisit_cooldown = 600",
+            "revisit_cooldown = 0\nspeculate = true",
+            1,
+        ),
+    )
+    .expect("declaration");
+    ok(repo, &["goal", "add", "Say hello"]);
+    // Planned, never executed (no executor runs here).
+    let open = ok(
+        repo,
+        &[
+            "node",
+            "add",
+            "Open step",
+            "--before",
+            "2",
+            "--priority",
+            "1",
+        ],
+    );
+    ok(repo, &["run", "explorer", "-d"]);
+    let ahead = || {
+        json_lines(&ok(repo, &["node", "ls", "--format", "json"]))
+            .into_iter()
+            .find(|n| n["title"] == "After the open step")
+    };
+    wait_until("an exploration ahead of the open step", || {
+        ahead().is_some()
+    });
+    ok(repo, &["down", "--time", "5"]);
+    let after = node(repo, &ahead().expect("ahead")["id"].to_string());
+    assert_eq!(after["predecessors"].to_string(), format!("[{open}]"));
+    assert_eq!(after["successors"], serde_json::json!([2]));
+    assert_eq!(node(repo, &open)["node"]["status"], "planned");
+    let prompts = sandbox.dir.path().join("prompts");
+    let told = std::fs::read_dir(&prompts)
+        .expect("prompts")
+        .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("prompt"))
+        .any(|text| text.contains("## Assumed done") && text.contains("- Open step"));
+    assert!(told, "no prompt assumed the open step done");
 }

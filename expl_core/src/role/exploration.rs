@@ -19,6 +19,12 @@
 //!   and head for its goals, informed by what went wrong. A failed step is
 //!   also a starting point that revisits come back to.
 //!
+//! An agent declared with `speculate = true` also counts steps not
+//! carried out yet among its starting points: revisiting one explores
+//! ahead of it — assuming it and the open steps it builds on succeed — so
+//! the map grows deep before anything runs. Only revisits explore ahead, so
+//! the revisit cooldown bounds how fast that happens.
+//!
 //! An agent declared with `scope = "graph"` reacts to the same events
 //! differently: it surveys the whole graph at once — every step with its
 //! outcome and evaluations — for what no single node would suggest (gaps
@@ -314,13 +320,28 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
             explorations
         }
         EventKind::NodeRevisited => {
-            if !graph.starting_points()?.iter().any(|n| n.id == subject.id) {
+            let ahead = reaction.agent().declaration().speculate == Some(true);
+            if !graph
+                .starting_points(ahead)?
+                .iter()
+                .any(|n| n.id == subject.id)
+            {
                 return Ok(Reaction::ignore(format!(
                     "{} ({} {}) is no longer a starting point",
                     subject.id, subject.status, subject.kind
                 )));
             }
-            if subject.status == NodeStatus::Failed {
+            if matches!(subject.status, NodeStatus::Proposed | NodeStatus::Planned) {
+                match explore_ahead(reaction, graph, &subject)? {
+                    Some(report) => vec![report],
+                    None => {
+                        return Ok(Reaction::ignore(format!(
+                            "{} builds on a failed or pruned step",
+                            subject.id
+                        )));
+                    }
+                }
+            } else if subject.status == NodeStatus::Failed {
                 vec![explore_failure(reaction, graph, &subject)?]
             } else if subject.kind == NodeKind::Goal {
                 vec![explore(
@@ -662,6 +683,95 @@ fn explore_failure(
         );
     }
     Ok(report)
+}
+
+/// Explore ahead of `start`, a step not carried out yet: assume it and the
+/// open steps it builds on succeed, and propose what could come after it.
+/// `None` when it builds on a failed or pruned step, so it can never run.
+fn explore_ahead(
+    reaction: &Reaction<'_>,
+    graph: &mut Graph,
+    start: &Node,
+) -> Result<Option<ExplorationReport>, RoleError> {
+    // The open steps it rests on, and the realised nodes they start from.
+    let mut assumed: Vec<Node> = vec![start.clone()];
+    let mut frontier: Vec<Node> = Vec::new();
+    let mut stack = vec![start.id];
+    while let Some(id) = stack.pop() {
+        for predecessor in graph.predecessors(id)? {
+            match (predecessor.kind, predecessor.status) {
+                (NodeKind::Origin, _) | (NodeKind::Step, NodeStatus::Completed) => {
+                    if !frontier.iter().any(|n| n.id == predecessor.id) {
+                        frontier.push(predecessor);
+                    }
+                }
+                (NodeKind::Step, NodeStatus::Failed | NodeStatus::Pruned) => return Ok(None),
+                (NodeKind::Step, _) => {
+                    if !assumed.iter().any(|n| n.id == predecessor.id) {
+                        stack.push(predecessor.id);
+                        assumed.push(predecessor);
+                    }
+                }
+                (NodeKind::Goal, _) => {}
+            }
+        }
+    }
+    assumed.sort_by_key(|n| n.id);
+    let origin = graph.origin()?;
+    let lineage = graph.lineage()?;
+    let base = realised_base(&lineage, &origin, &frontier.iter().collect::<Vec<_>>());
+    let ground = match base.as_slice() {
+        [only] if *only != origin.id => graph.node(*only)?,
+        _ => origin.clone(),
+    };
+    let aim = Aim::from(graph, start)?;
+    let known = known_steps(graph, graph.successors(start.id)?)?;
+    let breadth = breadth(reaction);
+
+    let mut steps = String::new();
+    for step in &assumed {
+        let _ = writeln!(steps, "- {}", step.title);
+        if !step.objective.trim().is_empty() {
+            let _ = writeln!(steps, "  {}", digest::excerpt(&step.objective));
+        }
+    }
+    let task = format!(
+        "## Task\n\n\
+         The steps below have not been carried out yet. Assume each of them succeeds as \
+         described — the working directory holds the code they start from — and propose up \
+         to {breadth} possible steps that could come right after the last of them, \
+         \"{title}\", toward the goal{s} below. Read the code to ground your proposals in \
+         what the assumed steps would change. Do not modify files.\n\n\
+         ## Assumed done\n\n{steps}\n\
+         ## Goal{s}\n\n{goals}",
+        title = start.title,
+        s = if aim.goals.len() == 1 { "" } else { "s" },
+        goals = aim.describe(graph)?,
+    );
+    let schema = schema(true);
+    let prompt = prompt(reaction, &task, &known, &schema);
+    let scratch = reaction.context().workspaces().scratch(&ground)?;
+    let response: Response =
+        reaction.invoke(graph, Some(start.id), scratch.path(), &prompt, &schema)?;
+    drop(scratch);
+
+    let mut report = ExplorationReport {
+        direction: Direction::Ahead,
+        from: start.id,
+        proposed: Vec::new(),
+        rejected: Vec::new(),
+    };
+    for proposal in response.nodes.into_iter().take(breadth) {
+        record(
+            graph,
+            &mut report,
+            &proposal.title,
+            &proposal.objective,
+            &[start.id],
+            &aim.resolve(&proposal.before),
+        );
+    }
+    Ok(Some(report))
 }
 
 /// A graph-wide exploration's reaction to any event: survey toward the

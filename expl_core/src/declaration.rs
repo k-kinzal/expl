@@ -91,9 +91,11 @@ pub struct AgentDeclaration {
     /// Exploration only: maximum steps proposed per reaction.
     #[serde(default)]
     pub breadth: Option<usize>,
-    /// Exploration only: pause while this many steps await execution.
+    /// Exploration only: also explore ahead of steps not carried out yet,
+    /// assuming they succeed, when revisiting starting points — the map
+    /// grows deep before anything runs.
     #[serde(default)]
-    pub max_pending: Option<usize>,
+    pub speculate: Option<bool>,
     /// Exploration only: seconds an idle process waits after its last
     /// exploration before it revisits a random starting point. Without it,
     /// an exploration reacts to events only and never revisits.
@@ -194,7 +196,6 @@ command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
 replicas = 1
 breadth = 3
-max_pending = 6
 revisit_cooldown = 600          # idle: explore again from a random node every 10 minutes
 
 [agent.planner]
@@ -288,19 +289,16 @@ replicas = 1
                     if agent.breadth.is_none_or(|b| b == 0) {
                         return invalid(name, "exploration needs `breadth` >= 1");
                     }
-                    if agent.max_pending.is_none_or(|m| m == 0) {
-                        return invalid(name, "exploration needs `max_pending` >= 1");
-                    }
                 }
                 Role::Planning | Role::Execution | Role::Evaluation => {
                     if agent.breadth.is_some()
-                        || agent.max_pending.is_some()
+                        || agent.speculate.is_some()
                         || agent.revisit_cooldown.is_some()
                         || agent.scope.is_some()
                     {
                         return invalid(
                             name,
-                            "`breadth`, `max_pending`, `revisit_cooldown` and `scope` apply to \
+                            "`breadth`, `revisit_cooldown`, `scope` and `speculate` apply to \
                              exploration agents only",
                         );
                     }
@@ -392,8 +390,8 @@ mod tests {
     fn weighted_agents_split_their_role_by_weight() {
         let text = format!(
             "{}\n[agent.contrarian]\nrole = \"exploration\"\ndriver = \"generic\"\n\
-             command = [\"x\"]\nreplicas = 1\nbreadth = 1\nmax_pending = 1\nweight = 1\n",
-            Declaration::TEMPLATE.replace("max_pending = 6\n", "max_pending = 6\nweight = 3\n")
+             command = [\"x\"]\nreplicas = 1\nbreadth = 1\nweight = 1\n",
+            Declaration::TEMPLATE.replace("breadth = 3\n", "breadth = 3\nweight = 3\n")
         );
         let declaration = Declaration::parse(&text).expect("parses");
         let mut counts = BTreeMap::new();
@@ -408,8 +406,7 @@ mod tests {
         // Unweighted agents react to everything of their role.
         assert_eq!(declaration.route("planner", EventId(1)), None);
 
-        let zero =
-            Declaration::TEMPLATE.replace("max_pending = 6\n", "max_pending = 6\nweight = 0\n");
+        let zero = Declaration::TEMPLATE.replace("breadth = 3\n", "breadth = 3\nweight = 0\n");
         let error = Declaration::parse(&zero).expect_err("zero weight");
         assert!(
             error.to_string().contains("`weight` must be >= 1"),

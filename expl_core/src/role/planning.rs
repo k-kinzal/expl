@@ -44,6 +44,8 @@ pub struct PlanningReport {
     pub planned: Vec<NodeId>,
     /// Steps given further predecessors.
     pub joined: Vec<NodeId>,
+    /// Steps moved off superseded origins onto the active one.
+    pub rebased: Vec<NodeId>,
     /// Steps pruned.
     pub pruned: Vec<NodeId>,
     /// The newest event when the agent was shown the graph: the events
@@ -62,6 +64,8 @@ struct Response {
     prunes: Vec<PruneResponse>,
     #[serde(default)]
     joins: Vec<JoinResponse>,
+    #[serde(default)]
+    rebases: Vec<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,7 +97,7 @@ fn schema() -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["summary", "paths", "priorities", "prunes", "joins"],
+        "required": ["summary", "paths", "priorities", "prunes", "joins", "rebases"],
         "properties": {
             "summary": {"type": "string", "description": "Your reading of the steps and the strategy behind this plan."},
             "paths": {
@@ -132,6 +136,11 @@ fn schema() -> serde_json::Value {
                         "after": {"type": "array", "items": {"type": "integer"}, "description": "Further steps it builds on; its work starts from all of them combined."}
                     }
                 }
+            },
+            "rebases": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "Proposed/planned steps that build on a superseded origin and should start from the active origin instead."
             },
             "prunes": {
                 "type": "array",
@@ -195,6 +204,21 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
             pruned.push(id);
         }
     }
+    // Rebases before joins and priorities: where a step starts decides
+    // what it can join and when it becomes ready.
+    let mut rebased = Vec::new();
+    for id in response.rebases.into_iter().map(NodeId) {
+        if !open(id) || pruned.contains(&id) {
+            continue;
+        }
+        match graph.rebase(id) {
+            Ok(true) => rebased.push(id),
+            // Nothing to move, or adopted work builds on it: the agent's
+            // mistake, not a failed reaction.
+            Ok(false) | Err(GraphError::NotInStatus { .. } | GraphError::Cycle { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     // Joins before priorities, so a step planned now becomes ready only
     // when its new predecessors are completed too.
     let mut joined = Vec::new();
@@ -251,6 +275,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
         paths: paths.len(),
         planned: planned.into_iter().collect(),
         joined,
+        rebased,
         pruned,
         covered: shown.through,
     }))
@@ -274,7 +299,12 @@ fn prompt(reaction: &Reaction<'_>, shown: &Snapshot, schema: &serde_json::Value)
            on other steps lists them in `after`; its work then starts from all of them \
            combined. Join steps whose results complement each other.\n\
          - `prunes`: `proposed`/`planned` steps that are redundant, already covered, or no \
-           longer promising given the judgements.\n\n\
+           longer promising given the judgements.\n\
+         - `rebases`: `proposed`/`planned` steps that build on a superseded origin and should \
+           start from the active origin instead. The trunk moving does not move them: move a \
+           step when its idea still holds on the newer code; keep it where it is when it \
+           depends on the older code (or is worth trying there as an alternative); prune it \
+           when the newer code already covers it.\n\n\
          Origins are states the code has been in: the `active` origin is the code as it \
          stands now (the working directory), `superseded` ones are earlier states. Each origin \
          builds on the one before it and on the steps adopted into it, so their work is already \
