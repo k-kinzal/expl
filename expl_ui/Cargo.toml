@@ -1,0 +1,25 @@
+[package]
+name = "expl_ui"
+description = "A live, minimal window onto an expl exploration: the graph, node states, and agent processes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "expl-ui"
+path = "src/main.rs"
+
+[dependencies]
+expl_core.workspace = true
+gpui.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

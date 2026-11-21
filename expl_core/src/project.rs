@@ -5,8 +5,8 @@
 //!
 //! - the **declaration**, `expl.toml` at the repository root — what the
 //!   operator wrote; safe to commit.
-//! - the **state directory**, `.expl/` — the graph database, node
-//!   worktrees, agent logs, and the run lock; local and never committed.
+//! - the **state directory**, `.expl/` — the database (graph, events,
+//!   processes), worktrees, and logs; local and never committed.
 //!
 //! Discovery is bounded by the git working tree: a project is found only at
 //! the top level of the working tree that contains the start directory.
@@ -14,14 +14,13 @@
 //! worktree (itself a git working tree) cannot accidentally reach the
 //! enclosing project's graph.
 
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
 use crate::git::{Git, GitError};
 
-/// Locating or locking a project failed.
+/// Locating a project failed.
 #[derive(Debug, Error)]
 pub enum ProjectError {
     /// The start directory is not inside a git working tree.
@@ -30,9 +29,6 @@ pub enum ProjectError {
     /// The repository has not been initialised with `expl init`.
     #[error("no expl project at {0} (run `expl init`)")]
     NotInitialized(String),
-    /// Another expl process holds the run lock.
-    #[error("another expl process is running agents in this project (lock: {0})")]
-    Locked(String),
     /// Filesystem failure.
     #[error("{context}: {source}")]
     Io {
@@ -48,13 +44,6 @@ pub enum ProjectError {
 #[derive(Debug, Clone)]
 pub struct Project {
     root: PathBuf,
-}
-
-/// Exclusive right to run agents in a project, held for a command's
-/// lifetime. Released on drop.
-#[derive(Debug)]
-pub struct ProjectLock {
-    _file: File,
 }
 
 impl Project {
@@ -134,40 +123,22 @@ impl Project {
         self.state_dir().join("logs")
     }
 
-    /// `.expl/lock`.
+    /// `.expl/proc/` — one log file per process.
     #[must_use]
-    pub fn lock_path(&self) -> PathBuf {
-        self.state_dir().join("lock")
+    pub fn processes_dir(&self) -> PathBuf {
+        self.state_dir().join("proc")
     }
 
-    /// Take the exclusive run lock without waiting.
-    ///
-    /// Commands that run agents hold it so that node claims, worktrees, and
-    /// interrupted-run recovery have a single owner.
-    ///
-    /// # Errors
-    ///
-    /// [`ProjectError::Locked`] when another process holds it.
-    pub fn lock(&self) -> Result<ProjectLock, ProjectError> {
-        let path = self.lock_path();
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .map_err(|source| ProjectError::Io {
-                context: format!("open {}", path.display()),
-                source,
-            })?;
-        match file.try_lock() {
-            Ok(()) => Ok(ProjectLock { _file: file }),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                Err(ProjectError::Locked(path.display().to_string()))
-            }
-            Err(std::fs::TryLockError::Error(source)) => Err(ProjectError::Io {
-                context: format!("lock {}", path.display()),
-                source,
-            }),
-        }
+    /// `.expl/worktrees/` — node and scratch worktrees.
+    #[must_use]
+    pub fn worktrees_dir(&self) -> PathBuf {
+        self.state_dir().join("worktrees")
+    }
+
+    /// `.expl/git.lock` — serialises git operations that touch shared
+    /// repository state across processes.
+    #[must_use]
+    pub fn git_lock_path(&self) -> PathBuf {
+        self.state_dir().join("git.lock")
     }
 }

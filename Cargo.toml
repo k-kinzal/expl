@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "expl_core",
     "expl_cli",
+    "expl_ui",
 ]
 
 [workspace.package]
@@ -25,6 +26,8 @@ toml = "0.8"
 rusqlite = { version = "0.43", features = ["bundled"] }
 clap = { version = "4", features = ["derive", "env"] }
 tempfile = "3"
+signal-hook = "0.3"
+gpui = "0.2.2"
 
 [profile.release]
 lto = "thin"

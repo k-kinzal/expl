@@ -1,44 +1,53 @@
 //! `clap` derive structures for the `expl` CLI.
 //!
-//! Resources follow iter's `<resource> <verb>` form; the four roles and the
-//! runner are top-level verbs because they act on the whole graph:
+//! Resources follow iter's `<resource> <verb>` form. Processes are managed
+//! with Docker's verbs, and the familiar short forms are top-level aliases:
 //!
 //! ```text
 //! Setup:      expl init
-//! Resources:  expl goal add|ls|prune
-//!             expl node ls|inspect|add|retry|prune   (alias: expl inspect)
-//!             expl graph show
-//!             expl path ls
-//!             expl candidate ls
-//!             expl logs <NODE>
-//! Roles:      expl explore | plan | execute | evaluate
-//! Runner:     expl run
+//! Graph:      expl goal add|ls|retire
+//!             expl node ls|inspect|add|retry|prune|logs
+//! Trunk:      expl origin ls   (the trunk itself moves with git)
+//!             expl graph show · expl path ls · expl candidate ls
+//!             expl event ls
+//! Agents:     expl agent ls
+//! Processes:  expl run <AGENT> [-d]
+//!             expl up [AGENT...] · expl down
+//!             expl process ls|inspect|logs|stop|kill|rm
+//!             (aliases: expl ps | logs | stop | kill | rm)
 //! ```
 
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use expl_core::{Direction, NodeId, NodeKind, NodeStatus};
+use expl_core::{EventKind, NodeId, NodeKind, NodeStatus};
 
 /// Top-level `expl` CLI definition.
 #[derive(Debug, Parser)]
 #[command(
     name = "expl",
     version,
-    about = "Explore a problem space as a graph of agent-realised git branches",
-    long_about = "expl explores a problem space as a graph. An explorer proposes nodes toward \
-                  goals (and, per goal, backward from them), a planner draws paths and sets \
-                  priorities, executors realise nodes as commits on their own git branches in \
-                  parallel worktrees, and an evaluator judges them against the goals. The graph \
-                  lives in SQLite under .expl/. Exploration never ends by itself: choosing among \
-                  the candidates that satisfy a goal is yours.",
+    about = "Explore a problem space with agents that react to graph events",
+    long_about = "expl explores a problem space as a graph of git branches. Every change to the \
+                  graph is an event. Agents declared in expl.toml react to the events of their \
+                  role: exploration proposes steps toward goals (and backward from them), \
+                  planning orders them into paths and sets priorities, execution realises ready \
+                  steps as commits on their own branches, and evaluation judges them against the \
+                  goals. Agents run as processes, managed like containers: run as many as you \
+                  like, and processes of one agent share its events, so independent work happens \
+                  in parallel. Exploration never ends by itself: choosing among the candidates \
+                  that satisfy a goal is yours.",
     after_help = "EXAMPLES:\n  \
                   expl init\n  \
-                  expl goal add \"Support Codex as executor\" --objective \"...\"\n  \
-                  expl run --cycles 3\n  \
-                  expl graph show --format mermaid\n  \
+                  expl goal add \"Support Codex\" --objective \"...\"\n  \
+                  expl up                       # every agent, `replicas` processes each\n  \
+                  expl ps\n  \
+                  expl run executor -d          # one more executor\n  \
+                  expl logs executor-5 -f\n  \
                   expl candidate ls\n  \
-                  git merge expl/node-7"
+                  git merge expl/node-7         # adopt it; running processes follow the trunk\n  \
+                  expl origin ls                # what was adopted, and when\n  \
+                  expl down"
 )]
 pub(crate) struct Cli {
     /// Run as if expl was started in this directory.
@@ -55,9 +64,8 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Initialise expl in the current git repository.
     #[command(
-        long_about = "Create .expl/ (graph database, worktrees, logs), write expl.toml if \
-                            absent, exclude .expl/ from git, and record the origin node at the \
-                            base commit."
+        long_about = "Create .expl/ (database, worktrees, logs), write expl.toml if absent, \
+                      exclude .expl/ from git, and record the origin node at the base commit."
     )]
     Init(InitArgs),
     /// Manage goals.
@@ -66,8 +74,6 @@ pub(crate) enum Command {
     /// Inspect and adjust nodes.
     #[command(subcommand)]
     Node(NodeCommand),
-    /// Show one node (alias of `expl node inspect`).
-    Inspect(InspectArgs),
     /// Render the whole graph.
     #[command(subcommand)]
     Graph(GraphCommand),
@@ -77,24 +83,41 @@ pub(crate) enum Command {
     /// Show steps evaluated as satisfying a goal.
     #[command(subcommand)]
     Candidate(CandidateCommand),
-    /// Print the newest agent log for a node.
-    Logs(LogsArgs),
-    /// Run the explorer once.
-    Explore(ExploreArgs),
-    /// Run the planner once.
-    Plan,
-    /// Run the executor on one ready step.
-    Execute(ExecuteArgs),
-    /// Run the evaluator on completed steps.
-    Evaluate(EvaluateArgs),
-    /// Repeat explore → plan → execute → evaluate cycles.
+    /// Show the trunk's lineage: every origin exploration started from.
+    #[command(subcommand)]
+    Origin(OriginCommand),
+    /// Show the event log.
+    #[command(subcommand)]
+    Event(EventCommand),
+    /// Show declared agents.
+    #[command(subcommand)]
+    Agent(AgentCommand),
+    /// Manage processes.
+    #[command(subcommand)]
+    Process(ProcessCommand),
+    /// Start a process of an agent.
     #[command(
-        long_about = "Repeat cycles of explore → plan → execute → evaluate. Runs until \
-                            --cycles is reached, a cycle finds nothing to do, or interrupted. \
-                            Steps left running by an interrupted run are re-planned on the next \
-                            start."
+        long_about = "Start a process of the declared agent. It leases the events of its role \
+                      from the agent's inbox one at a time, reacts, and acknowledges them, until \
+                      stopped. Processes of the same agent share its events, so starting more \
+                      processes adds parallelism. With -d the process runs in the background and \
+                      its name is printed."
     )]
     Run(RunArgs),
+    /// Start processes until every agent has `replicas` running.
+    Up(UpArgs),
+    /// Stop every running process.
+    Down(StopArgs),
+    /// List processes (alias of `expl process ls`).
+    Ps(PsArgs),
+    /// Print a process log (alias of `expl process logs`).
+    Logs(ProcessLogsArgs),
+    /// Stop processes (alias of `expl process stop`).
+    Stop(ProcessStopArgs),
+    /// Kill processes (alias of `expl process kill`).
+    Kill(ProcessTargetsArgs),
+    /// Remove exited processes (alias of `expl process rm`).
+    Rm(ProcessRmArgs),
 }
 
 /// `expl init`.
@@ -103,17 +126,28 @@ pub(crate) struct InitArgs {
     /// Revision the origin node starts from.
     #[arg(long, default_value = "HEAD")]
     pub(crate) base: String,
+    /// The trunk: the default branch expl follows, written to expl.toml
+    /// (default: the branch checked out, or `--base` when it names one).
+    #[arg(long, value_name = "BRANCH")]
+    pub(crate) trunk: Option<String>,
+}
+
+/// `expl origin ...`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum OriginCommand {
+    /// List every origin, oldest first, with what was adopted into it.
+    Ls(ListingArgs),
 }
 
 /// `expl goal ...`.
 #[derive(Debug, Subcommand)]
 pub(crate) enum GoalCommand {
-    /// Add a goal.
+    /// Add a goal (records `goal.added`).
     Add(GoalAddArgs),
-    /// List active goals.
-    Ls(ListingArgs),
-    /// Retire a goal.
-    Prune(PruneArgs),
+    /// List active goals (with --all, retired ones too).
+    Ls(GoalLsArgs),
+    /// Retire a goal (records `goal.retired`).
+    Retire(PruneArgs),
 }
 
 /// `expl goal add`.
@@ -129,19 +163,32 @@ pub(crate) struct GoalAddArgs {
     pub(crate) counter: bool,
 }
 
+/// `expl goal ls`.
+#[derive(Debug, Args)]
+pub(crate) struct GoalLsArgs {
+    /// Include retired goals.
+    #[arg(short, long)]
+    pub(crate) all: bool,
+    /// Output options.
+    #[command(flatten)]
+    pub(crate) listing: ListingArgs,
+}
+
 /// `expl node ...`.
 #[derive(Debug, Subcommand)]
 pub(crate) enum NodeCommand {
     /// List nodes.
     Ls(NodeLsArgs),
     /// Show one node with its edges, evaluations, and agent runs.
-    Inspect(InspectArgs),
-    /// Propose a step by hand.
+    Inspect(NodeRefArgs),
+    /// Propose a step by hand (records `node.proposed`).
     Add(NodeAddArgs),
     /// Re-plan a failed step.
     Retry(NodeRefArgs),
-    /// Prune a proposed or planned step.
+    /// Prune a proposed, planned, or failed step.
     Prune(PruneArgs),
+    /// Print the newest agent log about a node.
+    Logs(NodeRefArgs),
 }
 
 /// `expl node ls`.
@@ -172,7 +219,7 @@ pub(crate) struct NodeAddArgs {
     /// Nodes this step leads toward.
     #[arg(long, value_parser = parse_node)]
     pub(crate) before: Vec<NodeId>,
-    /// Plan it immediately at this priority.
+    /// Plan it immediately at this priority, without waiting for planning.
     #[arg(long)]
     pub(crate) priority: Option<i64>,
 }
@@ -185,22 +232,14 @@ pub(crate) struct NodeRefArgs {
     pub(crate) node: NodeId,
 }
 
-/// `inspect`.
-#[derive(Debug, Args)]
-pub(crate) struct InspectArgs {
-    /// Node id (`7` or `#7`).
-    #[arg(value_parser = parse_node)]
-    pub(crate) node: NodeId,
-}
-
-/// `prune`.
+/// `prune` / `retire`.
 #[derive(Debug, Args)]
 pub(crate) struct PruneArgs {
     /// Node id (`7` or `#7`).
     #[arg(value_parser = parse_node)]
     pub(crate) node: NodeId,
     /// Why.
-    #[arg(long, default_value = "pruned by operator")]
+    #[arg(long, default_value = "by operator")]
     pub(crate) reason: String,
 }
 
@@ -244,57 +283,150 @@ pub(crate) enum CandidateCommand {
     Ls(ListingArgs),
 }
 
-/// `expl logs`.
-#[derive(Debug, Args)]
-pub(crate) struct LogsArgs {
-    /// Node id (`7` or `#7`).
-    #[arg(value_parser = parse_node)]
-    pub(crate) node: NodeId,
+/// `expl event ...`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum EventCommand {
+    /// List events, oldest first.
+    Ls(EventLsArgs),
 }
 
-/// `expl explore`.
+/// `expl event ls`.
 #[derive(Debug, Args)]
-pub(crate) struct ExploreArgs {
-    /// Node to explore from (default: the frontier, or the
-    /// counter-exploration goal for `--direction backward`).
-    #[arg(long, value_parser = parse_node)]
-    pub(crate) from: Option<NodeId>,
-    /// Search direction.
-    #[arg(long, value_parser = parse_direction, default_value = "forward")]
-    pub(crate) direction: Direction,
+pub(crate) struct EventLsArgs {
+    /// Only events after this id (default: the newest `--limit`).
+    #[arg(long)]
+    pub(crate) after: Option<i64>,
+    /// At most this many events.
+    #[arg(long, default_value_t = 50)]
+    pub(crate) limit: usize,
+    /// Only these kinds.
+    #[arg(long, value_parser = parse_event_kind)]
+    pub(crate) kind: Vec<EventKind>,
+    /// Show how this agent's deliveries of each event stand.
+    #[arg(long)]
+    pub(crate) agent: Option<String>,
     /// Output options.
     #[command(flatten)]
-    pub(crate) report: ReportArgs,
+    pub(crate) listing: ListingArgs,
 }
 
-/// `expl execute`.
-#[derive(Debug, Args)]
-pub(crate) struct ExecuteArgs {
-    /// Step to execute (default: the highest-priority ready step).
-    #[arg(value_parser = parse_node)]
-    pub(crate) node: Option<NodeId>,
-    /// Output options.
-    #[command(flatten)]
-    pub(crate) report: ReportArgs,
+/// `expl agent ...`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum AgentCommand {
+    /// List declared agents with their running processes and backlog.
+    Ls(ListingArgs),
 }
 
-/// `expl evaluate`.
-#[derive(Debug, Args)]
-pub(crate) struct EvaluateArgs {
-    /// Step to evaluate (default: every completed step not yet evaluated).
-    #[arg(value_parser = parse_node)]
-    pub(crate) node: Option<NodeId>,
-    /// Output options.
-    #[command(flatten)]
-    pub(crate) report: ReportArgs,
+/// `expl process ...`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum ProcessCommand {
+    /// List processes.
+    Ls(PsArgs),
+    /// Show one process record.
+    Inspect(ProcessTargetArgs),
+    /// Print a process log.
+    Logs(ProcessLogsArgs),
+    /// Ask processes to stop, then kill them after a grace period.
+    Stop(ProcessStopArgs),
+    /// Kill processes immediately.
+    Kill(ProcessTargetsArgs),
+    /// Remove records (and logs) of exited processes.
+    Rm(ProcessRmArgs),
 }
 
 /// `expl run`.
 #[derive(Debug, Args)]
 pub(crate) struct RunArgs {
-    /// Stop after this many cycles.
+    /// Declared agent name.
+    pub(crate) agent: String,
+    /// Run in the background and print the process name.
+    #[arg(short, long)]
+    pub(crate) detach: bool,
+    /// Process name (default: `<agent>-<id>`).
     #[arg(long)]
-    pub(crate) cycles: Option<usize>,
+    pub(crate) name: Option<String>,
+    /// Exit after reacting to one event.
+    #[arg(long)]
+    pub(crate) once: bool,
+    /// Exit when no event is deliverable.
+    #[arg(long)]
+    pub(crate) exit_when_idle: bool,
+    /// Adopt a pre-created process record (used by `-d`).
+    #[arg(long, hide = true, conflicts_with_all = ["detach", "name"])]
+    pub(crate) adopt: Option<i64>,
+}
+
+/// `expl up`.
+#[derive(Debug, Args)]
+pub(crate) struct UpArgs {
+    /// Only these agents (default: all declared).
+    pub(crate) agents: Vec<String>,
+}
+
+/// `expl ps` / `expl process ls`.
+#[derive(Debug, Args)]
+pub(crate) struct PsArgs {
+    /// Include exited and dead processes.
+    #[arg(short, long)]
+    pub(crate) all: bool,
+    /// Output options.
+    #[command(flatten)]
+    pub(crate) listing: ListingArgs,
+}
+
+/// One process target.
+#[derive(Debug, Args)]
+pub(crate) struct ProcessTargetArgs {
+    /// Process id or name.
+    pub(crate) process: String,
+}
+
+/// Several process targets.
+#[derive(Debug, Args)]
+pub(crate) struct ProcessTargetsArgs {
+    /// Process ids or names.
+    #[arg(required = true)]
+    pub(crate) processes: Vec<String>,
+}
+
+/// `logs`.
+#[derive(Debug, Args)]
+pub(crate) struct ProcessLogsArgs {
+    /// Process id or name.
+    pub(crate) process: String,
+    /// Keep printing as the log grows, until the process exits.
+    #[arg(short, long)]
+    pub(crate) follow: bool,
+}
+
+/// Grace period for `stop` / `down`.
+#[derive(Debug, Args)]
+pub(crate) struct StopArgs {
+    /// Seconds to wait before killing.
+    #[arg(short, long, default_value_t = 30)]
+    pub(crate) time: u64,
+}
+
+/// `stop`.
+#[derive(Debug, Args)]
+pub(crate) struct ProcessStopArgs {
+    /// Process ids or names.
+    #[arg(required = true)]
+    pub(crate) processes: Vec<String>,
+    /// Grace period.
+    #[command(flatten)]
+    pub(crate) stop: StopArgs,
+}
+
+/// `rm`.
+#[derive(Debug, Args)]
+pub(crate) struct ProcessRmArgs {
+    /// Process ids or names.
+    #[arg(required = true)]
+    pub(crate) processes: Vec<String>,
+    /// Kill live processes first.
+    #[arg(short, long)]
+    pub(crate) force: bool,
 }
 
 /// Shared listing options (iter's vocabulary).
@@ -317,23 +449,6 @@ pub(crate) enum ListingFormat {
     Json,
 }
 
-/// Role report options.
-#[derive(Debug, Args)]
-pub(crate) struct ReportArgs {
-    /// Output format.
-    #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
-    pub(crate) format: ReportFormat,
-}
-
-/// Role report formats.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum ReportFormat {
-    /// Human summary.
-    Text,
-    /// One JSON object.
-    Json,
-}
-
 fn parse_node(value: &str) -> Result<NodeId, String> {
     value
         .parse()
@@ -348,7 +463,7 @@ fn parse_status(value: &str) -> Result<NodeStatus, String> {
     value.parse()
 }
 
-fn parse_direction(value: &str) -> Result<Direction, String> {
+fn parse_event_kind(value: &str) -> Result<EventKind, String> {
     value.parse()
 }
 

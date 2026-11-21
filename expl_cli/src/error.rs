@@ -3,7 +3,7 @@
 use expl_core::agent::AgentError;
 use expl_core::git::GitError;
 use expl_core::{
-    DeclarationError, GraphError, ProjectError, RoleError, RunnerError, WorkspaceError,
+    DeclarationError, GraphError, ProcessError, ProjectError, RoleError, StoreError, WorkspaceError,
 };
 use thiserror::Error;
 
@@ -23,12 +23,18 @@ pub(crate) enum CliError {
     /// The operator asked for something that cannot be done.
     #[error("{0}")]
     Usage(String),
-    /// Project discovery or locking.
+    /// Project discovery.
     #[error(transparent)]
     Project(#[from] ProjectError),
     /// `expl.toml`.
     #[error(transparent)]
     Declaration(#[from] DeclarationError),
+    /// The database file.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// Process and delivery records.
+    #[error("database error: {0}")]
+    Database(#[from] rusqlite::Error),
     /// Graph.
     #[error(transparent)]
     Graph(#[from] GraphError),
@@ -41,9 +47,9 @@ pub(crate) enum CliError {
     /// A role.
     #[error(transparent)]
     Role(#[from] RoleError),
-    /// The runner.
+    /// A process.
     #[error(transparent)]
-    Runner(#[from] RunnerError),
+    Process(#[from] ProcessError),
     /// Agent.
     #[error(transparent)]
     Agent(#[from] AgentError),
@@ -70,23 +76,22 @@ impl CliError {
     pub(crate) fn exit_code(&self) -> u8 {
         match self {
             Self::Usage(_)
-            | Self::Project(
-                ProjectError::NotARepository(..)
-                | ProjectError::NotInitialized(_)
-                | ProjectError::Locked(_),
-            )
-            | Self::Graph(GraphError::NodeNotFound(_))
-            | Self::Role(
-                RoleError::NotApplicable { .. } | RoleError::Graph(GraphError::NodeNotFound(_)),
-            )
-            | Self::Runner(RunnerError::NoGoals) => exit::USER,
+            | Self::Project(ProjectError::NotARepository(..) | ProjectError::NotInitialized(_))
+            | Self::Declaration(DeclarationError::UnknownAgent(_))
+            | Self::Graph(
+                GraphError::NodeNotFound(_)
+                | GraphError::NotInStatus { .. }
+                | GraphError::Cycle { .. },
+            ) => exit::USER,
             Self::Declaration(_) | Self::Role(RoleError::Declaration(_)) => exit::CONFIG,
             Self::Project(ProjectError::Io { .. })
+            | Self::Store(_)
+            | Self::Database(_)
             | Self::Graph(_)
             | Self::Git(_)
             | Self::Workspace(_)
             | Self::Role(_)
-            | Self::Runner(RunnerError::Graph(_))
+            | Self::Process(_)
             | Self::Agent(_)
             | Self::Io { .. } => exit::RUNTIME,
         }

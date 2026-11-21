@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::agent::AgentError;
 use crate::declaration::DeclarationError;
-use crate::graph::{GraphError, NodeId};
+use crate::graph::GraphError;
 use crate::workspace::WorkspaceError;
 
 /// A role could not do its work.
@@ -22,16 +22,19 @@ pub enum RoleError {
     /// The declaration is inconsistent.
     #[error(transparent)]
     Declaration(#[from] DeclarationError),
+    /// The database failed outside the graph.
+    #[error(transparent)]
+    Store(#[from] crate::store::StoreError),
     /// Filesystem failure (logs).
     #[error("role I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    /// The node is not in a state this role can work on.
-    #[error("node {node} cannot be handled by the {role}: {reason}")]
-    NotApplicable {
-        /// The node.
-        node: NodeId,
+    /// The event does not carry what the role needs.
+    #[error("{role} cannot react to {event}: {reason}")]
+    Malformed {
         /// The role.
         role: &'static str,
+        /// The event.
+        event: String,
         /// Why.
         reason: String,
     },

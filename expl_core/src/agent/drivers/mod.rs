@@ -2,10 +2,13 @@
 
 mod claude_code;
 mod codex;
+mod cursor_agent;
 mod generic;
+mod result_record;
 
 pub use claude_code::ClaudeCodeDriver;
 pub use codex::CodexDriver;
+pub use cursor_agent::CursorAgentDriver;
 pub use generic::GenericDriver;
 
 use crate::agent::AgentError;

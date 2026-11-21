@@ -1,21 +1,23 @@
-//! Agents: which AI agent CLI runs, and how it is invoked.
+//! Agents: the declared units that react to events.
 //!
-//! Mirrors iter's three levels, one direction of knowledge:
+//! An [`Agent`] is what `expl.toml` declares under `[agent.<name>]`: a
+//! [`Role`](crate::role::Role) (exploration, planning, execution,
+//! evaluation), the AI CLI that carries it out, and how many processes of
+//! it `expl up` keeps running. An agent is to a process what an image is to
+//! a container: the definition, started any number of times.
 //!
-//! - [`Agent`] — the noun. A struct, not a trait: it realises the
-//!   invocation cycle once — scratch directory, spawn in the workspace
-//!   directory, prompt delivery on stdin, faithful capture teed into the
-//!   run log, interpretation.
-//! - [`AgentDriver`] — the bidirectional translator for one CLI:
-//!   [`command`](AgentDriver::command) encodes expl's intent (prompt,
-//!   response schema) into the CLI's dialect, and
-//!   [`interpret`](AgentDriver::interpret) decodes the CLI's verdict back
-//!   into an [`AgentRun`]. Drivers never touch a process.
-//! - The concrete drivers in [`drivers`], named after the product they
-//!   translate for.
+//! Each reaction to an event is one **invocation** of the agent's CLI.
+//! Translating for a particular CLI is the job of an [`AgentDriver`] — the
+//! bidirectional translator kept from iter: [`command`](AgentDriver::command)
+//! encodes the request (prompt, response schema) into the CLI's dialect,
+//! [`interpret`](AgentDriver::interpret) decodes the CLI's verdict into an
+//! [`AgentRun`]. Drivers never touch a process; [`Agent::invoke`] realises
+//! the invocation cycle once — spawn in the workspace directory, prompt on
+//! stdin, output teed into the run log, cooperative interruption,
+//! interpretation.
 //!
-//! Unlike iter, every expl invocation asks for a **structured response**:
-//! each role hands the agent a JSON Schema and reads the reply as data.
+//! Every invocation asks for a **structured response**: the role hands the
+//! agent a JSON Schema and reads the reply as data.
 
 pub mod drivers;
 
@@ -23,13 +25,11 @@ pub mod drivers;
 mod agent;
 mod driver;
 mod error;
-mod kind;
 pub mod response;
 mod run;
 
 pub use agent::{Agent, Invocation};
-pub use driver::{AgentCommand, AgentDriver, AgentRequest};
-pub use drivers::{ClaudeCodeDriver, CodexDriver, GenericDriver};
+pub use driver::{AgentCommand, AgentDriver, AgentRequest, DriverKind};
+pub use drivers::{ClaudeCodeDriver, CodexDriver, CursorAgentDriver, GenericDriver};
 pub use error::AgentError;
-pub use kind::AgentKind;
 pub use run::AgentRun;

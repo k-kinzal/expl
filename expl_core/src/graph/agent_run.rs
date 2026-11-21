@@ -20,7 +20,7 @@ pub enum AgentRunStatus {
     Succeeded,
     /// The agent failed or its response was unusable.
     Failed,
-    /// The hosting expl process died mid-run.
+    /// The process was stopped mid-run.
     Interrupted,
 }
 
@@ -36,12 +36,16 @@ text_enum!(AgentRunStatus {
 pub struct AgentRunRecord {
     /// Identity.
     pub id: AgentRunId,
-    /// Role name (`explorer`, `planner`, `executor`, `evaluator`).
-    pub role: String,
-    /// The node the run was about, when any.
-    pub node: Option<NodeId>,
     /// Declared agent name.
     pub agent: String,
+    /// The agent's role (`exploration`, `planning`, `execution`, `evaluation`).
+    pub role: String,
+    /// The process that ran it.
+    pub process: Option<i64>,
+    /// The event it reacted to.
+    pub event: Option<i64>,
+    /// The node the run was about, when any.
+    pub node: Option<NodeId>,
     /// Outcome.
     pub status: AgentRunStatus,
     /// Raw stdout/stderr log.

@@ -9,11 +9,16 @@ use crate::graph::{Evaluation, Graph, GraphError, Node, NodeFilter, NodeId, Node
 const EXCERPT: usize = 600;
 
 pub(crate) fn excerpt(text: &str) -> String {
+    excerpt_to(text, EXCERPT)
+}
+
+/// `text` flattened to one line of at most `width` characters.
+pub(crate) fn excerpt_to(text: &str, width: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= EXCERPT {
+    if flat.chars().count() <= width {
         flat
     } else {
-        let cut: String = flat.chars().take(EXCERPT).collect();
+        let cut: String = flat.chars().take(width).collect();
         format!("{cut}…")
     }
 }
@@ -29,24 +34,35 @@ pub(crate) fn headline(node: &Node) -> String {
     line
 }
 
-/// The goals, one block each.
+/// Goals as a task states them: title and objective, no ids.
 pub(crate) fn goals(goals: &[Node]) -> String {
-    if goals.is_empty() {
-        return "(no active goals)\n".to_owned();
-    }
     let mut out = String::new();
     for goal in goals {
-        let _ = writeln!(out, "- {} {}", goal.id, goal.title);
-        let _ = writeln!(out, "  {}", excerpt(&goal.objective));
-        if goal.counter_exploration {
-            let _ = writeln!(out, "  (counter-exploration enabled)");
+        let _ = writeln!(out, "- {}", goal.title);
+        if !goal.objective.trim().is_empty() {
+            let _ = writeln!(out, "  {}", goal.objective.trim());
         }
     }
     out
 }
 
-/// The whole graph: every non-pruned node with its edges, outcome, and
-/// latest evaluation per goal.
+/// Goals with the ids a response refers to them by.
+pub(crate) fn numbered_goals(goals: &[Node]) -> String {
+    if goals.is_empty() {
+        return "(none)\n".to_owned();
+    }
+    let mut out = String::new();
+    for goal in goals {
+        let _ = writeln!(out, "- [{}] {}", goal.id, goal.title);
+        if !goal.objective.trim().is_empty() {
+            let _ = writeln!(out, "  {}", excerpt(&goal.objective));
+        }
+    }
+    out
+}
+
+/// The steps for planning: every non-pruned node with its edges, outcome,
+/// and latest evaluation per goal.
 pub(crate) fn graph(graph: &Graph) -> Result<String, GraphError> {
     let nodes = graph.nodes(&NodeFilter::default())?;
     let edges = graph.edges()?;
@@ -92,9 +108,6 @@ pub(crate) fn graph(graph: &Graph) -> Result<String, GraphError> {
                 ids(after.get(&node.id)),
                 ids(before.get(&node.id))
             );
-        }
-        if let Some(branch) = &node.branch {
-            let _ = writeln!(out, "    branch: {branch}");
         }
         if let Some(outcome) = &node.outcome {
             let _ = writeln!(out, "    outcome: {}", excerpt(outcome));

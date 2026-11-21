@@ -14,12 +14,8 @@
 
 use std::process::Command;
 
-use serde::Deserialize;
-use serde_json::Value;
-
-use crate::agent::drivers::{exit_failure, program};
-use crate::agent::response::extract_json_object;
-use crate::agent::{AgentCommand, AgentDriver, AgentError, AgentKind, AgentRequest, AgentRun};
+use crate::agent::drivers::{program, result_record};
+use crate::agent::{AgentCommand, AgentDriver, AgentError, AgentRequest, AgentRun, DriverKind};
 
 /// See the [module docs](self).
 #[derive(Debug, Clone)]
@@ -28,42 +24,17 @@ pub struct ClaudeCodeDriver {
     args: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ResultRecord {
-    #[serde(default)]
-    subtype: Option<String>,
-    #[serde(default)]
-    is_error: bool,
-    #[serde(default)]
-    result: Option<String>,
-    #[serde(default)]
-    structured_output: Option<Value>,
-    #[serde(default)]
-    session_id: Option<String>,
-}
-
 impl ClaudeCodeDriver {
     /// A driver running `command --print ... args`.
     #[must_use]
     pub fn new(command: Vec<String>, args: Vec<String>) -> Self {
         Self { command, args }
     }
-
-    /// The `result` record: the whole stdout, or failing that the last
-    /// line that parses as one.
-    fn result_record(stdout: &str) -> Option<ResultRecord> {
-        serde_json::from_str(stdout.trim()).ok().or_else(|| {
-            stdout
-                .lines()
-                .rev()
-                .find_map(|line| serde_json::from_str::<ResultRecord>(line.trim()).ok())
-        })
-    }
 }
 
 impl AgentDriver for ClaudeCodeDriver {
-    fn kind(&self) -> AgentKind {
-        AgentKind::ClaudeCode
+    fn kind(&self) -> DriverKind {
+        DriverKind::ClaudeCode
     }
 
     fn command(&self, request: &AgentRequest<'_>) -> Result<AgentCommand, AgentError> {
@@ -88,40 +59,7 @@ impl AgentDriver for ClaudeCodeDriver {
         output: &std::process::Output,
         _request: &AgentRequest<'_>,
     ) -> Result<AgentRun, AgentError> {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let Some(record) = Self::result_record(&stdout) else {
-            return Err(if output.status.success() {
-                AgentError::InvalidResponse("claude printed no result record".into())
-            } else {
-                exit_failure(output, "claude")
-            });
-        };
-        if record.is_error {
-            return Err(AgentError::Failed {
-                code: output.status.code(),
-                message: format!(
-                    "claude reported {}: {}",
-                    record.subtype.as_deref().unwrap_or("an error"),
-                    record.result.as_deref().unwrap_or("")
-                ),
-            });
-        }
-        let response = match record.structured_output {
-            Some(value @ Value::Object(_)) => value,
-            Some(_) | None => record
-                .result
-                .as_deref()
-                .and_then(extract_json_object)
-                .ok_or_else(|| {
-                    AgentError::InvalidResponse(
-                        "claude's result carries no structured output".into(),
-                    )
-                })?,
-        };
-        Ok(AgentRun {
-            session_id: record.session_id,
-            response,
-        })
+        result_record::interpret(output, "claude")
     }
 }
 
@@ -146,6 +84,7 @@ mod tests {
             prompt: &prompt,
             response_schema: &schema,
             scratch: std::path::Path::new("/nonexistent"),
+            facts: &[],
         };
         driver.interpret(out, &request)
     }

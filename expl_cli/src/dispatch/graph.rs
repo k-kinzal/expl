@@ -77,6 +77,7 @@ fn mermaid(nodes: &[Node], edges: &[expl_core::Edge]) -> String {
         (NodeStatus::Failed, "stroke:#c22,stroke-width:2px"),
         (NodeStatus::Pruned, "opacity:0.4"),
         (NodeStatus::Active, "stroke:#26c,stroke-width:3px"),
+        (NodeStatus::Superseded, "opacity:0.6"),
     ] {
         let _ = writeln!(out, "  classDef {} {style}", status.as_str());
     }

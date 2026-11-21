@@ -14,7 +14,7 @@ use std::process::Command;
 
 use crate::agent::drivers::{exit_failure, program};
 use crate::agent::response::extract_json_object;
-use crate::agent::{AgentCommand, AgentDriver, AgentError, AgentKind, AgentRequest, AgentRun};
+use crate::agent::{AgentCommand, AgentDriver, AgentError, AgentRequest, AgentRun, DriverKind};
 
 const SCHEMA_FILE: &str = "response-schema.json";
 const LAST_MESSAGE_FILE: &str = "last-message.txt";
@@ -35,8 +35,8 @@ impl CodexDriver {
 }
 
 impl AgentDriver for CodexDriver {
-    fn kind(&self) -> AgentKind {
-        AgentKind::Codex
+    fn kind(&self) -> DriverKind {
+        DriverKind::Codex
     }
 
     fn command(&self, request: &AgentRequest<'_>) -> Result<AgentCommand, AgentError> {

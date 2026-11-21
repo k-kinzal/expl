@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::Path;
 
 use expl_core::git::Git;
-use expl_core::{Declaration, Graph, Project, Workspaces};
+use expl_core::{Declaration, Graph, Project};
 
 use crate::cli::InitArgs;
 use crate::error::CliError;
@@ -27,30 +27,56 @@ pub(crate) fn init(start: &Path, args: &InitArgs) -> Result<(), CliError> {
     })?;
 
     let state = project.state_dir();
-    std::fs::create_dir_all(project.logs_dir())
-        .map_err(|e| CliError::io(format!("create {}", state.display()), e))?;
+    for dir in [project.logs_dir(), project.processes_dir()] {
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| CliError::io(format!("create {}", state.display()), e))?;
+    }
     exclude_state_dir(&git)?;
 
     let declaration_path = project.declaration_path();
-    if declaration_path.exists() {
-        Declaration::load(&declaration_path)?;
+    let trunk = if declaration_path.exists() {
+        let declaration = Declaration::load(&declaration_path)?;
         status(&format!("using existing {}", Project::DECLARATION_FILE));
+        match (&args.trunk, declaration.trunk) {
+            (None, Some(declared)) => Some(declared),
+            _ => trunk_branch(&git, args)?,
+        }
     } else {
-        std::fs::write(&declaration_path, Declaration::TEMPLATE)
+        let trunk = trunk_branch(&git, args)?;
+        std::fs::write(&declaration_path, Declaration::template(trunk.as_deref()))
             .map_err(|e| CliError::io(format!("write {}", declaration_path.display()), e))?;
         status(&format!("wrote {}", Project::DECLARATION_FILE));
-    }
+        trunk
+    };
 
-    let graph = Graph::open(&project.database_path())?;
-    let origin = graph.create_origin("Origin", &base)?;
-    graph.set_branch(origin, &Workspaces::branch_name(origin), Some(&base))?;
+    let mut graph = Graph::open(&project.database_path())?;
+    let origin = graph.create_origin("Origin", trunk.as_deref(), &base)?;
     status(&format!(
-        "initialised {} with origin {origin} at {}",
+        "initialised {} with origin {origin} at {}{}",
         project.root().display(),
-        short_commit(Some(&base))
+        short_commit(Some(&base)),
+        trunk.as_deref().map_or_else(
+            || " (no trunk branch to follow)".to_owned(),
+            |t| format!(", following {t}")
+        )
     ));
-    status("next: expl goal add \"<what you want>\" && expl run");
+    status("next: expl goal add \"<what you want>\" && expl up");
     println(&origin.0.to_string())
+}
+
+/// The branch to follow: `--trunk`, else the branch checked out (when
+/// starting from it), else `--base` when it names one.
+fn trunk_branch(git: &Git, args: &InitArgs) -> Result<Option<String>, CliError> {
+    if let Some(trunk) = &args.trunk {
+        if !git.has_branch(trunk)? {
+            return Err(CliError::Usage(format!("`{trunk}` is not a local branch")));
+        }
+        return Ok(Some(trunk.clone()));
+    }
+    if args.base == "HEAD" {
+        return Ok(git.current_branch()?);
+    }
+    Ok(git.has_branch(&args.base)?.then(|| args.base.clone()))
 }
 
 /// Add `/.expl/` to the repository's `info/exclude` so expl's state never

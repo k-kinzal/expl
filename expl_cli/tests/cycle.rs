@@ -1,20 +1,36 @@
-//! End-to-end: a scripted `generic` agent drives every role through the
-//! real binary, git worktrees, and SQLite graph.
+//! End-to-end: a scripted `generic` agent reacts to graph events through
+//! the real binary, processes, git worktrees, and SQLite database.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
+/// One script plays every role. Exploration proposes a step only for a new
+/// goal, so the graph settles; execution writes a file named after its node
+/// and sleeps while `@DIR@/slow` exists. Planning answers with
+/// `@DIR@/plan.json` when present. Every prompt is kept in `@DIR@/prompts/`
+/// for inspection.
 const AGENT: &str = r#"#!/bin/sh
-cat > /dev/null
+mkdir -p "@DIR@/prompts"
+cat > "@DIR@/prompts/$EXPL_ROLE-$$.txt"
 case "$EXPL_ROLE" in
-explorer)
-  echo '{"nodes":[{"title":"Write hello","objective":"Create hello.txt","after":[],"before":[2]}]}' ;;
-planner)
-  echo 'Plan follows: {"summary":"one path","paths":[{"goal":2,"nodes":[3],"rationale":"only option"}],"priorities":[{"node":3,"priority":5}],"prunes":[]}' ;;
-executor)
+exploration)
+  if [ "$EXPL_EVENT" = goal.added ]; then
+    echo '{"nodes":[{"title":"Write hello","objective":"Create hello.txt"}]}'
+  else
+    echo '{"nodes":[]}'
+  fi ;;
+planning)
+  if [ -f "@DIR@/plan.json" ]; then
+    cat "@DIR@/plan.json"
+  else
+    echo 'Plan follows: {"summary":"one path","paths":[{"goal":2,"nodes":[3],"rationale":"only option"}],"priorities":[{"node":3,"priority":5}],"prunes":[],"joins":[]}'
+  fi ;;
+execution)
+  while [ -f "@DIR@/slow" ]; do sleep 0.2; done
   echo "node $EXPL_NODE" > "node-$EXPL_NODE.txt"
   echo '{"succeeded":true,"summary":"wrote a file"}' ;;
-evaluator)
+evaluation)
   if ls node-*.txt > /dev/null 2>&1; then
     echo '{"evaluations":[{"goal":2,"satisfied":true,"score":90,"reason":"file exists"}]}'
   else
@@ -24,8 +40,26 @@ esac
 "#;
 
 struct Sandbox {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     repo: PathBuf,
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        // Never leave detached processes behind, even when a test fails.
+        expl(&self.repo, &["down", "--time", "5"]);
+    }
+}
+
+impl Sandbox {
+    fn slow(&self, on: bool) {
+        let marker = self.dir.path().join("slow");
+        if on {
+            std::fs::write(marker, "").expect("marker");
+        } else {
+            std::fs::remove_file(marker).expect("marker");
+        }
+    }
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {
@@ -62,6 +96,27 @@ fn ok(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
+fn json(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}: {text}"))
+}
+
+fn json_lines(text: &str) -> Vec<serde_json::Value> {
+    text.lines().map(json).collect()
+}
+
+fn node(repo: &Path, id: &str) -> serde_json::Value {
+    json(&ok(repo, &["node", "inspect", id]))
+}
+
+/// Poll `condition` for up to 60 seconds.
+fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn sandbox() -> Sandbox {
     let dir = tempfile::tempdir().expect("tempdir");
     let repo = dir.path().join("repo");
@@ -74,14 +129,15 @@ fn sandbox() -> Sandbox {
     git(&repo, &["commit", "-q", "-m", "initial"]);
 
     let agent = dir.path().join("agent.sh");
-    std::fs::write(&agent, AGENT).expect("agent");
+    let script = AGENT.replace("@DIR@", &dir.path().display().to_string());
+    std::fs::write(&agent, script).expect("agent");
     let mut perms = std::fs::metadata(&agent).expect("meta").permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
     std::fs::set_permissions(&agent, perms).expect("chmod");
 
     assert_eq!(ok(&repo, &["init"]), "1");
     let declaration = expl_core::Declaration::TEMPLATE
-        .replace("kind = \"claude_code\"", "kind = \"generic\"")
+        .replace("driver = \"claude_code\"", "driver = \"generic\"")
         .replace(
             "command = [\"claude\"]",
             &format!("command = [\"{}\"]", agent.display()),
@@ -91,56 +147,133 @@ fn sandbox() -> Sandbox {
             "args = []",
         );
     std::fs::write(repo.join("expl.toml"), declaration).expect("declaration");
-    Sandbox { _dir: dir, repo }
+    Sandbox { dir, repo }
 }
 
 #[test]
-fn one_cycle_explores_plans_executes_and_evaluates() {
+fn events_flow_through_every_role() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
-    assert_eq!(
-        ok(
-            repo,
-            &["goal", "add", "Say hello", "--objective", "A file greets"]
-        ),
-        "2"
+    let goal = ok(
+        repo,
+        &["goal", "add", "Say hello", "--objective", "A file greets"],
     );
+    assert_eq!(goal, "2");
 
-    ok(repo, &["run", "--cycles", "1"]);
+    // Each agent reacts to what the previous one caused, then goes idle.
+    for agent in [
+        "explorer",
+        "planner",
+        "executor",
+        "evaluator",
+        "explorer",
+        "planner",
+    ] {
+        ok(repo, &["run", agent, "--exit-when-idle"]);
+    }
 
-    let step = ok(repo, &["node", "ls", "--kind", "step", "--format", "json"]);
-    let step: serde_json::Value = serde_json::from_str(&step).expect("json");
-    assert_eq!(step["id"], 3);
-    assert_eq!(step["status"], "completed");
-    assert_eq!(step["priority"], 5);
+    let step = node(repo, "3");
+    assert_eq!(step["node"]["status"], "completed");
+    assert_eq!(step["node"]["priority"], 5);
+    assert_eq!(step["predecessors"], serde_json::json!([1]));
+    assert_eq!(step["successors"], serde_json::json!([2]));
+    // explorer (from the evaluated step) + evaluator + executor.
+    let runs = step["agent_runs"].as_array().expect("runs");
+    let agents: Vec<&str> = runs.iter().filter_map(|r| r["agent"].as_str()).collect();
+    assert_eq!(agents, ["explorer", "evaluator", "executor"], "{runs:?}");
     assert_eq!(git(repo, &["show", "expl/node-3:node-3.txt"]), "node 3");
 
     assert_eq!(ok(repo, &["candidate", "ls", "-q"]), "3");
     assert_eq!(ok(repo, &["path", "ls", "-q"]), "3");
-    let inspect: serde_json::Value =
-        serde_json::from_str(&ok(repo, &["inspect", "3"])).expect("json");
-    assert_eq!(inspect["predecessors"], serde_json::json!([1]));
-    assert_eq!(inspect["successors"], serde_json::json!([2]));
-    // executor + evaluator (the explorer run is journaled against the origin).
-    assert_eq!(inspect["agent_runs"].as_array().map(Vec::len), Some(2));
     assert!(ok(repo, &["graph", "show", "--format", "mermaid"]).contains("n1 --> n3"));
 
-    // The project's own working tree stays clean: state is excluded.
+    let kinds: Vec<String> = json_lines(&ok(repo, &["event", "ls", "--format", "json"]))
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    for expected in [
+        "goal.added",
+        "node.proposed",
+        "node.planned",
+        "node.ready",
+        "plan.recorded",
+        "node.started",
+        "node.completed",
+        "node.evaluated",
+    ] {
+        assert!(
+            kinds.iter().any(|k| k == expected),
+            "{expected} in {kinds:?}"
+        );
+    }
+    // Every agent has reacted to everything addressed to it.
+    for agent in json_lines(&ok(repo, &["agent", "ls", "--format", "json"])) {
+        assert_eq!(agent["backlog"], 0, "{agent}");
+    }
+    // The processes went idle and exited; none is left running.
+    assert_eq!(ok(repo, &["ps", "-q"]), "");
+    let exited = json_lines(&ok(repo, &["ps", "-a", "--format", "json"]));
+    assert_eq!(exited.len(), 6);
+    assert!(exited.iter().all(|p| p["state"] == "exited"), "{exited:?}");
+
+    // Read-only roles' scratch worktrees are gone; the project stays clean.
+    let worktrees: Vec<String> = std::fs::read_dir(repo.join(".expl/worktrees"))
+        .expect("worktrees")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(worktrees, ["node-3"]);
     assert_eq!(
         git(repo, &["status", "--porcelain", "--untracked-files=all"]),
         "?? expl.toml"
     );
+
+    // Agents are told their task, never that they run under expl: no role
+    // prompt names expl, worktrees, branches, or the events behind it.
+    let prompts = sandbox.dir.path().join("prompts");
+    let mut roles = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&prompts).expect("prompts") {
+        let path = entry.expect("entry").path();
+        let name = path
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        roles.insert(name.split('-').next().unwrap_or_default().to_owned());
+        let text = std::fs::read_to_string(&path)
+            .expect("prompt")
+            .to_lowercase();
+        for word in [
+            "expl",
+            "worktree",
+            "branch",
+            "goal.added",
+            "node.",
+            "agents",
+        ] {
+            let leaked = text.match_indices(word).any(|(at, _)| {
+                !text[at + word.len()..].starts_with(|c: char| c.is_ascii_alphabetic())
+            });
+            assert!(!leaked, "{name} mentions `{word}`:\n{text}");
+        }
+    }
+    assert_eq!(
+        roles.into_iter().collect::<Vec<_>>(),
+        ["evaluation", "execution", "exploration", "planning"]
+    );
+    // Commits carry the step's own words, not expl's.
+    assert_eq!(
+        git(repo, &["log", "-1", "--format=%s", "expl/node-3"]),
+        "Write hello"
+    );
 }
 
 #[test]
-fn joined_paths_merge_predecessor_branches() {
+fn completed_predecessors_make_joined_steps_ready() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
     ok(repo, &["goal", "add", "Both files"]);
     let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
     let b = ok(repo, &["node", "add", "B", "--priority", "1"]);
-    ok(repo, &["execute", &a]);
-    ok(repo, &["execute", &b]);
     let c = ok(
         repo,
         &[
@@ -155,9 +288,10 @@ fn joined_paths_merge_predecessor_branches() {
             "1",
         ],
     );
-    let report: serde_json::Value =
-        serde_json::from_str(&ok(repo, &["execute", &c, "--format", "json"])).expect("json");
-    assert_eq!(report["status"], "completed");
+    // C becomes ready only when both A and B complete; one executor
+    // process handles the whole cascade.
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    assert_eq!(node(repo, &c)["node"]["status"], "completed");
 
     let branch = format!("expl/node-{c}");
     let files = git(repo, &["ls-tree", "--name-only", &branch]);
@@ -174,13 +308,138 @@ fn joined_paths_merge_predecessor_branches() {
 }
 
 #[test]
+fn planning_joins_paths() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let goal = ok(repo, &["goal", "add", "Both files"]);
+    let a = ok(repo, &["node", "add", "A", "--before", &goal]);
+    let b = ok(repo, &["node", "add", "B", "--before", &goal]);
+    let c = ok(
+        repo,
+        &["node", "add", "C", "--after", &a, "--before", &goal],
+    );
+    std::fs::write(
+        sandbox.dir.path().join("plan.json"),
+        format!(
+            r#"{{"summary":"combine","paths":[{{"goal":{goal},"nodes":[{a},{b},{c}],"rationale":"C needs both"}}],"priorities":[{{"node":{a},"priority":3}},{{"node":{b},"priority":2}},{{"node":{c},"priority":1}}],"prunes":[],"joins":[{{"node":{c},"after":[{b}]}}]}}"#
+        ),
+    )
+    .expect("plan");
+
+    // Planning combines A's and B's paths into C; C then starts from both.
+    ok(repo, &["run", "planner", "--exit-when-idle"]);
+    let joined = node(repo, &c);
+    let mut predecessors: Vec<i64> = joined["predecessors"]
+        .as_array()
+        .expect("predecessors")
+        .iter()
+        .filter_map(serde_json::Value::as_i64)
+        .collect();
+    predecessors.sort_unstable();
+    assert_eq!(
+        predecessors,
+        [a.parse::<i64>().expect("a"), b.parse().expect("b")]
+    );
+
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    assert_eq!(node(repo, &c)["node"]["status"], "completed");
+    let files = git(repo, &["ls-tree", "--name-only", &format!("expl/node-{c}")]);
+    for expected in [
+        format!("node-{a}.txt"),
+        format!("node-{b}.txt"),
+        format!("node-{c}.txt"),
+    ] {
+        assert!(
+            files.lines().any(|f| f == expected),
+            "{expected} missing from {files}"
+        );
+    }
+}
+
+#[test]
+fn up_runs_every_agent_until_down() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let started = ok(repo, &["up"]);
+    // explorer, planner, 2 executors, evaluator.
+    assert_eq!(started.lines().count(), 5, "{started}");
+    assert_eq!(ok(repo, &["ps", "-q"]).lines().count(), 5);
+
+    // Adding a goal is all it takes: the running processes react.
+    ok(repo, &["goal", "add", "Say hello"]);
+    wait_until("a candidate", || {
+        ok(repo, &["candidate", "ls", "-q"]) == "3"
+    });
+
+    // `up` is idempotent.
+    assert_eq!(ok(repo, &["up"]), "");
+    assert_eq!(ok(repo, &["ps", "-q"]).lines().count(), 5);
+    let executor = ok(repo, &["ps", "--format", "json"])
+        .lines()
+        .map(json)
+        .find(|p| p["agent"] == "executor")
+        .expect("an executor");
+    let name = executor["name"].as_str().expect("name");
+    assert!(ok(repo, &["logs", name]).contains("started process"));
+
+    assert_eq!(ok(repo, &["down"]).lines().count(), 5);
+    assert_eq!(ok(repo, &["ps", "-q"]), "");
+    let all = json_lines(&ok(repo, &["ps", "-a", "--format", "json"]));
+    assert!(all.iter().all(|p| p["exit_reason"] == "stopped"), "{all:?}");
+    ok(repo, &["rm", name]);
+    assert_eq!(ok(repo, &["ps", "-a", "-q"]).lines().count(), 4);
+}
+
+#[test]
+fn stopping_mid_execution_gives_the_event_back() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    ok(repo, &["goal", "add", "g"]);
+    let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
+    sandbox.slow(true);
+    let name = ok(repo, &["run", "executor", "-d"]);
+    wait_until("the step to start", || {
+        node(repo, &a)["node"]["status"] == "running"
+    });
+
+    ok(repo, &["stop", &name]);
+    let record = json(&ok(repo, &["process", "inspect", &name]));
+    assert_eq!(record["state"], "exited");
+    assert_eq!(record["exit_reason"], "stopped");
+    let step = node(repo, &a);
+    assert_eq!(step["node"]["status"], "planned", "{step}");
+    assert_eq!(step["agent_runs"][0]["status"], "interrupted");
+    let ready = ok(
+        repo,
+        &[
+            "event",
+            "ls",
+            "--kind",
+            "node.ready",
+            "--agent",
+            "executor",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(json(&ready)["delivery"], "pending");
+
+    // The released event is delivered to the next executor process.
+    sandbox.slow(false);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    assert_eq!(node(repo, &a)["node"]["status"], "completed");
+}
+
+#[test]
 fn usage_errors_exit_with_code_one() {
     let sandbox = sandbox();
-    let out = expl(&sandbox.repo, &["inspect", "99"]);
+    let out = expl(&sandbox.repo, &["node", "inspect", "99"]);
     assert_eq!(out.status.code(), Some(1));
-    let out = expl(&sandbox.repo, &["run", "--cycles", "1"]);
-    assert_eq!(out.status.code(), Some(1), "no goals");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("no active goals"));
+    let out = expl(&sandbox.repo, &["run", "nobody"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no agent named `nobody`"));
+    let out = expl(&sandbox.repo, &["stop", "nothing"]);
+    assert_eq!(out.status.code(), Some(1));
 }
 
 #[test]
@@ -189,9 +448,85 @@ fn discovery_stops_at_node_worktrees() {
     let repo = &sandbox.repo;
     ok(repo, &["goal", "add", "g"]);
     let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
-    ok(repo, &["execute", &a]);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
     let worktree = repo.join(".expl/worktrees").join(format!("node-{a}"));
     let out = expl(&worktree, &["node", "ls"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no expl project"));
+}
+
+#[test]
+fn the_origin_follows_the_trunk() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    ok(repo, &["goal", "add", "Say hello"]);
+    let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
+    let b = ok(repo, &["node", "add", "B", "--priority", "1"]);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    let open = ok(repo, &["node", "add", "Later"]);
+
+    // The owner merges A with git; the next process to run follows the
+    // trunk, and the origin moves.
+    git(
+        repo,
+        &["merge", "-q", "--no-edit", &format!("expl/node-{a}")],
+    );
+    ok(repo, &["run", "evaluator", "--exit-when-idle"]);
+    let lineage = json_lines(&ok(repo, &["origin", "ls", "--format", "json"]));
+    assert_eq!(lineage.len(), 2, "{lineage:?}");
+    assert_eq!(lineage[0]["origin"]["status"], "superseded");
+    assert_eq!(lineage[1]["origin"]["status"], "active");
+    assert_eq!(lineage[1]["adopted"], serde_json::json!([3]));
+    let second = lineage[1]["origin"]["id"].to_string();
+    // The step that had not started moves onto the new origin; B stays a
+    // candidate on the old one.
+    assert_eq!(node(repo, &open)["predecessors"], serde_json::json!([6]));
+    assert_eq!(node(repo, &b)["predecessors"], serde_json::json!([1]));
+
+    // The trunk is judged against the goals, and exploration starts again
+    // from it.
+    ok(repo, &["run", "evaluator", "--exit-when-idle"]);
+    ok(repo, &["run", "explorer", "--exit-when-idle"]);
+    let origin = node(repo, &second);
+    assert_eq!(origin["evaluations"][0]["score"], 90, "{origin}");
+    let agents: Vec<&str> = origin["agent_runs"]
+        .as_array()
+        .expect("runs")
+        .iter()
+        .filter_map(|r| r["agent"].as_str())
+        .collect();
+    assert!(
+        agents.contains(&"explorer") && agents.contains(&"evaluator"),
+        "{agents:?}"
+    );
+    let candidates = json_lines(&ok(repo, &["candidate", "ls", "--format", "json"]));
+    let entry = |id: &str| {
+        candidates
+            .iter()
+            .find(|c| c["node"].as_i64() == id.parse().ok())
+            .unwrap_or_else(|| panic!("{id} in {candidates:?}"))
+            .clone()
+    };
+    assert_eq!(entry(&a)["adopted_into"], 6);
+    assert_eq!(entry(&b)["explored_from"], 1);
+    assert_eq!(entry(&b)["behind"], 1);
+
+    // A squash merge is recognised by its patch.
+    git(
+        repo,
+        &["merge", "-q", "--squash", &format!("expl/node-{b}")],
+    );
+    git(repo, &["commit", "-q", "-m", "Squash B"]);
+    ok(repo, &["run", "planner", "--exit-when-idle"]);
+    let lineage = json_lines(&ok(repo, &["origin", "ls", "--format", "json"]));
+    assert_eq!(lineage.len(), 3);
+    assert_eq!(lineage[2]["origin"]["title"], "Squash B");
+    assert_eq!(lineage[2]["adopted"], serde_json::json!([4]));
+    // The process that noticed says so in its log.
+    let planner = json_lines(&ok(repo, &["ps", "-a", "--format", "json"]))
+        .into_iter()
+        .find(|p| p["agent"] == "planner")
+        .expect("a planner process");
+    let log = ok(repo, &["logs", planner["name"].as_str().expect("name")]);
+    assert!(log.contains("trunk main moved to"), "{log}");
 }

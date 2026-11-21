@@ -19,6 +19,9 @@ pub enum AgentError {
         /// What went wrong.
         message: String,
     },
+    /// The process was asked to stop; the invocation was cut short.
+    #[error("agent invocation interrupted")]
+    Interrupted,
     /// The agent finished but its response is not the requested shape.
     #[error("agent response is unusable: {0}")]
     InvalidResponse(String),

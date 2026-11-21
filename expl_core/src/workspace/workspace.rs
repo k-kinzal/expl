@@ -1,36 +1,71 @@
-//! [`Workspaces`] and [`Workspace`].
+//! [`Workspaces`], [`Workspace`], and [`ScratchWorkspace`].
 
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::git::{Git, GitError};
 use crate::graph::{Node, NodeId};
 use crate::project::Project;
 use crate::workspace::WorkspaceError;
 
-/// The node worktrees of one project. See the [module docs](crate::workspace).
+/// Distinguishes scratch worktrees made by one process.
+static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// The worktrees of one project. See the [module docs](crate::workspace).
 #[derive(Debug, Clone)]
 pub struct Workspaces {
     repository: Git,
     root: PathBuf,
+    lock: PathBuf,
 }
 
-/// One node's worktree.
+/// One step's own worktree, on the step's branch.
 #[derive(Debug, Clone)]
 pub struct Workspace {
     node: NodeId,
     path: PathBuf,
     branch: String,
+    lock: PathBuf,
     /// Files left conflicted by joining predecessor branches.
     conflicts: Vec<String>,
 }
 
+/// A private, detached worktree for one read-only reaction; removed on
+/// drop.
+#[derive(Debug)]
+pub struct ScratchWorkspace {
+    repository: Git,
+    path: PathBuf,
+    lock: PathBuf,
+}
+
+/// Holds the cross-process git lock until dropped.
+struct GitLock {
+    _file: File,
+}
+
+fn lock(path: &Path) -> Result<GitLock, WorkspaceError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    file.lock()?;
+    Ok(GitLock { _file: file })
+}
+
 impl Workspaces {
-    /// The worktrees of `project`, under `.expl/worktrees/`.
+    /// The worktrees of `project`.
     #[must_use]
     pub fn new(project: &Project) -> Self {
         Self {
             repository: Git::new(project.root()),
-            root: project.state_dir().join("worktrees"),
+            root: project.worktrees_dir(),
+            lock: project.git_lock_path(),
         }
     }
 
@@ -40,46 +75,14 @@ impl Workspaces {
         format!("expl/node-{}", node.0)
     }
 
-    /// Where `node`'s worktree lives.
+    /// Where `node`'s own worktree lives.
     #[must_use]
     pub fn path_of(&self, node: NodeId) -> PathBuf {
         self.root.join(format!("node-{}", node.0))
     }
 
-    /// The existing worktree of a realised node (origin or completed step),
-    /// re-creating it from the node's recorded commit if it was removed.
-    ///
-    /// # Errors
-    ///
-    /// [`WorkspaceError::NoCommit`] when the node was never realised.
-    pub fn open(&self, node: &Node) -> Result<Workspace, WorkspaceError> {
-        let commit = node
-            .head_commit
-            .as_deref()
-            .ok_or(WorkspaceError::NoCommit(node.id))?;
-        let path = self.path_of(node.id);
-        let branch = Self::branch_name(node.id);
-        if !path.join(".git").exists() {
-            std::fs::create_dir_all(&self.root)?;
-            let path_text = path.display().to_string();
-            if self.branch_exists(&branch)? {
-                self.repository
-                    .run_exclusive(&["worktree", "add", &path_text, &branch])?;
-            } else {
-                self.repository
-                    .run_exclusive(&["worktree", "add", "-b", &branch, &path_text, commit])?;
-            }
-        }
-        Ok(Workspace {
-            node: node.id,
-            path,
-            branch,
-            conflicts: Vec::new(),
-        })
-    }
-
     /// A fresh worktree for `node`, starting from its predecessors. Any
-    /// previous worktree and branch of the node (a failed attempt) are
+    /// previous worktree and branch of the node (an earlier attempt) are
     /// discarded first.
     ///
     /// # Errors
@@ -102,13 +105,16 @@ impl Workspaces {
             return Err(WorkspaceError::PredecessorNotRealized(node.id));
         };
 
-        self.discard(node.id)?;
-        std::fs::create_dir_all(&self.root)?;
         let path = self.path_of(node.id);
         let branch = Self::branch_name(node.id);
-        let path_text = path.display().to_string();
-        self.repository
-            .run_exclusive(&["worktree", "add", "-b", &branch, &path_text, base])?;
+        {
+            let _guard = lock(&self.lock)?;
+            self.discard_locked(node.id)?;
+            std::fs::create_dir_all(&self.root)?;
+            let path_text = path.display().to_string();
+            self.repository
+                .run(&["worktree", "add", "-b", &branch, &path_text, base])?;
+        }
 
         let git = Git::new(&path);
         let identity = identity_args(&git)?;
@@ -123,8 +129,8 @@ impl Workspaces {
                     if unmerged.is_empty() {
                         return Err(error.into());
                     }
-                    // Leave the conflict for the executor; further joins
-                    // cannot start until this merge is concluded.
+                    // Leave the conflict for the agent; further joins cannot
+                    // start until this merge is concluded.
                     conflicts = unmerged;
                     break;
                 }
@@ -135,7 +141,36 @@ impl Workspaces {
             node: node.id,
             path,
             branch,
+            lock: self.lock.clone(),
             conflicts,
+        })
+    }
+
+    /// A private detached worktree at `node`'s commit.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::NoCommit`] when the node was never realised.
+    pub fn scratch(&self, node: &Node) -> Result<ScratchWorkspace, WorkspaceError> {
+        let commit = node
+            .head_commit
+            .as_deref()
+            .ok_or(WorkspaceError::NoCommit(node.id))?;
+        let sequence = SCRATCH_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        let path = self.root.join(format!(
+            "scratch-{}-{}-{sequence}",
+            node.id.0,
+            std::process::id()
+        ));
+        let _guard = lock(&self.lock)?;
+        std::fs::create_dir_all(&self.root)?;
+        let path_text = path.display().to_string();
+        self.repository
+            .run(&["worktree", "add", "--detach", &path_text, commit])?;
+        Ok(ScratchWorkspace {
+            repository: self.repository.clone(),
+            path,
+            lock: self.lock.clone(),
         })
     }
 
@@ -145,30 +180,31 @@ impl Workspaces {
     ///
     /// [`WorkspaceError::Git`] when git fails.
     pub fn discard(&self, node: NodeId) -> Result<(), WorkspaceError> {
+        let _guard = lock(&self.lock)?;
+        self.discard_locked(node)
+    }
+
+    fn discard_locked(&self, node: NodeId) -> Result<(), WorkspaceError> {
         let path = self.path_of(node);
         if path.exists() {
             let path_text = path.display().to_string();
             self.repository
-                .run_exclusive(&["worktree", "remove", "--force", &path_text])?;
+                .run(&["worktree", "remove", "--force", &path_text])?;
         }
-        self.repository.run_exclusive(&["worktree", "prune"])?;
+        self.repository.run(&["worktree", "prune"])?;
         let branch = Self::branch_name(node);
-        if self.branch_exists(&branch)? {
-            self.repository.run_exclusive(&["branch", "-D", &branch])?;
-        }
-        Ok(())
-    }
-
-    fn branch_exists(&self, branch: &str) -> Result<bool, WorkspaceError> {
         let reference = format!("refs/heads/{branch}");
         match self
             .repository
             .run(&["show-ref", "--verify", "--quiet", &reference])
         {
-            Ok(_) => Ok(true),
-            Err(GitError::Failed { .. }) => Ok(false),
-            Err(error @ GitError::Spawn(_)) => Err(error.into()),
+            Ok(_) => {
+                self.repository.run(&["branch", "-D", &branch])?;
+            }
+            Err(GitError::Failed { .. }) => {}
+            Err(error @ GitError::Spawn(_)) => return Err(error.into()),
         }
+        Ok(())
     }
 }
 
@@ -219,38 +255,31 @@ impl Workspace {
             let identity = identity_args(&git)?;
             let mut args: Vec<&str> = identity.iter().map(String::as_str).collect();
             args.extend(["commit", "-m", message]);
-            git.run_exclusive(&args)?;
+            let _guard = lock(&self.lock)?;
+            git.run(&args)?;
         }
         Ok(git.run(&["rev-parse", "HEAD"])?)
     }
+}
 
-    /// Reset the worktree to `commit`, dropping uncommitted changes and
-    /// untracked (non-ignored) files.
-    ///
-    /// # Errors
-    ///
-    /// [`WorkspaceError::Git`] when git fails.
-    pub fn restore(&self, commit: &str) -> Result<(), WorkspaceError> {
-        let git = Git::new(&self.path);
-        if git
-            .run(&["rev-parse", "-q", "--verify", "MERGE_HEAD"])
-            .is_ok()
-        {
-            git.run(&["merge", "--abort"])?;
-        }
-        git.run(&["reset", "--hard", commit])?;
-        git.run(&["clean", "-fd"])?;
-        Ok(())
+impl ScratchWorkspace {
+    /// Worktree directory.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
     }
+}
 
-    /// `git diff --stat base..HEAD`, for prompts.
-    ///
-    /// # Errors
-    ///
-    /// [`WorkspaceError::Git`] when git fails.
-    pub fn diff_stat(&self, base: &str) -> Result<String, WorkspaceError> {
-        let range = format!("{base}..HEAD");
-        Ok(Git::new(&self.path).run(&["diff", "--stat", &range])?)
+impl Drop for ScratchWorkspace {
+    fn drop(&mut self) {
+        // Best effort: a leftover scratch worktree is pruned by the next one.
+        if let Ok(_guard) = lock(&self.lock) {
+            let path = self.path.display().to_string();
+            self.repository
+                .run(&["worktree", "remove", "--force", &path])
+                .ok();
+            self.repository.run(&["worktree", "prune"]).ok();
+        }
     }
 }
 

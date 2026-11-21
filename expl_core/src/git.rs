@@ -7,14 +7,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 
 use thiserror::Error;
-
-/// Serialises git invocations that mutate shared repository state (refs,
-/// the worktree list). Parallel executors each own a worktree, but branch
-/// creation and worktree registration touch the common `.git` directory.
-static REPOSITORY_MUTATION: Mutex<()> = Mutex::new(());
 
 /// A git invocation failed.
 #[derive(Debug, Error)]
@@ -76,16 +70,60 @@ impl Git {
         }
     }
 
-    /// Run git while holding the repository-mutation lock.
+    /// Run git as a yes/no question: `true` on exit 0, `false` on exit 1.
     ///
     /// # Errors
     ///
-    /// Same as [`Git::run`].
-    pub fn run_exclusive(&self, args: &[&str]) -> Result<String, GitError> {
-        let _guard = REPOSITORY_MUTATION
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.run(args)
+    /// [`GitError`] when git cannot start or exits with any other code.
+    pub fn test(&self, args: &[&str]) -> Result<bool, GitError> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&self.dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(GitError::Spawn)?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(GitError::Failed {
+                args: args.join(" "),
+                dir: self.dir.display().to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            }),
+        }
+    }
+
+    /// Whether `ancestor` is reachable from `descendant` (a commit is its
+    /// own ancestor).
+    ///
+    /// # Errors
+    ///
+    /// [`GitError`] when either does not name a commit.
+    pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
+        self.test(&["merge-base", "--is-ancestor", ancestor, descendant])
+    }
+
+    /// The branch checked out here, if not detached.
+    ///
+    /// # Errors
+    ///
+    /// [`GitError`] when git cannot start.
+    pub fn current_branch(&self) -> Result<Option<String>, GitError> {
+        match self.run(&["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+            Ok(branch) if !branch.is_empty() => Ok(Some(branch)),
+            Ok(_) | Err(GitError::Failed { .. }) => Ok(None),
+            Err(error @ GitError::Spawn(_)) => Err(error),
+        }
+    }
+
+    /// Whether a local branch named `name` exists.
+    ///
+    /// # Errors
+    ///
+    /// [`GitError`] when git cannot start.
+    pub fn has_branch(&self, name: &str) -> Result<bool, GitError> {
+        let reference = format!("refs/heads/{name}");
+        self.test(&["show-ref", "--verify", "--quiet", &reference])
     }
 
     /// The top-level directory of the working tree containing `dir`.

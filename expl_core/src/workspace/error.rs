@@ -17,7 +17,7 @@ pub enum WorkspaceError {
     /// A predecessor has no commit to build on.
     #[error("predecessor {0} has no commit to build on")]
     PredecessorNotRealized(NodeId),
-    /// The node has no recorded commit to restore to.
+    /// The node has no recorded commit to start from.
     #[error("node {0} has no recorded commit")]
     NoCommit(NodeId),
     /// Merge conflicts remain after the executor ran.

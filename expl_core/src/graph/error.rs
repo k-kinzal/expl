@@ -10,17 +10,20 @@ pub enum GraphError {
     /// SQLite failure.
     #[error("graph database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    /// The database was created by a newer expl.
-    #[error("graph schema version {found} is newer than supported version {supported}")]
-    SchemaTooNew {
-        /// Version stored in the database.
-        found: i64,
-        /// Newest version this build knows.
-        supported: i64,
-    },
+    /// The database could not be opened.
+    #[error(transparent)]
+    Store(#[from] crate::store::StoreError),
     /// No node with this id.
     #[error("node {0} does not exist")]
     NodeNotFound(NodeId),
+    /// The node is not in a state that allows the operation.
+    #[error("node {node} must be {expected}")]
+    NotInStatus {
+        /// The node.
+        node: NodeId,
+        /// What it must be.
+        expected: &'static str,
+    },
     /// The graph has no origin (not initialised).
     #[error("the graph has no origin node")]
     NoOrigin,

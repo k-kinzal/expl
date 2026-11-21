@@ -1,11 +1,11 @@
 //! [`Declaration`] — `expl.toml`, what the operator wrote.
 //!
-//! The declaration names the agents available to the project, binds each
-//! [`Role`](crate::role::Role) to one of them, and fixes the runner's
-//! breadth and parallelism. Following iter's "no implicit defaults" rule,
-//! every field the runtime needs is spelled out in the file; `expl init`
-//! writes a complete [`template`](Declaration::TEMPLATE) instead of
-//! leaving values to hidden fallbacks.
+//! The declaration names the project's [agents](crate::agent::Agent): for
+//! each, its role, the AI CLI that carries it out (and alternative CLIs its
+//! invocations are routed across), and how many processes `expl up` keeps
+//! running. Following iter's "no implicit defaults" rule,
+//! every field the runtime needs is spelled out; `expl init` writes a
+//! complete [`TEMPLATE`](Declaration::TEMPLATE).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,7 +13,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::agent::AgentKind;
+use crate::agent::DriverKind;
 use crate::project::Project;
 use crate::role::Role;
 
@@ -41,112 +41,162 @@ pub enum DeclarationError {
     /// The declaration is well-formed but inconsistent.
     #[error("invalid declaration: {0}")]
     Invalid(String),
+    /// No agent has this name.
+    #[error("no agent named `{0}` in expl.toml")]
+    UnknownAgent(String),
 }
 
 /// The whole `expl.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Declaration {
-    /// Named agents, referenced from `[role.*]`.
+    /// The default branch expl follows: whenever it moves, the origin
+    /// advances to it and exploration starts again from there.
+    #[serde(default)]
+    pub trunk: Option<String>,
+    /// Named agents.
     pub agent: BTreeMap<String, AgentDeclaration>,
-    /// Which agent carries each role.
-    pub role: RoleDeclarations,
-    /// Runner breadth and parallelism.
-    pub run: RunDeclaration,
 }
 
-/// One agent CLI and how to invoke it.
+/// One `[agent.<name>]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDeclaration {
-    /// Which driver translates for this CLI.
-    pub kind: AgentKind,
+    /// What the agent does, and so which events it reacts to.
+    pub role: Role,
+    /// Which driver translates for its CLI.
+    pub driver: DriverKind,
     /// Program and leading arguments, e.g. `["claude"]`.
     pub command: Vec<String>,
     /// Extra arguments appended after the driver's own flags.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Extra environment variables for the child process.
+    /// Extra environment variables for the CLI.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Project-specific guidance appended to the role's built-in prompt.
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// Processes `expl up` keeps running.
+    pub replicas: usize,
+    /// Exploration only: maximum steps proposed per reaction.
+    #[serde(default)]
+    pub breadth: Option<usize>,
+    /// Exploration only: pause while this many steps await execution.
+    #[serde(default)]
+    pub max_pending: Option<usize>,
+    /// Further CLIs that can carry out the agent (`[[agent.<name>.alternative]]`).
+    /// Invocations are routed across the primary CLI and these in turn, and
+    /// fall over to the next one when a CLI fails.
+    #[serde(default)]
+    pub alternative: Vec<CliDeclaration>,
+}
+
+/// One alternative CLI of an agent: the same fields that declare the
+/// agent's primary CLI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CliDeclaration {
+    /// Which driver translates for this CLI.
+    pub driver: DriverKind,
+    /// Program and leading arguments, e.g. `["codex"]`.
+    pub command: Vec<String>,
+    /// Extra arguments appended after the driver's own flags.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extra environment variables for this CLI, over the agent's `env`.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
 
-/// The four role bindings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RoleDeclarations {
-    /// Exploration (and counter-exploration).
-    pub explorer: RoleDeclaration,
-    /// Planning.
-    pub planner: RoleDeclaration,
-    /// Execution.
-    pub executor: RoleDeclaration,
-    /// Evaluation.
-    pub evaluator: RoleDeclaration,
-}
-
-/// One role's binding.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RoleDeclaration {
-    /// Name of an `[agent.<name>]` entry.
-    pub agent: String,
-    /// Project-specific guidance appended to the role's built-in prompt.
-    #[serde(default)]
-    pub instructions: Option<String>,
-}
-
-/// Runner settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RunDeclaration {
-    /// Maximum nodes executed (and evaluated) concurrently.
-    pub parallelism: usize,
-    /// Maximum nodes one exploration may propose.
-    pub breadth: usize,
-    /// Exploration pauses while this many nodes await execution
-    /// (`proposed` + `planned`), so proposals cannot outrun execution.
-    pub max_pending: usize,
+impl AgentDeclaration {
+    /// Every CLI of the agent, primary first.
+    #[must_use]
+    pub fn clis(&self) -> Vec<CliDeclaration> {
+        let primary = CliDeclaration {
+            driver: self.driver,
+            command: self.command.clone(),
+            args: self.args.clone(),
+            env: BTreeMap::new(),
+        };
+        std::iter::once(primary)
+            .chain(self.alternative.iter().cloned())
+            .collect()
+    }
 }
 
 impl Declaration {
     /// The declaration `expl init` writes.
-    pub const TEMPLATE: &'static str = r#"# expl declaration. See README.md and `expl --help`..
-
-# Agents available to this project. `kind` selects the driver:
-#   claude_code — `claude --print --output-format json --json-schema ...`
-#   codex       — `codex exec --output-schema ... --output-last-message ...`
-#   generic     — any command: prompt on stdin, JSON response on stdout
+    pub const TEMPLATE: &'static str = r#"# expl declaration. See README.md and `expl --help`.
 #
-# Agents run unattended inside expl-owned git worktrees, so the default
-# below lets Claude Code edit files and run commands without asking.
-[agent.claude]
-kind = "claude_code"
+# Each [agent.<name>] is started as processes (`expl run <name>`, or
+# `expl up` for `replicas` of every agent). An agent reacts to the graph
+# events of its role:
+#   exploration — goal.added, node.evaluated, origin.advanced → proposes steps
+#   planning    — node.proposed/evaluated/failed, goal.retired, origin.advanced → paths and priorities
+#   execution   — node.ready                       → commits on the step's branch
+#   evaluation  — node.completed, origin.advanced → verdicts against goals
+#
+# `driver` selects how the CLI is spoken to:
+#   claude_code  — `claude --print --output-format json --json-schema ...`
+#   codex        — `codex exec --output-schema ... --output-last-message ...`
+#   cursor_agent — `cursor-agent --print --output-format json ...`
+#   generic      — any command: prompt on stdin, JSON response on stdout
+#
+# An agent may name further CLIs with [[agent.<name>.alternative]] (driver,
+# command, args, env). Its invocations are then routed across all of them in
+# turn, falling over to the next CLI when one fails.
+#
+# Agents run unattended inside expl-owned git worktrees, so the defaults
+# below let Claude Code edit files and run commands without asking.
+
+# The default branch. Merge the candidates you choose into it with git;
+# running processes notice it moved, the origin follows, and exploration
+# starts again from there.
+trunk = "main"
+
+[agent.explorer]
+role = "exploration"
+driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
-
-# Which agent carries each role. `instructions` is appended to the role's
-# built-in prompt.
-[role.explorer]
-agent = "claude"
-
-[role.planner]
-agent = "claude"
-
-[role.executor]
-agent = "claude"
-
-[role.evaluator]
-agent = "claude"
-
-[run]
-# Nodes executed (and evaluated) concurrently, each in its own worktree.
-parallelism = 2
-# Maximum nodes proposed by one exploration.
+replicas = 1
 breadth = 3
-# Exploration pauses while this many nodes await execution.
 max_pending = 6
+
+[agent.planner]
+role = "planning"
+driver = "claude_code"
+command = ["claude"]
+args = ["--permission-mode", "bypassPermissions"]
+replicas = 1
+
+[agent.executor]
+role = "execution"
+driver = "claude_code"
+command = ["claude"]
+args = ["--permission-mode", "bypassPermissions"]
+replicas = 2
+
+[agent.evaluator]
+role = "evaluation"
+driver = "claude_code"
+command = ["claude"]
+args = ["--permission-mode", "bypassPermissions"]
+replicas = 1
 "#;
+
+    /// The declaration `expl init` writes, following `trunk` (or with the
+    /// `trunk` line commented out when there is none).
+    #[must_use]
+    pub fn template(trunk: Option<&str>) -> String {
+        let line = "trunk = \"main\"";
+        let replacement = trunk.map_or_else(
+            || "# trunk = \"main\"".to_owned(),
+            |t| format!("trunk = {}", toml::Value::String(t.to_owned())),
+        );
+        Self::TEMPLATE.replacen(line, &replacement, 1)
+    }
 
     /// Read and validate `path`.
     ///
@@ -159,13 +209,13 @@ max_pending = 6
             path: path.display().to_string(),
             source,
         })?;
-        Self::parse(&text).map_err(|error| match error {
-            DeclarationError::Parse { source, .. } => DeclarationError::Parse {
+        let declaration: Self =
+            toml::from_str(&text).map_err(|source| DeclarationError::Parse {
                 path: path.display().to_string(),
                 source,
-            },
-            other @ (DeclarationError::Read { .. } | DeclarationError::Invalid(_)) => other,
-        })
+            })?;
+        declaration.validate()?;
+        Ok(declaration)
     }
 
     /// Parse and validate declaration text.
@@ -183,59 +233,48 @@ max_pending = 6
     }
 
     fn validate(&self) -> Result<(), DeclarationError> {
+        let invalid = |name: &str, what: &str| {
+            Err(DeclarationError::Invalid(format!("agent `{name}`: {what}")))
+        };
         for (name, agent) in &self.agent {
-            if agent.command.is_empty() || agent.command[0].trim().is_empty() {
-                return Err(DeclarationError::Invalid(format!(
-                    "agent `{name}` has an empty `command`"
-                )));
+            if agent
+                .clis()
+                .iter()
+                .any(|cli| cli.command.first().is_none_or(|p| p.trim().is_empty()))
+            {
+                return invalid(name, "`command` is empty");
             }
-        }
-        for role in Role::ALL {
-            let binding = self.role_declaration(role);
-            if !self.agent.contains_key(&binding.agent) {
-                return Err(DeclarationError::Invalid(format!(
-                    "role `{}` refers to unknown agent `{}`",
-                    role.as_str(),
-                    binding.agent
-                )));
+            match agent.role {
+                Role::Exploration => {
+                    if agent.breadth.is_none_or(|b| b == 0) {
+                        return invalid(name, "exploration needs `breadth` >= 1");
+                    }
+                    if agent.max_pending.is_none_or(|m| m == 0) {
+                        return invalid(name, "exploration needs `max_pending` >= 1");
+                    }
+                }
+                Role::Planning | Role::Execution | Role::Evaluation => {
+                    if agent.breadth.is_some() || agent.max_pending.is_some() {
+                        return invalid(
+                            name,
+                            "`breadth` and `max_pending` apply to exploration agents only",
+                        );
+                    }
+                }
             }
-        }
-        if self.run.parallelism == 0 {
-            return Err(DeclarationError::Invalid(
-                "`run.parallelism` must be >= 1".into(),
-            ));
-        }
-        if self.run.breadth == 0 {
-            return Err(DeclarationError::Invalid(
-                "`run.breadth` must be >= 1".into(),
-            ));
         }
         Ok(())
     }
 
-    /// The binding for `role`.
-    #[must_use]
-    pub fn role_declaration(&self, role: Role) -> &RoleDeclaration {
-        match role {
-            Role::Explorer => &self.role.explorer,
-            Role::Planner => &self.role.planner,
-            Role::Executor => &self.role.executor,
-            Role::Evaluator => &self.role.evaluator,
-        }
-    }
-
-    /// The agent declaration bound to `role` (validated to exist).
+    /// The agent named `name`.
     ///
     /// # Errors
     ///
-    /// [`DeclarationError::Invalid`] when the binding is dangling (only
-    /// possible for a declaration built without [`Declaration::parse`]).
-    pub fn agent_for(&self, role: Role) -> Result<(&str, &AgentDeclaration), DeclarationError> {
-        let name = &self.role_declaration(role).agent;
+    /// [`DeclarationError::UnknownAgent`].
+    pub fn agent(&self, name: &str) -> Result<&AgentDeclaration, DeclarationError> {
         self.agent
-            .get_key_value(name)
-            .map(|(k, v)| (k.as_str(), v))
-            .ok_or_else(|| DeclarationError::Invalid(format!("unknown agent `{name}`")))
+            .get(name)
+            .ok_or_else(|| DeclarationError::UnknownAgent(name.to_owned()))
     }
 }
 
@@ -246,20 +285,50 @@ mod tests {
     #[test]
     fn template_is_a_valid_declaration() {
         let declaration = Declaration::parse(Declaration::TEMPLATE).expect("template parses");
-        assert_eq!(declaration.run.parallelism, 2);
-        assert_eq!(declaration.role.executor.agent, "claude");
+        assert_eq!(declaration.agent.len(), 4);
+        assert_eq!(declaration.agent["executor"].role, Role::Execution);
+        assert_eq!(declaration.agent["executor"].replicas, 2);
+        assert_eq!(declaration.trunk.as_deref(), Some("main"));
+        let none = Declaration::parse(&Declaration::template(None)).expect("parses");
+        assert_eq!(none.trunk, None);
+        let dev = Declaration::parse(&Declaration::template(Some("dev"))).expect("parses");
+        assert_eq!(dev.trunk.as_deref(), Some("dev"));
     }
 
     #[test]
-    fn dangling_role_agent_is_rejected() {
-        let text = Declaration::TEMPLATE.replace(
-            "[role.planner]\nagent = \"claude\"",
-            "[role.planner]\nagent = \"nobody\"",
-        );
-        let error = Declaration::parse(&text).expect_err("dangling agent");
+    fn exploration_settings_are_role_specific() {
+        let text = Declaration::TEMPLATE
+            .replace("role = \"planning\"", "role = \"planning\"\nbreadth = 2");
+        let error = Declaration::parse(&text).expect_err("breadth on planner");
         assert!(
-            error.to_string().contains("unknown agent `nobody`"),
+            error.to_string().contains("exploration agents only"),
             "{error}"
         );
+        let text = Declaration::TEMPLATE.replace("breadth = 3\n", "");
+        let error = Declaration::parse(&text).expect_err("missing breadth");
+        assert!(error.to_string().contains("breadth"), "{error}");
+    }
+
+    #[test]
+    fn alternatives_follow_the_primary_cli() {
+        let text = format!(
+            "{}\n[[agent.planner.alternative]]\ndriver = \"codex\"\ncommand = [\"codex\"]\n\
+             env = {{ A = \"1\" }}\n",
+            Declaration::TEMPLATE
+        );
+        let declaration = Declaration::parse(&text).expect("parses");
+        let clis = declaration.agent["planner"].clis();
+        assert_eq!(clis.len(), 2);
+        assert_eq!(clis[0].driver, DriverKind::ClaudeCode);
+        assert_eq!(clis[1].driver, DriverKind::Codex);
+        assert_eq!(clis[1].env["A"], "1");
+        assert_eq!(declaration.agent["executor"].clis().len(), 1);
+
+        let empty = format!(
+            "{}\n[[agent.planner.alternative]]\ndriver = \"codex\"\ncommand = []\n",
+            Declaration::TEMPLATE
+        );
+        let error = Declaration::parse(&empty).expect_err("empty command");
+        assert!(error.to_string().contains("`command` is empty"), "{error}");
     }
 }

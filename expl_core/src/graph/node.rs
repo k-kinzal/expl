@@ -30,7 +30,10 @@ impl FromStr for NodeId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeKind {
-    /// The starting point: the commit exploration began from. Exactly one.
+    /// A position of the trunk: a commit exploration starts from. The
+    /// newest is `active` (where exploration starts now); every earlier
+    /// one is `superseded` and kept as history. Each origin builds on the
+    /// previous one and on the steps adopted into it.
     Origin,
     /// A unit of work toward some goal, realised on its own branch.
     Step,
@@ -41,8 +44,10 @@ pub enum NodeKind {
 /// Where a node is in its lifecycle.
 ///
 /// Steps move `proposed → planned → running → completed | failed`, and may
-/// be `pruned` by the planner (or a human) before running. The origin is
-/// always `completed`. Goals are `active` until a human prunes them.
+/// be `pruned` by the planner (or a human) before running. The current
+/// origin is `active`; an origin becomes `superseded` when the trunk
+/// advances past it. Goals are `active` until a human retires them
+/// (`pruned`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeStatus {
@@ -59,8 +64,10 @@ pub enum NodeStatus {
     Failed,
     /// Discarded; never executed.
     Pruned,
-    /// A goal that is being pursued.
+    /// A goal that is being pursued, or the current origin.
     Active,
+    /// An origin the trunk has advanced past.
+    Superseded,
 }
 
 macro_rules! text_enum {
@@ -108,6 +115,7 @@ text_enum!(NodeStatus {
     Failed => "failed",
     Pruned => "pruned",
     Active => "active",
+    Superseded => "superseded",
 });
 
 pub(crate) use text_enum;
@@ -148,10 +156,20 @@ impl Node {
         matches!(self.kind, NodeKind::Origin | NodeKind::Step)
     }
 
-    /// Whether this node can be the target of an edge.
+    /// Whether this node can be the target of an edge that exploration,
+    /// planning, or a human draws. Edges into an origin are drawn only by
+    /// [`Graph::advance_origin`](crate::graph::Graph::advance_origin).
     #[must_use]
     pub fn can_follow(&self) -> bool {
         matches!(self.kind, NodeKind::Step | NodeKind::Goal)
+    }
+
+    /// Whether this node's commit exists, so others can build on it: every
+    /// origin (current or past), and completed steps.
+    #[must_use]
+    pub fn is_realized(&self) -> bool {
+        self.kind == NodeKind::Origin
+            || (self.kind == NodeKind::Step && self.status == NodeStatus::Completed)
     }
 }
 

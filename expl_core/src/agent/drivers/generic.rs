@@ -2,14 +2,16 @@
 //! a JSON object on stdout.
 //!
 //! The response schema is written to a scratch file whose path is exported
-//! as `EXPL_RESPONSE_SCHEMA`, so wrappers around other CLIs can forward it.
+//! as `EXPL_RESPONSE_SCHEMA`, so wrappers around other CLIs can forward it,
+//! alongside the reaction's facts (`EXPL_AGENT`, `EXPL_ROLE`, `EXPL_EVENT`,
+//! `EXPL_NODE`). Only this driver exports them.
 //! Also the driver for scripted agents in tests.
 
 use std::process::Command;
 
 use crate::agent::drivers::{exit_failure, program};
 use crate::agent::response::extract_json_object;
-use crate::agent::{AgentCommand, AgentDriver, AgentError, AgentKind, AgentRequest, AgentRun};
+use crate::agent::{AgentCommand, AgentDriver, AgentError, AgentRequest, AgentRun, DriverKind};
 
 /// See the [module docs](self).
 #[derive(Debug, Clone)]
@@ -27,8 +29,8 @@ impl GenericDriver {
 }
 
 impl AgentDriver for GenericDriver {
-    fn kind(&self) -> AgentKind {
-        AgentKind::Generic
+    fn kind(&self) -> DriverKind {
+        DriverKind::Generic
     }
 
     fn command(&self, request: &AgentRequest<'_>) -> Result<AgentCommand, AgentError> {
@@ -39,6 +41,7 @@ impl AgentDriver for GenericDriver {
         process
             .args(leading)
             .args(&self.args)
+            .envs(request.facts.iter().map(|(k, v)| (k, v)))
             .env("EXPL_RESPONSE_SCHEMA", &schema_path);
         Ok(AgentCommand {
             process,
