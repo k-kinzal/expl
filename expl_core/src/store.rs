@@ -154,6 +154,11 @@ UPDATE nodes SET branch = NULL WHERE kind = 'origin' AND branch = 'expl/node-' |
 CREATE UNIQUE INDEX nodes_current_origin ON nodes (kind)
     WHERE kind = 'origin' AND status = 'active';
 ",
+    r"
+-- Every lease carries its own token; only its holder may renew or settle
+-- it. Leases taken before tokens existed have none and simply expire.
+ALTER TABLE deliveries ADD COLUMN lease_token TEXT;
+",
 ];
 
 /// Open the database at `path`, creating and migrating it as needed.

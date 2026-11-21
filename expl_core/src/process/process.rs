@@ -1,5 +1,6 @@
 //! [`Process`] — one running agent: lease an event, react, acknowledge.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -7,7 +8,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::agent::Agent;
-use crate::event::{Delivery, Inbox};
+use crate::event::{Delivery, Inbox, InboxError};
 use crate::graph::{Graph, GraphError};
 use crate::process::{HEARTBEAT_SECONDS, Interrupt, ProcessId, ProcessRecord, Processes};
 use crate::role::{Context, Reaction, Report, RoleError};
@@ -67,6 +68,10 @@ pub enum ProcessActivity<'a> {
         /// What the role did.
         report: &'a Report,
     },
+    /// The process lost its lease on the event (it expired and another
+    /// process may have taken the event over): the reaction was interrupted
+    /// or its outcome discarded, and the event was left to the new holder.
+    LeaseLost(&'a Delivery),
     /// The reaction failed.
     Failed {
         /// The delivery.
@@ -84,6 +89,18 @@ pub enum ProcessActivity<'a> {
 pub trait ProcessObserver: Sync {
     /// Observe one activity.
     fn observe(&self, activity: &ProcessActivity<'_>);
+}
+
+/// The lease a process is reacting under, shared with its heartbeat.
+type Held = Mutex<Option<(Delivery, Interrupt)>>;
+
+/// `Ok(None)` when the lease was lost.
+fn holding<T>(result: Result<T, InboxError>) -> Result<Option<T>, ProcessError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(InboxError::LeaseLost { .. }) => Ok(None),
+        Err(InboxError::Sqlite(error)) => Err(error.into()),
+    }
 }
 
 /// See the [module docs](crate::process).
@@ -130,9 +147,10 @@ impl<'a> Process<'a> {
         observer.observe(&ProcessActivity::Started(&processes.get(self.id)?));
 
         let finished = AtomicBool::new(false);
+        let held = Held::default();
         let result = thread::scope(|scope| {
-            scope.spawn(|| self.beat(&finished));
-            let result = self.serve(&processes, options, observer);
+            scope.spawn(|| self.beat(&finished, &held));
+            let result = self.serve(&processes, &held, options, observer);
             finished.store(true, Ordering::SeqCst);
             result
         });
@@ -145,9 +163,10 @@ impl<'a> Process<'a> {
         result
     }
 
-    /// Heartbeat: prove liveness, renew held leases, and turn a recorded
-    /// stop request into an interrupt.
-    fn beat(&self, finished: &AtomicBool) {
+    /// Heartbeat: prove liveness, renew the held lease (interrupting the
+    /// reaction when it is lost), and turn a recorded stop request into an
+    /// interrupt.
+    fn beat(&self, finished: &AtomicBool, held: &Held) {
         let project = self.context.project();
         let database = project.database_path();
         let (Ok(processes), Ok(inbox)) = (
@@ -163,8 +182,19 @@ impl<'a> Process<'a> {
                 if let Ok(true) = processes.heartbeat(self.id) {
                     self.interrupt.raise();
                 }
-                // A failed renewal only shortens the lease; the next beat retries.
-                inbox.renew(self.id).ok();
+                // Locked while renewing, so a lease being settled is not
+                // renewed (nor reported lost) after it was given up.
+                let held = held
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some((delivery, interrupt)) = held.as_ref() {
+                    match inbox.renew(delivery) {
+                        Err(InboxError::LeaseLost { .. }) => interrupt.lose_lease(),
+                        // A failed renewal only shortens the lease; the next
+                        // beat retries.
+                        Ok(()) | Err(InboxError::Sqlite(_)) => {}
+                    }
+                }
             }
             thread::sleep(tick);
             elapsed += tick;
@@ -177,6 +207,7 @@ impl<'a> Process<'a> {
     fn serve(
         &self,
         processes: &Processes,
+        held: &Held,
         options: ProcessOptions,
         observer: &dyn ProcessObserver,
     ) -> Result<String, ProcessError> {
@@ -264,58 +295,78 @@ impl<'a> Process<'a> {
                 let report = Report::Ignored {
                     reason: format!("routed to `{owner}`"),
                 };
-                inbox.ack(delivery.event.id, Some(&report.summary()))?;
-                observer.observe(&ProcessActivity::Reacted {
-                    delivery: &delivery,
-                    report: &report,
-                });
+                if holding(inbox.ack(&delivery, Some(&report.summary())))?.is_some() {
+                    observer.observe(&ProcessActivity::Reacted {
+                        delivery: &delivery,
+                        report: &report,
+                    });
+                } else {
+                    observer.observe(&ProcessActivity::LeaseLost(&delivery));
+                }
                 continue;
             }
             processes.set_activity(self.id, Some(&format!("reacting to {}", delivery.event)))?;
             observer.observe(&ProcessActivity::Reacting(&delivery));
 
             let covered = graph.last_event()?;
-            let reaction = Reaction::new(
-                self.context,
-                self.agent,
-                self.id,
-                &delivery,
-                &self.interrupt,
-            );
-            match role.react(&reaction, &mut graph) {
+            let interrupt = self.interrupt.for_reaction();
+            *held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((delivery.clone(), interrupt.clone()));
+            let reaction = Reaction::new(self.context, self.agent, self.id, &delivery, &interrupt);
+            let result = role.react(&reaction, &mut graph);
+            held.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let lost = || observer.observe(&ProcessActivity::LeaseLost(&delivery));
+            match result {
+                _ if interrupt.lease_lost() => lost(),
                 Ok(report) => {
-                    if role.coalesces()
-                        && let Some(through) = covered
+                    let coalesced = match report.covered().or(covered) {
+                        Some(through) if role.coalesces() => {
+                            let note = format!("covered by the reaction to {}", delivery.event.id);
+                            holding(inbox.ack_through(&delivery, role.reactions(), through, &note))?
+                                .is_some()
+                        }
+                        Some(_) | None => true,
+                    };
+                    if coalesced
+                        && holding(inbox.ack(&delivery, Some(&report.summary())))?.is_some()
                     {
-                        let note = format!("covered by the reaction to {}", delivery.event.id);
-                        inbox.ack_through(role.reactions(), through, &note)?;
+                        observer.observe(&ProcessActivity::Reacted {
+                            delivery: &delivery,
+                            report: &report,
+                        });
+                    } else {
+                        lost();
                     }
-                    inbox.ack(delivery.event.id, Some(&report.summary()))?;
-                    observer.observe(&ProcessActivity::Reacted {
-                        delivery: &delivery,
-                        report: &report,
-                    });
                 }
                 Err(error) if self.interrupt.is_raised() => {
-                    inbox.release(delivery.event.id)?;
-                    observer.observe(&ProcessActivity::Failed {
-                        delivery: &delivery,
-                        error: &error,
-                        retry: true,
-                    });
+                    if holding(inbox.release(&delivery))?.is_some() {
+                        observer.observe(&ProcessActivity::Failed {
+                            delivery: &delivery,
+                            error: &error,
+                            retry: true,
+                        });
+                    } else {
+                        lost();
+                    }
                     return Ok("stopped".to_owned());
                 }
                 Err(RoleError::Graph(error)) => {
-                    inbox.release(delivery.event.id)?;
+                    holding(inbox.release(&delivery))?;
                     return Err(error.into());
                 }
                 Err(error) => {
-                    let retry = inbox.fail(delivery.event.id, &error.to_string(), MAX_ATTEMPTS)?;
-                    observer.observe(&ProcessActivity::Failed {
-                        delivery: &delivery,
-                        error: &error,
-                        retry,
-                    });
+                    match holding(inbox.fail(&delivery, &error.to_string(), MAX_ATTEMPTS))? {
+                        Some(retry) => observer.observe(&ProcessActivity::Failed {
+                            delivery: &delivery,
+                            error: &error,
+                            retry,
+                        }),
+                        None => lost(),
+                    }
                 }
             }
             last_reaction = Instant::now();

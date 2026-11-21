@@ -104,6 +104,10 @@ impl ProcessObserver for ActivityLog {
             ProcessActivity::Reacted { delivery, report } => {
                 self.line(&format!("{}: {}", delivery.event.id, report.summary()));
             }
+            ProcessActivity::LeaseLost(delivery) => self.line(&format!(
+                "{}: lost the lease; the reaction was abandoned to the process that took it over",
+                delivery.event.id
+            )),
             ProcessActivity::Failed {
                 delivery,
                 error,

@@ -11,7 +11,7 @@ use crate::event::{Event, EventId, EventKind};
 use crate::graph::{
     AgentRunId, AgentRunRecord, AgentRunStatus, Edge, Evaluation, GraphError, Lineage,
     NewEvaluation, NewOrigin, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Plan, PlanId,
-    PlannedPath,
+    PlannedPath, Snapshot,
 };
 use crate::store::{self, NOW};
 
@@ -1085,6 +1085,24 @@ impl Graph {
                 r.get::<_, Option<i64>>(0)
             })?
             .map(EventId))
+    }
+
+    /// Every node, edge, and evaluation with the newest event, read in one
+    /// transaction so that no mutation lands between them.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError`] on SQLite failure.
+    pub fn snapshot(&self) -> Result<Snapshot, GraphError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let snapshot = Snapshot {
+            nodes: self.nodes(&NodeFilter::default())?,
+            edges: self.edges()?,
+            evaluations: self.evaluations()?,
+            through: self.last_event()?,
+        };
+        tx.commit()?;
+        Ok(snapshot)
     }
 
     // ------------------------------------------------------------ agent runs
