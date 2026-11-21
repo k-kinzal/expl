@@ -82,7 +82,8 @@ impl CliError {
                 GraphError::NodeNotFound(_)
                 | GraphError::NotInStatus { .. }
                 | GraphError::Cycle { .. },
-            ) => exit::USER,
+            )
+            | Self::Process(ProcessError::NotAdoptable(_)) => exit::USER,
             Self::Declaration(_) | Self::Role(RoleError::Declaration(_)) => exit::CONFIG,
             Self::Project(ProjectError::Io { .. })
             | Self::Store(_)

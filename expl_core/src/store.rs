@@ -159,6 +159,12 @@ CREATE UNIQUE INDEX nodes_current_origin ON nodes (kind)
 -- it. Leases taken before tokens existed have none and simply expire.
 ALTER TABLE deliveries ADD COLUMN lease_token TEXT;
 ",
+    r"
+-- A created record must be adopted by its startup deadline (Unix seconds),
+-- so an interrupted launch cannot hold a replica slot forever. Records
+-- created before deadlines existed have none and count as abandoned.
+ALTER TABLE processes ADD COLUMN start_by INTEGER;
+",
 ];
 
 /// Open the database at `path`, creating and migrating it as needed.

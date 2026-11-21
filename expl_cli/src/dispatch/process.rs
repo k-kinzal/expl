@@ -95,6 +95,9 @@ pub(crate) fn describe(record: &ProcessRecord) -> String {
         ProcessState::Created => "starting".to_owned(),
         ProcessState::Running if record.stop_requested => "stopping".to_owned(),
         ProcessState::Running => record.activity.clone().unwrap_or_else(|| "running".into()),
+        ProcessState::Dead if record.pid.is_none() => {
+            "never adopted (launch interrupted)".to_owned()
+        }
         ProcessState::Dead => "no heartbeat (crashed or killed)".to_owned(),
         ProcessState::Exited => record.exit_reason.clone().unwrap_or_default(),
     }

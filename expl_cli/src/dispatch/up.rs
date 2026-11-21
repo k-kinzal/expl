@@ -1,8 +1,9 @@
 //! `expl up` and `expl down` — the declared set of processes.
 //!
 //! `up` is idempotent, like `docker compose up -d`: for each agent it starts
-//! only the processes missing to reach `replicas`. `down` stops every live
-//! process.
+//! only the processes missing to reach `replicas`. A record still created
+//! past its startup deadline is abandoned first, so an interrupted launch
+//! does not hold a slot. `down` stops every live process.
 
 use std::path::Path;
 use std::process::Command;
@@ -19,6 +20,14 @@ pub(crate) fn up(start: &Path, args: &UpArgs) -> Result<(), CliError> {
         declaration.agent(name)?;
     }
     let table = processes(context.project())?;
+    // A launch that never got adopted gives its slot back; its child, if
+    // it ever arrives, can no longer adopt the record.
+    for record in table.abandon_unstarted()? {
+        status(&format!(
+            "{}: abandoned {}, never adopted",
+            record.agent, record.name
+        ));
+    }
     let live = table.list(false)?;
     let exe = std::env::current_exe().map_err(|e| CliError::io("locate the expl binary", e))?;
     for (name, agent) in &declaration.agent {

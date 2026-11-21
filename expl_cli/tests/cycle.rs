@@ -598,6 +598,83 @@ fn up_runs_every_agent_until_down() {
 }
 
 #[test]
+fn an_abandoned_start_gives_its_replica_slot_back() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let project = expl_core::Project::discover(repo).expect("project");
+    // A launch interrupted between creating the record and its child
+    // adopting it.
+    let mut table = expl_core::Processes::open(&project.database_path(), &project.processes_dir())
+        .expect("processes");
+    let orphan = table.create("executor", None, true).expect("create");
+    let id = orphan.id.to_string();
+
+    // While its startup deadline holds, it occupies one of the two slots.
+    assert_eq!(ok(repo, &["up", "executor"]).lines().count(), 1);
+    let record = json(&ok(repo, &["process", "inspect", &id]));
+    assert_eq!(record["state"], "created", "{record}");
+
+    // Past its deadline it is dead, and `up` abandons it and starts a
+    // replacement in its place.
+    let db = rusqlite::Connection::open(project.database_path()).expect("db");
+    db.busy_timeout(Duration::from_secs(30)).expect("timeout");
+    let aged = db
+        .execute(
+            "UPDATE processes SET start_by = CAST(strftime('%s','now') AS INTEGER) - 1 \
+             WHERE id = ?1",
+            [orphan.id.0],
+        )
+        .expect("age");
+    assert_eq!(aged, 1);
+    assert_eq!(
+        json(&ok(repo, &["process", "inspect", &id]))["state"],
+        "dead"
+    );
+    let up = expl(repo, &["up", "executor"]);
+    assert!(up.status.success(), "{up:?}");
+    assert_eq!(String::from_utf8_lossy(&up.stdout).lines().count(), 1);
+    assert!(
+        String::from_utf8_lossy(&up.stderr).contains("abandoned"),
+        "{up:?}"
+    );
+    let record = json(&ok(repo, &["process", "inspect", &id]));
+    assert_eq!(record["state"], "exited", "{record}");
+    let reason = record["exit_reason"].as_str().expect("reason").to_owned();
+    assert!(reason.starts_with("abandoned"), "{record}");
+    let executors = || {
+        json_lines(&ok(repo, &["ps", "--format", "json"]))
+            .into_iter()
+            .filter(|p| p["agent"] == "executor")
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(executors().len(), 2);
+    assert!(executors().iter().all(|p| p["id"] != orphan.id.0));
+
+    // The child arriving late cannot adopt the expired record.
+    let late = expl(repo, &["run", "executor", "--adopt", &id]);
+    assert_eq!(late.status.code(), Some(1), "{late:?}");
+    assert!(
+        String::from_utf8_lossy(&late.stderr).contains("cannot be adopted"),
+        "{late:?}"
+    );
+    let record = json(&ok(repo, &["process", "inspect", &id]));
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["pid"], serde_json::Value::Null, "{record}");
+    assert_eq!(record["exit_reason"], reason.as_str(), "{record}");
+
+    // Nor can a second child adopt a record that is already running.
+    wait_until("both replicas to run", || {
+        executors().iter().all(|p| p["state"] == "running")
+    });
+    let running = executors()[0]["id"].to_string();
+    let twin = expl(repo, &["run", "executor", "--adopt", &running]);
+    assert_eq!(twin.status.code(), Some(1), "{twin:?}");
+
+    assert_eq!(ok(repo, &["up", "executor"]), "");
+    assert_eq!(executors().len(), 2);
+}
+
+#[test]
 fn stopping_mid_execution_gives_the_event_back() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
