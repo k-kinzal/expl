@@ -1110,6 +1110,7 @@ fn speculative_exploration_grows_past_steps_not_carried_out() {
             "1",
         ],
     );
+    let open_id: i64 = open.trim().parse().expect("node id");
     ok(repo, &["run", "explorer", "-d"]);
     // Revisits pick at random, so steps proposed meanwhile can be explored
     // ahead of too: wait for the one that starts from the open step.
@@ -1118,7 +1119,7 @@ fn speculative_exploration_grows_past_steps_not_carried_out() {
             .into_iter()
             .filter(|n| n["title"] == "After the open step")
             .map(|n| node(repo, &n["id"].to_string()))
-            .find(|n| n["predecessors"].to_string() == format!("[{open}]"))
+            .find(|n| n["predecessors"] == serde_json::json!([open_id]))
     };
     wait_until("an exploration ahead of the open step", || {
         ahead().is_some()
