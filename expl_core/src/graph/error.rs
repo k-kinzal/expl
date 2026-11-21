@@ -30,6 +30,15 @@ pub enum GraphError {
     /// An origin already exists.
     #[error("the graph already has an origin node")]
     OriginExists,
+    /// The active origin is no longer the one a new origin was observed
+    /// from: another process recorded a move of the trunk first.
+    #[error("the active origin is {current}, not {expected}: the trunk was followed meanwhile")]
+    OriginMoved {
+        /// The origin the observation was made from.
+        expected: NodeId,
+        /// The active origin now.
+        current: NodeId,
+    },
     /// An edge would close a cycle.
     #[error("edge {from} -> {target} would create a cycle")]
     Cycle {

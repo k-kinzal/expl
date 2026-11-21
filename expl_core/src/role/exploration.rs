@@ -8,6 +8,15 @@
 //! - `origin.advanced` → the trunk moved: explore forward from the new
 //!   origin toward every active goal, and backward from each goal that
 //!   asks for counter-exploration, as for a new goal.
+//! - `node.revisited` → an idle exploration process picked a starting
+//!   point at random ([`Graph::starting_points`]): explore forward from it,
+//!   or backward when it is a counter-exploration goal. One exploration
+//!   never exhausts a starting point, so the same node is explored again
+//!   and again, each time growing new steps.
+//!
+//! Every exploration is told which steps already exist around it (the
+//! ones built on its starting point, and all open work), so a repeated
+//! exploration proposes alternatives instead of the same steps again.
 //!
 //! The agent works read-only in a scratch worktree at the node it explores
 //! from (the origin, for backward exploration), so its proposals are
@@ -15,11 +24,13 @@
 //! toward; where proposals attach in the graph is decided here, not by the
 //! agent.
 
+use std::fmt::Write;
+
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::event::EventKind;
-use crate::graph::{Graph, Node, NodeId, NodeKind, NodeStatus};
+use crate::graph::{Graph, Node, NodeFilter, NodeId, NodeKind, NodeStatus};
 use crate::prompt::Prompt;
 use crate::role::{Direction, Reaction, Report, RoleError, digest};
 
@@ -137,6 +148,33 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
             }
             explorations
         }
+        EventKind::NodeRevisited => {
+            if !graph.starting_points()?.iter().any(|n| n.id == subject.id) {
+                return Ok(Reaction::ignore(format!(
+                    "{} ({} {}) is no longer a starting point",
+                    subject.id, subject.status, subject.kind
+                )));
+            }
+            if subject.kind == NodeKind::Goal {
+                let goals = [subject.clone()];
+                vec![explore(
+                    reaction,
+                    graph,
+                    Direction::Backward,
+                    &subject,
+                    &goals,
+                )?]
+            } else {
+                let goals = goals_from(graph, &subject)?;
+                vec![explore(
+                    reaction,
+                    graph,
+                    Direction::Forward,
+                    &subject,
+                    &goals,
+                )?]
+            }
+        }
         EventKind::NodeEvaluated => {
             if subject.kind != NodeKind::Step || subject.status != NodeStatus::Completed {
                 return Ok(Reaction::ignore(format!(
@@ -144,14 +182,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
                     subject.id, subject.status, subject.kind
                 )));
             }
-            let mut goals: Vec<Node> = graph
-                .goals_reachable_from(subject.id)?
-                .into_iter()
-                .filter(|goal| goal.status == NodeStatus::Active)
-                .collect();
-            if goals.is_empty() {
-                goals = graph.goals()?;
-            }
+            let goals = goals_from(graph, &subject)?;
             if goals.is_empty() {
                 return Ok(Reaction::ignore("no active goals"));
             }
@@ -180,6 +211,46 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     Ok(Report::Exploration { explorations })
 }
 
+/// The active goals a step leads to, or every active goal when it leads
+/// to none (the origin, or a step whose goals were retired).
+fn goals_from(graph: &Graph, start: &Node) -> Result<Vec<Node>, RoleError> {
+    let goals: Vec<Node> = graph
+        .goals_reachable_from(start.id)?
+        .into_iter()
+        .filter(|goal| goal.status == NodeStatus::Active)
+        .collect();
+    if goals.is_empty() {
+        return Ok(graph.goals()?);
+    }
+    Ok(goals)
+}
+
+/// Most steps an exploration is told already exist.
+const KNOWN_STEPS: usize = 40;
+
+/// The steps that already exist around an exploration from `start`: those
+/// built on it (forward) or leading to it (backward), whatever became of
+/// them, and every step still open anywhere — newest first.
+fn known_steps(graph: &Graph, direction: Direction, start: &Node) -> Result<Vec<Node>, RoleError> {
+    let mut steps = match direction {
+        Direction::Forward => graph.successors(start.id)?,
+        Direction::Backward => graph.predecessors(start.id)?,
+    };
+    steps.extend(graph.nodes(&NodeFilter {
+        kinds: vec![NodeKind::Step],
+        statuses: vec![
+            NodeStatus::Proposed,
+            NodeStatus::Planned,
+            NodeStatus::Running,
+        ],
+    })?);
+    steps.retain(|n| n.kind == NodeKind::Step);
+    steps.sort_by_key(|n| std::cmp::Reverse(n.id));
+    steps.dedup_by_key(|n| n.id);
+    steps.truncate(KNOWN_STEPS);
+    Ok(steps)
+}
+
 /// Explore from `start` toward `goals`. Forward proposals build on `start`
 /// and lead to `goals`; backward proposals (`start` is the goal) build on
 /// the origin and lead to `start`.
@@ -197,8 +268,9 @@ fn explore(
     };
     let scratch = reaction.context().workspaces().scratch(ground)?;
     let breadth = reaction.agent().declaration().breadth.unwrap_or(1);
+    let known = known_steps(graph, direction, start)?;
     let schema = schema();
-    let prompt = prompt(reaction, direction, start, goals, breadth, &schema);
+    let prompt = prompt(reaction, direction, start, goals, &known, breadth, &schema);
     let response: Response =
         reaction.invoke(graph, Some(start.id), scratch.path(), &prompt, &schema)?;
     drop(scratch);
@@ -226,12 +298,14 @@ fn explore(
     Ok(report)
 }
 
-/// The prompt: the goals and the task, nothing about the graph.
+/// The prompt: the goals, the task, and the steps that already exist —
+/// nothing else about the graph.
 fn prompt(
     reaction: &Reaction<'_>,
     direction: Direction,
     start: &Node,
     goals: &[Node],
+    known: &[Node],
     breadth: usize,
     schema: &serde_json::Value,
 ) -> Prompt {
@@ -255,8 +329,20 @@ fn prompt(
             target = digest::goals(std::slice::from_ref(start)),
         ),
     };
+    let known = if known.is_empty() {
+        String::new()
+    } else {
+        let mut list = String::from(
+            "\n## Already proposed\n\nThese steps already exist. Do not propose them again; \
+             propose genuinely different alternatives, or what could come after them:\n\n",
+        );
+        for step in known {
+            let _ = writeln!(list, "- {}", step.title);
+        }
+        list
+    };
     Prompt::from(format!(
-        "{task}\n\
+        "{task}{known}\n\
          Guidelines:\n\
          - Each step must be a concrete, verifiable unit of work that can be completed in one \
            session.\n\

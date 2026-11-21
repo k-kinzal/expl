@@ -307,6 +307,11 @@ impl Graph {
     /// origin is already at `origin.commit` — several processes follow the
     /// trunk, and only the first to see it move records it.
     ///
+    /// `origin.previous` must still be the active origin: adoption is only
+    /// meaningful against the origin it was computed from, and a process
+    /// that observed the trunk before another recorded a newer move must
+    /// not record its older observation on top.
+    ///
     /// The new origin builds on the previous origin and on every adopted
     /// step, so the lineage — what was chosen, and when — stays in the
     /// graph. Steps that have not started yet (`proposed`, `planned`) and
@@ -317,13 +322,20 @@ impl Graph {
     /// # Errors
     ///
     /// [`GraphError::NoOrigin`] when the graph has no origin;
-    /// [`GraphError::NotInStatus`] when an adopted node is not a completed
-    /// step. Nothing is recorded then.
+    /// [`GraphError::OriginMoved`] when `origin.previous` is no longer the
+    /// active origin; [`GraphError::NotInStatus`] when an adopted node is
+    /// not a completed step. Nothing is recorded then.
     pub fn advance_origin(&mut self, origin: &NewOrigin) -> Result<Option<NodeId>, GraphError> {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let previous = current_origin_in(&tx)?.ok_or(GraphError::NoOrigin)?;
+        if previous != origin.previous {
+            return Err(GraphError::OriginMoved {
+                expected: origin.previous,
+                current: previous,
+            });
+        }
         if node_in(&tx, previous)?.head_commit.as_deref() == Some(origin.commit.as_str()) {
             return Ok(None);
         }
@@ -440,6 +452,27 @@ impl Graph {
         emit(&tx, EventKind::NodeProposed, Some(id))?;
         tx.commit()?;
         Ok(id)
+    }
+
+    /// Record that `id` is to be explored from again (`node.revisited`).
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError::NodeNotFound`], or [`GraphError::NotInStatus`] when
+    /// `id` is not one of the [`starting_points`](Self::starting_points).
+    pub fn revisit(&mut self, id: NodeId) -> Result<(), GraphError> {
+        if !self.starting_points()?.iter().any(|n| n.id == id) {
+            self.node(id)?;
+            return Err(GraphError::NotInStatus {
+                node: id,
+                expected: "a starting point of exploration (the active origin, a completed \
+                           step not in the trunk, or an active counter-exploration goal)",
+            });
+        }
+        let tx = self.conn.savepoint()?;
+        emit(&tx, EventKind::NodeRevisited, Some(id))?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Add `source → target` to existing nodes.
@@ -812,6 +845,33 @@ impl Graph {
         })
     }
 
+    /// Every node exploration can start from again: the active origin,
+    /// each completed step whose work is not yet in the trunk (forward),
+    /// and each active counter-exploration goal (backward). Empty while
+    /// there are no active goals.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError`] on SQLite failure.
+    pub fn starting_points(&self) -> Result<Vec<Node>, GraphError> {
+        let goals = self.goals()?;
+        if goals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lineage = self.lineage()?;
+        let mut points = vec![self.origin()?];
+        points.extend(
+            self.nodes(&NodeFilter {
+                kinds: vec![NodeKind::Step],
+                statuses: vec![NodeStatus::Completed],
+            })?
+            .into_iter()
+            .filter(|step| !lineage.in_trunk(step.id)),
+        );
+        points.extend(goals.into_iter().filter(|g| g.counter_exploration));
+        Ok(points)
+    }
+
     /// Steps awaiting execution (`proposed` + `planned`).
     ///
     /// # Errors
@@ -1127,6 +1187,55 @@ mod tests {
     }
 
     #[test]
+    fn starting_points_are_realised_nodes_and_counter_goals() {
+        let mut graph = Graph::in_memory().expect("graph");
+        let origin = graph
+            .create_origin("origin", Some("main"), "abc")
+            .expect("origin");
+        assert!(graph.starting_points().expect("points").is_empty());
+        let goal = graph.add_goal("goal", "do it", false).expect("goal");
+        let counter = graph.add_goal("counter", "back", true).expect("counter");
+        let a = graph.propose_step("a", "a", &[origin], &[goal]).expect("a");
+        let b = graph.propose_step("b", "b", &[origin], &[goal]).expect("b");
+        graph.plan_step(a, 1).expect("plan");
+        assert!(graph.claim(a, false).expect("claim"));
+        graph
+            .set_branch(a, "expl/node-a", Some("def"))
+            .expect("branch");
+        graph.complete(a, "done").expect("complete");
+
+        let ids: Vec<NodeId> = graph
+            .starting_points()
+            .expect("points")
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(ids, [origin, a, counter]);
+
+        graph.revisit(a).expect("revisit a");
+        graph.revisit(counter).expect("revisit counter");
+        assert!(matches!(
+            graph.revisit(b),
+            Err(GraphError::NotInStatus { node, .. }) if node == b
+        ));
+        assert!(matches!(
+            graph.revisit(goal),
+            Err(GraphError::NotInStatus { .. })
+        ));
+        let revisits: Vec<_> = kinds(&graph)
+            .into_iter()
+            .filter(|(kind, _)| *kind == EventKind::NodeRevisited)
+            .collect();
+        assert_eq!(
+            revisits,
+            [
+                (EventKind::NodeRevisited, Some(a.0)),
+                (EventKind::NodeRevisited, Some(counter.0))
+            ]
+        );
+    }
+
+    #[test]
     fn single_origin() {
         let (mut graph, _, _) = seeded();
         assert!(matches!(
@@ -1298,8 +1407,9 @@ mod tests {
         ));
         assert_eq!(ids(&graph, second), [first]);
     }
-    fn new_origin(commit: &str, adopted: &[NodeId]) -> NewOrigin {
+    fn new_origin(previous: NodeId, commit: &str, adopted: &[NodeId]) -> NewOrigin {
         NewOrigin {
+            previous,
             title: "trunk".into(),
             note: String::new(),
             branch: Some("main".into()),
@@ -1323,21 +1433,30 @@ mod tests {
             graph.complete(step, "done").expect("complete");
         }
         assert!(matches!(
-            graph.advance_origin(&new_origin("def", &[open])),
+            graph.advance_origin(&new_origin(first, "def", &[open])),
             Err(GraphError::NotInStatus { .. })
         ));
 
         let second = graph
-            .advance_origin(&new_origin("def", &[adopted]))
+            .advance_origin(&new_origin(first, "def", &[adopted]))
             .expect("advance")
             .expect("moved");
         assert_eq!(
             graph
-                .advance_origin(&new_origin("def", &[]))
+                .advance_origin(&new_origin(second, "def", &[]))
                 .expect("again"),
             None,
             "the trunk is already there"
         );
+        // An observation made from the superseded origin records nothing.
+        let (edges, events) = (graph.edges().expect("edges"), kinds(&graph));
+        assert!(matches!(
+            graph.advance_origin(&new_origin(first, "abc", &[left])),
+            Err(GraphError::OriginMoved { expected, current })
+                if expected == first && current == second
+        ));
+        assert_eq!(graph.edges().expect("edges"), edges);
+        assert_eq!(kinds(&graph), events);
         assert_eq!(graph.origin().expect("origin").id, second);
         assert_eq!(
             graph.node(first).expect("first").status,

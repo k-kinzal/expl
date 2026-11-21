@@ -51,6 +51,12 @@ pub enum EventKind {
     /// A step was discarded.
     #[serde(rename = "node.pruned")]
     NodePruned,
+    /// An idle exploration picked a node at random to explore from again:
+    /// a realised node (forward) or a counter-exploration goal (backward).
+    /// One exploration never exhausts a starting point, so each one keeps
+    /// growing new steps.
+    #[serde(rename = "node.revisited")]
+    NodeRevisited,
     /// A plan (paths toward goals) was recorded.
     #[serde(rename = "plan.recorded")]
     PlanRecorded,
@@ -73,6 +79,7 @@ impl EventKind {
         Self::NodeFailed,
         Self::NodeEvaluated,
         Self::NodePruned,
+        Self::NodeRevisited,
         Self::PlanRecorded,
         Self::OriginAdvanced,
     ];
@@ -91,6 +98,7 @@ impl EventKind {
             Self::NodeFailed => "node.failed",
             Self::NodeEvaluated => "node.evaluated",
             Self::NodePruned => "node.pruned",
+            Self::NodeRevisited => "node.revisited",
             Self::PlanRecorded => "plan.recorded",
             Self::OriginAdvanced => "origin.advanced",
         }

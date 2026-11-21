@@ -281,6 +281,7 @@ mod tests {
         // The owner adopts the step: the trunk moves, and is judged.
         let next = graph
             .advance_origin(&expl_core::NewOrigin {
+                previous: origin,
                 title: "adopt cache".into(),
                 note: String::new(),
                 branch: Some("main".into()),
