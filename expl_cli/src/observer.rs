@@ -121,6 +121,12 @@ impl ProcessObserver for ActivityLog {
                     "giving up"
                 }
             )),
+            ProcessActivity::Abandoned { delivery, failed } => self.line(&format!(
+                "{}: its holder died on attempt {}; giving up{}",
+                delivery.event.id,
+                delivery.attempts,
+                failed.map_or_else(String::new, |node| format!(" ({node} failed)"))
+            )),
             ProcessActivity::Exiting(reason) => self.line(&format!("exiting: {reason}")),
         }
         *paused = None;
