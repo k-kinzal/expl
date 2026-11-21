@@ -1111,18 +1111,28 @@ fn speculative_exploration_grows_past_steps_not_carried_out() {
         ],
     );
     ok(repo, &["run", "explorer", "-d"]);
+    // Revisits pick at random, so steps proposed meanwhile can be explored
+    // ahead of too: wait for the one that starts from the open step.
     let ahead = || {
         json_lines(&ok(repo, &["node", "ls", "--format", "json"]))
             .into_iter()
-            .find(|n| n["title"] == "After the open step")
+            .filter(|n| n["title"] == "After the open step")
+            .map(|n| node(repo, &n["id"].to_string()))
+            .find(|n| n["predecessors"].to_string() == format!("[{open}]"))
     };
     wait_until("an exploration ahead of the open step", || {
         ahead().is_some()
     });
     ok(repo, &["down", "--time", "5"]);
-    let after = node(repo, &ahead().expect("ahead")["id"].to_string());
-    assert_eq!(after["predecessors"].to_string(), format!("[{open}]"));
-    assert_eq!(after["successors"], serde_json::json!([2]));
+    // It heads for the goal (and may have been explored ahead of in turn).
+    let after = ahead().expect("ahead");
+    assert!(
+        after["successors"]
+            .as_array()
+            .expect("successors")
+            .contains(&serde_json::json!(2)),
+        "{after}"
+    );
     assert_eq!(node(repo, &open)["node"]["status"], "planned");
     let prompts = sandbox.dir.path().join("prompts");
     let told = std::fs::read_dir(&prompts)

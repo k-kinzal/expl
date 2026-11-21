@@ -14,9 +14,19 @@ cd "$repo" || exit 2
 binary="$(command -v expl)"
 installed=$(stat -f %m "$binary")
 state="$(mktemp -d "${TMPDIR:-/tmp}/expl-restart-XXXX")"
-trap 'rm -rf "$state"' EXIT
 
 expl --version >/dev/null || { echo "the installed expl does not run" >&2; exit 2; }
+
+# One rolling restart at a time: two would each see an agent short after the
+# other stopped its process, and both `expl up` would start one — doubling
+# replicas.
+lock="$repo/.expl/operator/rolling-restart.lock"
+mkdir -p "$repo/.expl/operator"
+if ! mkdir "$lock" 2>/dev/null; then
+  echo "another rolling restart is running ($lock); not starting a second" >&2
+  exit 2
+fi
+trap 'rm -rf "$state" "$lock"' EXIT
 
 while true; do
   stale=0
