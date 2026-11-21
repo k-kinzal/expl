@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::agent::DriverKind;
+use crate::event::EventId;
 use crate::project::Project;
 use crate::role::Role;
 
@@ -153,17 +154,32 @@ pub struct AgentDeclaration {
     pub instructions: Option<String>,
     /// Processes `expl up` keeps running.
     pub replicas: usize,
+    /// Share of its role's events. Agents of one role that declare a
+    /// weight split that role's events between them in proportion — each
+    /// event goes to exactly one of them — instead of each reacting to
+    /// every event. Agents without a weight react to every event of their
+    /// role. Use it to route one role across agents with different
+    /// instructions (e.g. a mainstream and a contrarian exploration).
+    #[serde(default)]
+    pub weight: Option<u32>,
     /// Exploration only: maximum steps proposed per reaction.
     #[serde(default)]
     pub breadth: Option<usize>,
-    /// Exploration only: pause while this many steps await execution.
+    /// Exploration only: also explore ahead of steps not carried out yet,
+    /// assuming they succeed, when revisiting starting points — the map
+    /// grows deep before anything runs.
     #[serde(default)]
-    pub max_pending: Option<usize>,
+    pub speculate: Option<bool>,
     /// Exploration only: seconds an idle process waits after its last
     /// exploration before it revisits a random starting point. Without it,
     /// an exploration reacts to events only and never revisits.
     #[serde(default)]
     pub revisit_cooldown: Option<u64>,
+    /// Exploration only: what one exploration looks at — `"node"` (the
+    /// default) explores from the node an event names; `"graph"` surveys the
+    /// whole graph at once, for what no single node would suggest.
+    #[serde(default)]
+    pub scope: Option<Scope>,
     /// How long one attempt of a CLI may run before its process group is
     /// stopped and the attempt fails. Applies to the primary CLI and to
     /// every alternative that does not declare its own. Without it, an
@@ -175,6 +191,17 @@ pub struct AgentDeclaration {
     /// fall over to the next one when a CLI fails.
     #[serde(default)]
     pub alternative: Vec<CliDeclaration>,
+}
+
+/// What one exploration looks at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    /// The node an event names (or a goal, for counter-exploration).
+    #[default]
+    Node,
+    /// The whole graph at once.
+    Graph,
 }
 
 /// One alternative CLI of an agent: the same fields that declare the
@@ -260,7 +287,6 @@ command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
 replicas = 1
 breadth = 3
-max_pending = 6
 revisit_cooldown = 600          # idle: explore again from a random node every 10 minutes
 
 [agent.planner]
@@ -351,30 +377,60 @@ replicas = 1
                         source,
                     })?;
             }
+            if agent.weight == Some(0) {
+                return invalid(
+                    name,
+                    "`weight` must be >= 1 (leave it out to receive every event)",
+                );
+            }
             match agent.role {
                 Role::Exploration => {
                     if agent.breadth.is_none_or(|b| b == 0) {
                         return invalid(name, "exploration needs `breadth` >= 1");
                     }
-                    if agent.max_pending.is_none_or(|m| m == 0) {
-                        return invalid(name, "exploration needs `max_pending` >= 1");
-                    }
                 }
                 Role::Planning | Role::Execution | Role::Evaluation => {
                     if agent.breadth.is_some()
-                        || agent.max_pending.is_some()
+                        || agent.speculate.is_some()
                         || agent.revisit_cooldown.is_some()
+                        || agent.scope.is_some()
                     {
                         return invalid(
                             name,
-                            "`breadth`, `max_pending` and `revisit_cooldown` apply to exploration \
-                             agents only",
+                            "`breadth`, `revisit_cooldown`, `scope` and `speculate` apply to \
+                             exploration agents only",
                         );
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    /// When the agent named `agent` shares its role's events by weight,
+    /// the agent `event` is routed to (possibly `agent` itself); `None`
+    /// when `agent` declares no weight, i.e. it reacts to every event. The
+    /// choice depends only on the event and the declaration, so every
+    /// process of every agent agrees on it.
+    #[must_use]
+    pub fn route(&self, agent: &str, event: EventId) -> Option<&str> {
+        let role = self.agent.get(agent)?.role;
+        self.agent.get(agent)?.weight?;
+        let shares: Vec<(&str, u64)> = self
+            .agent
+            .iter()
+            .filter(|(_, a)| a.role == role)
+            .filter_map(|(name, a)| a.weight.map(|w| (name.as_str(), u64::from(w))))
+            .collect();
+        let total: u64 = shares.iter().map(|(_, w)| w).sum();
+        let mut point = spread(event.0 as u64) % total;
+        for (name, weight) in shares {
+            if point < weight {
+                return Some(name);
+            }
+            point -= weight;
+        }
+        None
     }
 
     /// The agent named `name`.
@@ -387,6 +443,15 @@ replicas = 1
             .get(name)
             .ok_or_else(|| DeclarationError::UnknownAgent(name.to_owned()))
     }
+}
+
+/// `SplitMix64`: consecutive event ids land far apart, so routing by weight
+/// does not alternate in lockstep with the event log.
+fn spread(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
 }
 
 #[cfg(test)]
@@ -418,6 +483,34 @@ mod tests {
         let text = Declaration::TEMPLATE.replace("breadth = 3\n", "");
         let error = Declaration::parse(&text).expect_err("missing breadth");
         assert!(error.to_string().contains("breadth"), "{error}");
+    }
+
+    #[test]
+    fn weighted_agents_split_their_role_by_weight() {
+        let text = format!(
+            "{}\n[agent.contrarian]\nrole = \"exploration\"\ndriver = \"generic\"\n\
+             command = [\"x\"]\nreplicas = 1\nbreadth = 1\nweight = 1\n",
+            Declaration::TEMPLATE.replace("breadth = 3\n", "breadth = 3\nweight = 3\n")
+        );
+        let declaration = Declaration::parse(&text).expect("parses");
+        let mut counts = BTreeMap::new();
+        for id in 1..=4000 {
+            let explorer = declaration.route("explorer", EventId(id));
+            let contrarian = declaration.route("contrarian", EventId(id));
+            assert_eq!(explorer, contrarian, "every agent agrees on e{id}");
+            *counts.entry(explorer.expect("routed")).or_insert(0) += 1;
+        }
+        assert!((2800..3200).contains(&counts["explorer"]), "{counts:?}");
+        assert!((800..1200).contains(&counts["contrarian"]), "{counts:?}");
+        // Unweighted agents react to everything of their role.
+        assert_eq!(declaration.route("planner", EventId(1)), None);
+
+        let zero = Declaration::TEMPLATE.replace("breadth = 3\n", "breadth = 3\nweight = 0\n");
+        let error = Declaration::parse(&zero).expect_err("zero weight");
+        assert!(
+            error.to_string().contains("`weight` must be >= 1"),
+            "{error}"
+        );
     }
 
     #[test]

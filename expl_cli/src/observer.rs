@@ -15,8 +15,6 @@ use expl_core::{ProcessActivity, ProcessObserver};
 pub(crate) struct ActivityLog {
     name: String,
     tee: Option<Mutex<File>>,
-    /// The last pause reason printed, so a paused process logs it once.
-    paused: Mutex<Option<String>>,
 }
 
 impl ActivityLog {
@@ -25,7 +23,6 @@ impl ActivityLog {
         Self {
             name: name.to_owned(),
             tee: tee.map(Mutex::new),
-            paused: Mutex::new(None),
         }
     }
 
@@ -43,18 +40,7 @@ impl ActivityLog {
 
 impl ProcessObserver for ActivityLog {
     fn observe(&self, activity: &ProcessActivity<'_>) {
-        let mut paused = self
-            .paused
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match activity {
-            ProcessActivity::Paused(reason) => {
-                if paused.as_deref() != Some(*reason) {
-                    *paused = Some((*reason).to_owned());
-                    self.line(reason);
-                }
-                return;
-            }
             ProcessActivity::Followed(advance) => {
                 let adopted = if advance.adopted.is_empty() {
                     "nothing adopted".to_owned()
@@ -81,11 +67,9 @@ impl ProcessObserver for ActivityLog {
                         " (the trunk was rewritten)"
                     }
                 ));
-                return;
             }
             ProcessActivity::Unfollowed(reason) => {
                 self.line(&format!("cannot follow the trunk: {reason}"));
-                return;
             }
             ProcessActivity::Started(record) => self.line(&format!(
                 "started process {} of agent `{}` (pid {})",
@@ -129,7 +113,6 @@ impl ProcessObserver for ActivityLog {
             )),
             ProcessActivity::Exiting(reason) => self.line(&format!("exiting: {reason}")),
         }
-        *paused = None;
     }
 }
 

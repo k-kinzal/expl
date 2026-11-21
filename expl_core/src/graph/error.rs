@@ -30,6 +30,15 @@ pub enum GraphError {
     /// An origin already exists.
     #[error("the graph already has an origin node")]
     OriginExists,
+    /// The active origin is no longer the one a new origin was observed
+    /// from: another process recorded a move of the trunk first.
+    #[error("the active origin is {current}, not {expected}: the trunk was followed meanwhile")]
+    OriginMoved {
+        /// The origin the observation was made from.
+        expected: NodeId,
+        /// The active origin now.
+        current: NodeId,
+    },
     /// An edge would close a cycle.
     #[error("edge {from} -> {target} would create a cycle")]
     Cycle {
@@ -56,4 +65,41 @@ pub enum GraphError {
         /// Offending value.
         value: String,
     },
+}
+
+impl GraphError {
+    /// Whether the database was only busy: another process held its lock
+    /// past the busy timeout. Trying again later can succeed.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(failure, _))
+                if matches!(
+                    failure.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqlite(code: std::ffi::c_int) -> GraphError {
+        GraphError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            None,
+        ))
+    }
+
+    #[test]
+    fn only_a_busy_database_is_transient() {
+        assert!(sqlite(rusqlite::ffi::SQLITE_BUSY).is_busy());
+        assert!(sqlite(rusqlite::ffi::SQLITE_BUSY_SNAPSHOT).is_busy());
+        assert!(sqlite(rusqlite::ffi::SQLITE_LOCKED).is_busy());
+        assert!(!sqlite(rusqlite::ffi::SQLITE_CORRUPT).is_busy());
+        assert!(!GraphError::NoOrigin.is_busy());
+    }
 }

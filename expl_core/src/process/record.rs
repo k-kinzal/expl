@@ -61,7 +61,9 @@ pub enum ProcessState {
     Created,
     /// Running and beating.
     Running,
-    /// Says running, but its heartbeat stopped (crashed or killed).
+    /// Says running, but its heartbeat stopped (crashed or killed); or was
+    /// created but not adopted by its startup deadline (the launch was
+    /// interrupted).
     Dead,
     /// Finished.
     Exited,
@@ -103,6 +105,9 @@ pub struct ProcessRecord {
     pub exit_reason: Option<String>,
     /// Creation time.
     pub created_at: String,
+    /// Startup deadline: a created record not adopted by then is
+    /// abandoned and can no longer be adopted.
+    pub start_by: Option<String>,
     /// Exit time.
     pub finished_at: Option<String>,
 }

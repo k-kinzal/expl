@@ -8,15 +8,21 @@
 //! - **The trunk is the spine.** Origins — every position the default
 //!   branch has held — sit on one straight line, oldest on the left. The
 //!   current origin is the bright one with a ring: exploration grows from
-//!   it. A step adopted into the trunk turns square, and hairlines join it
-//!   to the origin that took it in. Steps explored from an origin the trunk
+//!   it. Work adopted into the trunk reads like a merged branch: its steps
+//!   turn square, the line from the origin it was explored from through
+//!   them is drawn in the trunk's colour, and it joins the spine at the
+//!   origin that took it in with a line as strong as the spine itself. An
+//!   origin that took work in is a merge: it carries a halo, and its label
+//!   counts the steps it merged. Steps explored from an origin the trunk
 //!   has moved past fade, unless they are still candidates.
 //! - **Edges are hairlines.** Edges into goals are drawn only once a step
 //!   satisfies the goal (or the step is selected), so the picture shows
 //!   reached goals rather than intentions.
 //! - **Goals** are listed top right, with where the trunk stands on each
-//!   and the best candidate not adopted yet. Selecting a goal focuses the
-//!   graph on it: what leads to it, and what was judged against it.
+//!   and the best candidate not adopted yet, subgoals indented under the
+//!   goals they serve (and joined to them by a faint line in the graph).
+//!   Selecting a goal focuses the graph on it: what leads to it, and what
+//!   was judged against it.
 //! - **The trunk's history** is listed bottom right: each origin, newest
 //!   first, with what was adopted into it.
 //! - **Agents are dots** bottom left, one per process, grouped by agent:
@@ -26,7 +32,12 @@
 //!   Escape hides them.
 //!
 //! The view polls the database on a background thread and re-renders only
-//! when the snapshot changed. Drag or scroll pans; `0` recentres.
+//! when the snapshot changed. Dragging pans; scrolling zooms the graph
+//! around the pointer, `+` / `-` zoom around the window centre,
+//! `f` fits the whole graph in the window, and `0` resets pan and zoom.
+//! Zooming scales the distances between dots, not the dots or the panels;
+//! when zoomed far out, only the labels that matter (selected, current,
+//! running, candidates) stay.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -61,9 +72,22 @@ const CLICK_SLOP: f32 = 4.0;
 /// Corner panels.
 const DETAIL_W: f32 = 360.0;
 const GOALS_W: f32 = 290.0;
+/// How far each level of subgoals is indented in the goals panel.
+const SUBGOAL_INDENT: f32 = 14.0;
 const TRUNK_W: f32 = 320.0;
 /// Origins listed in the trunk panel.
 const TRUNK_ROWS: usize = 6;
+/// Zoom range, the factor of one `+` / `-`, and the zoom below which only
+/// labels that matter are drawn.
+const MIN_ZOOM: f32 = 0.1;
+const MAX_ZOOM: f32 = 3.0;
+const ZOOM_STEP: f32 = 1.25;
+const QUIET_LABELS_BELOW: f32 = 0.55;
+/// Narrowest label once zoomed out.
+const MIN_LABEL_W: f32 = 72.0;
+/// Room `f` leaves around the fitted graph for the corner panels.
+const FIT_INSET_X: f32 = 120.0;
+const FIT_INSET_Y: f32 = 110.0;
 /// Opacity of nodes outside a focused goal, and of steps left behind.
 const OUT_OF_FOCUS: f32 = 0.16;
 const BEHIND: f32 = 0.45;
@@ -79,6 +103,8 @@ pub(crate) struct ExplView {
     error: Option<String>,
     selected: Option<NodeId>,
     pan: Point<Pixels>,
+    /// Scale of the distances between dots (1.0: as laid out).
+    zoom: f32,
     drag: Option<Drag>,
     pressed: Option<NodeId>,
     /// The press came from a panel: bring the node into view on select.
@@ -137,6 +163,7 @@ impl ExplView {
             error: None,
             selected: None,
             pan: Point::default(),
+            zoom: 1.0,
             drag: None,
             pressed: None,
             reveal: false,
@@ -181,19 +208,59 @@ impl ExplView {
         }
     }
 
-    /// Centre of a node's dot in window coordinates.
-    fn centre(&self, id: NodeId, viewport: Size<Pixels>) -> Option<Point<Pixels>> {
-        let slot = self.layout.slots.get(&id)?;
-        let span = small_f32(self.layout.columns.saturating_sub(1)) * COLUMN_STRIDE;
+    /// Where the graph's first column and middle row land at `zoom`,
+    /// before panning: centred while the graph fits, else right-aligned so
+    /// the present and the goals stay in view.
+    fn anchor(&self, zoom: f32, viewport: Size<Pixels>) -> Point<Pixels> {
+        let span = small_f32(self.layout.columns.saturating_sub(1)) * COLUMN_STRIDE * zoom;
         let width = f32::from(viewport.width);
         let left = if span + 2.0 * MARGIN <= width {
             (width - span) / 2.0
         } else {
             width - RIGHT_MARGIN - span
         };
-        let x = left + small_f32(slot.column) * COLUMN_STRIDE;
-        let y = f32::from(viewport.height) / 2.0 + slot.row * ROW_STRIDE;
-        Some(point(px(x), px(y)) + self.pan)
+        point(px(left), px(f32::from(viewport.height) / 2.0))
+    }
+
+    /// Centre of a node's dot in window coordinates.
+    fn centre(&self, id: NodeId, viewport: Size<Pixels>) -> Option<Point<Pixels>> {
+        let slot = self.layout.slots.get(&id)?;
+        let offset = point(
+            px(small_f32(slot.column) * COLUMN_STRIDE * self.zoom),
+            px(slot.row * ROW_STRIDE * self.zoom),
+        );
+        Some(self.anchor(self.zoom, viewport) + offset + self.pan)
+    }
+
+    /// Zoom by `factor`, keeping the graph point under `at` where it is.
+    fn zoom_at(&mut self, factor: f32, at: Point<Pixels>, viewport: Size<Pixels>) {
+        let zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        let unscaled = (at - self.anchor(self.zoom, viewport) - self.pan) / self.zoom;
+        self.zoom = zoom;
+        self.pan = at - self.anchor(zoom, viewport) - unscaled * zoom;
+    }
+
+    /// Zoom and pan so the whole graph fits between the corner panels
+    /// (never enlarging past 1.0).
+    fn fit(&mut self, viewport: Size<Pixels>) {
+        let rows = self.layout.slots.values().map(|slot| slot.row);
+        let (top, bottom) = rows.fold((0.0_f32, 0.0_f32), |(lo, hi), r| (lo.min(r), hi.max(r)));
+        let span_x = small_f32(self.layout.columns.saturating_sub(1)) * COLUMN_STRIDE;
+        let span_y = (bottom - top) * ROW_STRIDE;
+        let room_x = (f32::from(viewport.width) - 2.0 * FIT_INSET_X).max(1.0);
+        let room_y = (f32::from(viewport.height) - 2.0 * FIT_INSET_Y).max(1.0);
+        let zoom = [room_x / span_x, room_y / span_y]
+            .into_iter()
+            .filter(|z| z.is_finite())
+            .fold(1.0_f32, f32::min)
+            .clamp(MIN_ZOOM, 1.0);
+        let middle = point(
+            px(span_x / 2.0),
+            px(f32::midpoint(top, bottom) * ROW_STRIDE),
+        );
+        let window_centre = point(viewport.width / 2.0, viewport.height / 2.0);
+        self.zoom = zoom;
+        self.pan = window_centre - self.anchor(zoom, viewport) - middle * zoom;
     }
 
     /// Pan so `id` is in view, if it is not.
@@ -262,14 +329,25 @@ impl ExplView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.pan += event.delta.pixel_delta(window.line_height());
+        // Scrolling up (or two fingers pushed away) zooms in.
+        let delta = event.delta.pixel_delta(window.line_height());
+        let factor = (f32::from(delta.y) / 240.0).exp();
+        self.zoom_at(factor, event.position, window.viewport_size());
         cx.notify();
     }
 
-    fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<'_, Self>) {
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let viewport = window.viewport_size();
+        let centre = point(viewport.width / 2.0, viewport.height / 2.0);
         match event.keystroke.key.as_str() {
             "escape" => self.selected = None,
-            "0" => self.pan = Point::default(),
+            "0" => {
+                self.pan = Point::default();
+                self.zoom = 1.0;
+            }
+            "=" | "+" => self.zoom_at(ZOOM_STEP, centre, viewport),
+            "-" | "_" => self.zoom_at(1.0 / ZOOM_STEP, centre, viewport),
+            "f" => self.fit(viewport),
             _ => return,
         }
         cx.notify();
@@ -291,6 +369,8 @@ impl ExplView {
 
     fn edges(&self, viewport: Size<Pixels>, lens: &Lens) -> Vec<Line> {
         let by_id: HashMap<NodeId, &Node> = self.snapshot.nodes.iter().map(|n| (n.id, n)).collect();
+        let lineage = &self.snapshot.lineage;
+        let merged = |n: &Node| n.kind == NodeKind::Step && lineage.in_trunk(n.id);
         let mut lines = Vec::with_capacity(self.snapshot.edges.len());
         for edge in &self.snapshot.edges {
             let (Some(source), Some(target)) = (by_id.get(&edge.source), by_id.get(&edge.target))
@@ -312,9 +392,18 @@ impl ExplView {
                     width = 2.0;
                     theme::alpha(theme::text(), 0.7)
                 }
+                // A merged branch joining the spine: as strong as the spine.
+                (NodeKind::Step, NodeKind::Origin) if merged(source) => {
+                    width = 2.0;
+                    theme::alpha(theme::text(), if selected { 0.95 } else { 0.7 })
+                }
                 // Work taken into the trunk.
                 (_, NodeKind::Origin) => {
                     theme::alpha(theme::text(), if selected { 0.6 } else { 0.3 })
+                }
+                // A subgoal and the goal it serves.
+                (NodeKind::Goal, NodeKind::Goal) => {
+                    theme::alpha(theme::text(), if selected { 0.6 } else { 0.25 })
                 }
                 (_, NodeKind::Goal) => {
                     let satisfied = self
@@ -329,6 +418,13 @@ impl ExplView {
                     } else {
                         continue;
                     }
+                }
+                // Along a merged branch, from where it left the spine.
+                (NodeKind::Origin | NodeKind::Step, NodeKind::Step)
+                    if merged(target) && (source.kind == NodeKind::Origin || merged(source)) =>
+                {
+                    width = 1.5;
+                    theme::alpha(theme::text(), if selected { 0.8 } else { 0.5 })
                 }
                 _ if selected => theme::alpha(theme::bright(), 0.4),
                 _ if source.status == NodeStatus::Pruned || target.status == NodeStatus::Pruned => {
@@ -382,13 +478,30 @@ impl ExplView {
             1.0
         };
         let text = if node.kind == NodeKind::Origin {
-            format!("{}  {}", short(node.head_commit.as_deref()), node.title)
+            let merged = self
+                .snapshot
+                .lineage
+                .epoch(id)
+                .map_or(0, |epoch| epoch.absorbed.len());
+            if merged > 0 {
+                format!(
+                    "{}  +{merged}  {}",
+                    short(node.head_commit.as_deref()),
+                    node.title
+                )
+            } else {
+                format!("{}  {}", short(node.head_commit.as_deref()), node.title)
+            }
         } else {
             node.title.clone()
         };
-        let label = (node.status != NodeStatus::Pruned || selected).then(|| {
+        let running = node.status == NodeStatus::Running;
+        let quiet = self.zoom < QUIET_LABELS_BELOW
+            && !(selected || current || running || candidate || node.kind == NodeKind::Goal);
+        let label_w = (LABEL_W * self.zoom).clamp(MIN_LABEL_W, LABEL_W);
+        let label = ((node.status != NodeStatus::Pruned || selected) && !quiet).then(|| {
             div()
-                .max_w(px(LABEL_W))
+                .max_w(px(label_w))
                 .px_1()
                 .bg(theme::background())
                 .truncate()
@@ -400,9 +513,9 @@ impl ExplView {
         div()
             .id(("node", id.0 as u64))
             .absolute()
-            .left(centre.x - px(LABEL_W / 2.0))
+            .left(centre.x - px(label_w / 2.0))
             .top(centre.y - px(DOT_BOX / 2.0))
-            .w(px(LABEL_W))
+            .w(px(label_w))
             .flex()
             .flex_col()
             .items_center()
@@ -497,6 +610,10 @@ impl ExplView {
             .when(current, |el| {
                 el.child(ring(size + 8.0, theme::alpha(theme::text(), 0.6)))
             })
+            // A merge: this origin took work into the trunk.
+            .when(!current && self.merges(node), |el| {
+                el.child(ring(size + 6.0, theme::alpha(theme::text(), 0.45)))
+            })
             .when(selected, |el| {
                 el.child(ring(
                     size + if current { 16.0 } else { 8.0 },
@@ -504,6 +621,16 @@ impl ExplView {
                 ))
             })
             .child(mark)
+    }
+
+    /// Whether `node` is an origin that took steps into the trunk.
+    fn merges(&self, node: &Node) -> bool {
+        node.kind == NodeKind::Origin
+            && self
+                .snapshot
+                .lineage
+                .epoch(node.id)
+                .is_some_and(|epoch| !epoch.adopted.is_empty())
     }
 
     // ------------------------------------------------------------ corners
@@ -728,6 +855,8 @@ impl ExplView {
             })
             .children(goals.into_iter().map(|goal| {
                 let active = goal.status == NodeStatus::Active;
+                // Subgoals sit indented under the goals they serve.
+                let indent = small_f32(self.snapshot.goal_tree.depth(goal.id)) * SUBGOAL_INDENT;
                 let selected = lens.selected == Some(goal.id);
                 let trunk = self.snapshot.trunk_verdict(goal.id).map(|(_, e)| e);
                 let best = self.snapshot.best_open(goal.id);
@@ -758,6 +887,7 @@ impl ExplView {
                     .flex()
                     .items_center()
                     .gap_3()
+                    .pl(px(indent))
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, Self::press(goal.id, true, cx))
                     .child(marker)

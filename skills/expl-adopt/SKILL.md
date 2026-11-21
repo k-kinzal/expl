@@ -32,12 +32,14 @@ expl candidate ls                                   # best first; BEHIND = commi
 expl node inspect N | less                          # evaluations, reasons, predecessors
 git log --oneline main..expl/node-N; git diff main...expl/node-N --stat
 skills/expl-adopt/scripts/check-candidate.sh N      # the gate
-skills/expl-adopt/scripts/adopt.sh N                # gate again + merge --no-ff + cargo install
+skills/expl-adopt/scripts/adopt.sh N                # gate again + merge --no-ff + build & install
 expl origin ls                                      # confirm: new origin, ADOPTED shows #N
 ```
 
 `adopt.sh` refuses unless you are on a clean `main`. It installs the adopted expl
-(`cargo install --path expl_cli`) so newly started processes run it. Pass
+with `skills/expl-operate/scripts/install.sh`, so newly started processes run it;
+then run `skills/expl-operate/scripts/rolling-restart.sh` to move the running
+processes over as each goes idle. Pass
 `--restart` (`adopt.sh --restart N`) to restart all processes right away — do this
 when the adoption changes the database schema, the inbox/process/graph code the
 running processes depend on, or fixes a bug they suffer from. Otherwise prefer to

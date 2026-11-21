@@ -161,6 +161,10 @@ pub(crate) struct GoalAddArgs {
     /// Also explore backward from this goal (counter-exploration).
     #[arg(long)]
     pub(crate) counter: bool,
+    /// Make it a subgoal of this goal: a hypothesis about a route toward it
+    /// (repeatable).
+    #[arg(long, value_name = "GOAL")]
+    pub(crate) under: Vec<NodeId>,
 }
 
 /// `expl goal ls`.

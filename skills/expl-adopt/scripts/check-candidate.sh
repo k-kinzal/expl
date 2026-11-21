@@ -43,8 +43,12 @@ cd "$work"
 cargo fmt --all --check || { echo "REJECT: cargo fmt --check fails"; exit 5; }
 cargo clippy --all-targets --quiet 2>&1 | tail -20
 [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "REJECT: cargo clippy fails"; exit 5; }
-cargo test --quiet 2>&1 | grep -E 'test result|FAILED|panicked|error' || true
-cargo test --quiet >/dev/null 2>&1 || { echo "REJECT: cargo test fails"; exit 5; }
+# One run decides: a second run could pass a flaky test the first failed.
+log="$work/.cargo-test.log"
+status=0
+cargo test --quiet >"$log" 2>&1 || status=$?
+grep -E 'test result|FAILED|panicked|error' "$log" || true
+[ "$status" -eq 0 ] || { echo "REJECT: cargo test fails"; exit 5; }
 
 echo "OK: ${branch} is safe to adopt into ${trunk}"
 git -C "$repo" log --oneline "${trunk}..${branch}"

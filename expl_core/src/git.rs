@@ -155,4 +155,49 @@ impl Git {
         let out = self.run(&["diff", "--name-only", "--diff-filter=U"])?;
         Ok(out.lines().map(str::to_owned).collect())
     }
+
+    /// Whether `revision` names a commit in this repository.
+    ///
+    /// # Errors
+    ///
+    /// [`GitError`] when git cannot start or fails other than by not
+    /// finding the commit.
+    pub fn has_commit(&self, revision: &str) -> Result<bool, GitError> {
+        let spec = format!("{revision}^{{commit}}");
+        self.test(&["rev-parse", "--verify", "--quiet", &spec])
+    }
+
+    /// The tree that merging `theirs` into `ours` would produce, without
+    /// touching any worktree or index; `None` when the merge conflicts.
+    /// Histories without a common ancestor merge from the empty tree.
+    ///
+    /// # Errors
+    ///
+    /// [`GitError`] when git cannot start or fails other than by a
+    /// conflict.
+    pub fn merge_tree(&self, ours: &str, theirs: &str) -> Result<Option<String>, GitError> {
+        let args = [
+            "merge-tree",
+            "--write-tree",
+            "--allow-unrelated-histories",
+            ours,
+            theirs,
+        ];
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&self.dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(GitError::Spawn)?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        match (output.status.code(), stdout.lines().next()) {
+            (Some(0), Some(tree)) if !tree.trim().is_empty() => Ok(Some(tree.trim().to_owned())),
+            (Some(1), _) => Ok(None),
+            _ => Err(GitError::Failed {
+                args: args.join(" "),
+                dir: self.dir.display().to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            }),
+        }
+    }
 }

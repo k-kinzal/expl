@@ -5,8 +5,8 @@
 #
 # Runs check-candidate.sh first and refuses on any failure. The merge is a
 # --no-ff merge so the lineage keeps the step's commits as they were made.
-# Because the repository is expl itself, the adopted code is installed
-# (`cargo install`), so processes started from now on run it. With
+# Because the repository is expl itself, the adopted code is built and
+# installed over the `expl` on PATH, so processes started from now on run it. With
 # --restart every process is restarted at once; this interrupts in-flight
 # agent runs (their events are redelivered), so use it when the adoption
 # changes the database schema or fixes something the running processes need.
@@ -28,7 +28,7 @@ cd "$repo"
 title="$(expl node inspect "$node" | python3 -c 'import json,sys; print(json.load(sys.stdin)["node"]["title"])')"
 git merge --no-ff "expl/node-${node}" -m "Adopt #${node}: ${title}"
 
-cargo install --quiet --locked --path expl_cli
+"$here/../../expl-operate/scripts/install.sh"
 if git diff --name-only HEAD^1 HEAD | grep -qE 'expl_core/src/(store|graph/graph|event/inbox|process/)'; then
   echo "note: the adoption touches the store, graph, inbox or process code; restart processes soon"
 fi
@@ -37,5 +37,5 @@ if [ "$restart" = 1 ]; then
   expl up
   echo "adopted #${node}; processes restarted on the new expl"
 else
-  echo "adopted #${node}; new expl installed (running processes keep the old binary until restarted)"
+  echo "adopted #${node}; new expl installed — run skills/expl-operate/scripts/rolling-restart.sh"
 fi

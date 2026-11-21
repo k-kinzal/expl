@@ -10,8 +10,11 @@
 //!
 //! Git is the ground truth for what was taken in. A completed step is
 //! adopted when the new trunk contains its work and the previous one did
-//! not: by history (a merge or fast-forward), or by patch (`git cherry`:
-//! squash merges and cherry-picks of the step's commits).
+//! not: by history (a merge or fast-forward), by patch (`git cherry`:
+//! squash merges and cherry-picks of the step's commits), or by content
+//! (merging the step into the trunk would change nothing: a squash merge
+//! of several commits, of a step together with the not-yet-adopted steps
+//! it built on, or of a joined step and its merges).
 //!
 //! Every running [process](crate::process::Process) follows the trunk, so
 //! it is enough to merge: the origin moves within seconds.
@@ -70,6 +73,15 @@ pub struct Advance {
     pub descends: bool,
 }
 
+/// One reading of the trunk: its tip as a new origin, with adoption
+/// computed against the origin that was active when it was read.
+#[derive(Debug, Clone)]
+struct Observation {
+    origin: NewOrigin,
+    branch: String,
+    descends: bool,
+}
+
 /// The project's trunk. See the [module docs](self).
 #[derive(Debug, Clone)]
 pub struct Trunk {
@@ -93,12 +105,52 @@ impl Trunk {
     /// `origin.advanced`. `None` when there is no trunk to follow, or it
     /// has not moved (or another process recorded the move first).
     ///
+    /// Adoption is computed against the active origin. If another process
+    /// records a move meanwhile, this observation is stale and recording it
+    /// is refused; the trunk is read again and adoption recomputed from the
+    /// origin that is active now.
+    ///
     /// # Errors
     ///
     /// [`TrunkError::MissingBranch`] when the trunk branch does not exist;
     /// [`TrunkError::Ancestry`] when git cannot tell what the trunk holds
     /// (nothing is recorded then); [`TrunkError::Graph`] on graph failure.
     pub fn follow(&self, graph: &mut Graph) -> Result<Option<Advance>, TrunkError> {
+        let observation = self.observe(graph)?;
+        self.record(graph, observation)
+    }
+
+    /// Record `observation`, reading the trunk again for as long as another
+    /// process has recorded a move since the observation was made.
+    fn record(
+        &self,
+        graph: &mut Graph,
+        mut observation: Option<Observation>,
+    ) -> Result<Option<Advance>, TrunkError> {
+        loop {
+            let Some(seen) = observation else {
+                return Ok(None);
+            };
+            match graph.advance_origin(&seen.origin) {
+                Ok(recorded) => {
+                    return Ok(recorded.map(|origin| Advance {
+                        origin,
+                        previous: seen.origin.previous,
+                        commit: seen.origin.commit,
+                        branch: seen.branch,
+                        adopted: seen.origin.adopted,
+                        descends: seen.descends,
+                    }));
+                }
+                Err(GraphError::OriginMoved { .. }) => observation = self.observe(graph)?,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// Read the trunk's tip and what it adopts relative to the active
+    /// origin. `None` when there is no trunk to follow, or it has not moved.
+    fn observe(&self, graph: &Graph) -> Result<Option<Observation>, TrunkError> {
         let current = graph.origin()?;
         let Some(branch) = self
             .branch
@@ -130,8 +182,13 @@ impl Trunk {
             if lineage.in_trunk(step.id) {
                 continue;
             }
-            let already = !previous.is_empty() && self.takes_in(&previous, head)?;
-            if !already && self.takes_in(&commit, head)? {
+            // A step whose tip is still a predecessor's committed nothing.
+            let committed = !graph
+                .predecessors(step.id)?
+                .iter()
+                .any(|p| p.head_commit.as_deref() == Some(head));
+            let already = !previous.is_empty() && self.takes_in(&previous, head, committed)?;
+            if !already && self.takes_in(&commit, head, committed)? {
                 adopted.insert(step.id);
             }
         }
@@ -157,19 +214,16 @@ impl Trunk {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "Origin".to_owned());
-        let recorded = graph.advance_origin(&NewOrigin {
-            title,
-            note: String::new(),
-            branch: Some(branch.clone()),
-            commit: commit.clone(),
-            adopted: newest.clone(),
-        })?;
-        Ok(recorded.map(|origin| Advance {
-            origin,
-            previous: current.id,
-            commit,
+        Ok(Some(Observation {
+            origin: NewOrigin {
+                previous: current.id,
+                title,
+                note: String::new(),
+                branch: Some(branch.clone()),
+                commit,
+                adopted: newest,
+            },
             branch,
-            adopted: newest,
             descends,
         }))
     }
@@ -186,23 +240,36 @@ impl Trunk {
     }
 
     /// Whether `trunk` holds the work of the step whose tip is `head`: by
-    /// history, or because every commit of the step has an equivalent patch
-    /// in `trunk` (squash merges, cherry-picks). A step that committed
-    /// nothing is held only by history.
+    /// history; because every commit of the step has an equivalent patch in
+    /// `trunk` (squash merges, cherry-picks); or because merging `head`
+    /// into `trunk` yields `trunk`'s own tree (squash merges of several
+    /// commits, of predecessors, or of joins). A step that has not
+    /// `committed` anything is held only by history.
     ///
     /// # Errors
     ///
     /// [`TrunkError::Ancestry`] when git fails, e.g. on an unknown commit.
-    fn takes_in(&self, trunk: &str, head: &str) -> Result<bool, TrunkError> {
+    fn takes_in(&self, trunk: &str, head: &str, committed: bool) -> Result<bool, TrunkError> {
         if self.contains(trunk, head)? {
             return Ok(true);
         }
-        let listing = self
-            .git
-            .run(&["cherry", trunk, head])
-            .map_err(|source| ancestry(trunk, head, source))?;
+        if !committed {
+            return Ok(false);
+        }
+        let failed = |source| ancestry(trunk, head, source);
+        let listing = self.git.run(&["cherry", trunk, head]).map_err(failed)?;
         let lines: Vec<&str> = listing.lines().filter(|l| !l.trim().is_empty()).collect();
-        Ok(!lines.is_empty() && lines.iter().all(|l| l.starts_with('-')))
+        if !lines.is_empty() && lines.iter().all(|l| l.starts_with('-')) {
+            return Ok(true);
+        }
+        let Some(merged) = self.git.merge_tree(trunk, head).map_err(failed)? else {
+            return Ok(false);
+        };
+        let tree = self
+            .git
+            .run(&["rev-parse", &format!("{trunk}^{{tree}}")])
+            .map_err(failed)?;
+        Ok(merged == tree)
     }
 }
 
@@ -217,6 +284,7 @@ fn ancestry(trunk: &str, commit: &str, source: GitError) -> TrunkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::EventKind;
     use crate::workspace::Workspaces;
     use std::path::Path;
 
@@ -261,31 +329,42 @@ mod tests {
 
         /// A completed step after `after`, committing `file` (or nothing).
         fn step(&mut self, after: NodeId, file: Option<&str>) -> NodeId {
+            self.join(&[after], file.as_slice())
+        }
+
+        /// A completed step after every node of `after`: its branch starts
+        /// at the first one's commit and merges the others' (as a joined
+        /// step's workspace does), then commits each of `files` in turn.
+        fn join(&mut self, after: &[NodeId], files: &[&str]) -> NodeId {
             let id = self
                 .graph
-                .propose_step("step", "step", &[after], &[])
+                .propose_step("step", "step", after, &[])
                 .expect("step");
-            let base = self
-                .graph
-                .node(after)
-                .expect("after")
-                .head_commit
-                .expect("commit");
+            let commits: Vec<String> = after
+                .iter()
+                .map(|&n| {
+                    self.graph
+                        .node(n)
+                        .expect("after")
+                        .head_commit
+                        .expect("commit")
+                })
+                .collect();
             let branch = Workspaces::branch_name(id);
-            git(&self.root, &["branch", &branch, &base]);
-            let head = if let Some(file) = file {
-                let path = self.project.state_dir().join(format!("wt-{}", id.0));
-                let path_text = path.display().to_string();
-                git(&self.root, &["worktree", "add", "-q", &path_text, &branch]);
+            git(&self.root, &["branch", &branch, &commits[0]]);
+            let path = self.project.state_dir().join(format!("wt-{}", id.0));
+            let path_text = path.display().to_string();
+            git(&self.root, &["worktree", "add", "-q", &path_text, &branch]);
+            for commit in &commits[1..] {
+                git(&path, &["merge", "-q", "--no-ff", "--no-edit", commit]);
+            }
+            for file in files {
                 std::fs::write(path.join(file), format!("{file} by {id}")).expect("write");
                 git(&path, &["add", "."]);
                 git(&path, &["commit", "-q", "-m", file]);
-                let head = git(&path, &["rev-parse", "HEAD"]);
-                git(&self.root, &["worktree", "remove", "--force", &path_text]);
-                head
-            } else {
-                base
-            };
+            }
+            let head = git(&path, &["rev-parse", "HEAD"]);
+            git(&self.root, &["worktree", "remove", "--force", &path_text]);
             self.graph
                 .set_branch(id, &branch, Some(&head))
                 .expect("branch");
@@ -293,6 +372,22 @@ mod tests {
             assert!(self.graph.claim(id, false).expect("claim"));
             self.graph.complete(id, "done").expect("complete");
             id
+        }
+
+        /// Squash-merge `step`'s branch into `main` as one commit.
+        fn squash(&self, step: NodeId, message: &str) {
+            let branch = Workspaces::branch_name(step);
+            git(&self.root, &["merge", "-q", "--squash", &branch]);
+            git(&self.root, &["commit", "-q", "-m", message]);
+        }
+
+        /// Whether `origin.advanced` was recorded for `origin`.
+        fn advanced_to(&self, origin: NodeId) -> bool {
+            self.graph
+                .events(None, usize::MAX)
+                .expect("events")
+                .iter()
+                .any(|e| e.kind == EventKind::OriginAdvanced && e.node == Some(origin))
         }
     }
 
@@ -369,9 +464,114 @@ mod tests {
             Err(TrunkError::Ancestry { .. })
         ));
         assert!(matches!(
-            trunk.takes_in("HEAD", gone),
+            trunk.takes_in("HEAD", gone, true),
             Err(TrunkError::Ancestry { .. })
         ));
+    }
+
+    #[test]
+    fn a_stale_observation_records_nothing() {
+        let mut fx = Fixture::new();
+        let first = fx.graph.origin().expect("origin").id;
+        let a = fx.step(first, Some("a.txt"));
+        let b = fx.step(first, Some("b.txt"));
+        let c = fx.step(first, Some("c.txt"));
+        // Two processes, each with its own connection to the graph.
+        let mut slow = Graph::open(&fx.project.database_path()).expect("graph");
+        let slow_trunk = Trunk::new(&fx.project, Some("main"));
+        let fast_trunk = Trunk::new(&fx.project, Some("main"));
+        let merge = |fx: &Fixture, step: NodeId| {
+            let branch = Workspaces::branch_name(step);
+            git(
+                &fx.root,
+                &["merge", "-q", "--no-ff", "-m", &branch, &branch],
+            );
+            git(&fx.root, &["rev-parse", "HEAD"])
+        };
+        let advanced = |graph: &Graph| {
+            graph
+                .events(None, 1000)
+                .expect("events")
+                .into_iter()
+                .filter(|e| e.kind == EventKind::OriginAdvanced)
+                .count()
+        };
+
+        // The slow follower reads the trunk after `a` was merged...
+        let at_a = merge(&fx, a);
+        let older = slow_trunk.observe(&slow).expect("observe").expect("moved");
+        assert_eq!(
+            (older.origin.previous, older.origin.commit.as_str()),
+            (first, at_a.as_str())
+        );
+        assert_eq!(older.origin.adopted, vec![a]);
+
+        // ...the trunk takes in `b`, and the fast one records that first.
+        let at_b = merge(&fx, b);
+        let newer = fast_trunk
+            .follow(&mut fx.graph)
+            .expect("follow")
+            .expect("moved");
+        assert_eq!(
+            (newer.previous, newer.commit.as_str()),
+            (first, at_b.as_str())
+        );
+        assert_eq!(newer.adopted, vec![a, b]);
+
+        // The older observation finishes last and records nothing: no
+        // origin, no adoption edge, no `origin.advanced`.
+        assert!(matches!(
+            slow.advance_origin(&older.origin),
+            Err(GraphError::OriginMoved { expected, current })
+                if expected == first && current == newer.origin
+        ));
+        let (origins, edges, events) = (
+            slow.origins().expect("origins"),
+            slow.edges().expect("edges"),
+            advanced(&slow),
+        );
+        assert_eq!(
+            slow_trunk.record(&mut slow, Some(older)).expect("record"),
+            None
+        );
+        assert_eq!(slow.origins().expect("origins"), origins);
+        assert_eq!(slow.edges().expect("edges"), edges);
+        assert_eq!(advanced(&slow), events);
+        assert_eq!(events, 1);
+        let current = slow.origin().expect("origin");
+        assert_eq!(
+            (current.id, current.head_commit),
+            (newer.origin, Some(at_b))
+        );
+        assert!(
+            origins
+                .iter()
+                .all(|o| o.head_commit.as_deref() != Some(&at_a))
+        );
+
+        // A stale observation of a trunk that moved on again is recomputed
+        // from the origin active now: `c`, not `a` again.
+        let at_c = merge(&fx, c);
+        let older = slow_trunk.observe(&slow).expect("observe").expect("moved");
+        assert_eq!(older.origin.adopted, vec![c]);
+        let latest = fast_trunk
+            .follow(&mut fx.graph)
+            .expect("follow")
+            .expect("moved");
+        assert_eq!(latest.commit, at_c);
+        std::fs::write(fx.root.join("README"), "edited\n").expect("write");
+        git(&fx.root, &["commit", "-q", "-am", "edit readme"]);
+        let edited = git(&fx.root, &["rev-parse", "HEAD"]);
+        let recomputed = slow_trunk
+            .record(&mut slow, Some(older))
+            .expect("record")
+            .expect("moved");
+        assert_eq!(recomputed.previous, latest.origin);
+        assert_eq!(recomputed.commit, edited);
+        assert!(recomputed.adopted.is_empty());
+        assert_eq!(advanced(&slow), 3);
+        assert_eq!(slow.origins().expect("origins").len(), 4);
+        assert_eq!(slow.successors(c).expect("successors").len(), 1);
     }
 
     #[test]
@@ -387,5 +587,82 @@ mod tests {
         git(&fx.root, &["commit", "-q", "-am", "edit"]);
         let trunk = Trunk::new(&fx.project, None);
         assert!(trunk.follow(&mut fx.graph).expect("follow").is_some());
+    }
+
+    #[test]
+    fn squashing_a_step_with_its_predecessor_adopts_both() {
+        let mut fx = Fixture::new();
+        let origin = fx.graph.origin().expect("origin").id;
+        let a = fx.step(origin, Some("a.txt"));
+        let b = fx.step(a, Some("b.txt"));
+        let idle = fx.step(a, None);
+        let trunk = Trunk::new(&fx.project, Some("main"));
+
+        // Neither a nor b is in the trunk; b is squashed as one commit
+        // holding both, so no trunk commit matches either step's patch.
+        fx.squash(b, "squashed b");
+        let advance = trunk.follow(&mut fx.graph).expect("follow").expect("moved");
+        assert!(fx.advanced_to(advance.origin));
+        assert_eq!(
+            advance.adopted,
+            vec![b],
+            "a comes with b; idle committed nothing"
+        );
+        let lineage = fx.graph.lineage().expect("lineage");
+        assert!(lineage.in_trunk(a) && lineage.in_trunk(b));
+        assert!(!lineage.in_trunk(idle));
+        assert_eq!(trunk.follow(&mut fx.graph).expect("again"), None);
+    }
+
+    #[test]
+    fn squashing_a_joined_step_adopts_it() {
+        let mut fx = Fixture::new();
+        let origin = fx.graph.origin().expect("origin").id;
+        let a = fx.step(origin, Some("a.txt"));
+        let c = fx.step(origin, Some("c.txt"));
+        let joined = fx.join(&[a, c], &["j.txt"]);
+        let branch = Workspaces::branch_name(joined);
+        let parents = git(
+            &fx.root,
+            &["log", "-1", "--format=%P", &format!("{branch}~1")],
+        );
+        assert_eq!(parents.split_whitespace().count(), 2, "a merge commit");
+        let trunk = Trunk::new(&fx.project, Some("main"));
+
+        fx.squash(joined, "squashed join");
+        let advance = trunk.follow(&mut fx.graph).expect("follow").expect("moved");
+        assert!(fx.advanced_to(advance.origin));
+        assert_eq!(advance.adopted, vec![joined], "a and c come with it");
+        let lineage = fx.graph.lineage().expect("lineage");
+        assert!(lineage.in_trunk(a) && lineage.in_trunk(c) && lineage.in_trunk(joined));
+    }
+
+    #[test]
+    fn a_partial_squash_adopts_nothing_until_the_rest_follows() {
+        let mut fx = Fixture::new();
+        let origin = fx.graph.origin().expect("origin").id;
+        let step = fx.join(&[origin], &["one.txt", "two.txt"]);
+        let trunk = Trunk::new(&fx.project, Some("main"));
+
+        // Take in the step, but leave `two.txt` out.
+        git(
+            &fx.root,
+            &["merge", "-q", "--squash", &Workspaces::branch_name(step)],
+        );
+        git(&fx.root, &["rm", "-q", "--cached", "two.txt"]);
+        std::fs::remove_file(fx.root.join("two.txt")).expect("remove");
+        git(&fx.root, &["commit", "-q", "-m", "partial"]);
+        let partial = trunk.follow(&mut fx.graph).expect("follow").expect("moved");
+        assert!(partial.adopted.is_empty());
+        assert!(!fx.graph.lineage().expect("lineage").in_trunk(step));
+
+        // The rest arrives in a later commit: now the trunk holds it all.
+        git(
+            &fx.root,
+            &["checkout", &Workspaces::branch_name(step), "--", "two.txt"],
+        );
+        git(&fx.root, &["commit", "-q", "-m", "the rest"]);
+        let rest = trunk.follow(&mut fx.graph).expect("follow").expect("moved");
+        assert_eq!(rest.adopted, vec![step]);
     }
 }

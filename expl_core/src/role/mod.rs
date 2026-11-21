@@ -8,7 +8,7 @@
 //!
 //! | Role | Reacts to | Works in | Changes the graph by (events) |
 //! | --- | --- | --- | --- |
-//! | exploration | `goal.added`, `node.evaluated`, `origin.advanced`, `node.revisited` | scratch at the starting node | proposing steps (`node.proposed`) |
+//! | exploration | `goal.added`, `node.evaluated`, `node.failed`, `origin.advanced`, `node.revisited` | scratch at the starting node | proposing steps (`node.proposed`) |
 //! | planning | `node.proposed`, `node.evaluated`, `node.failed`, `goal.retired`, `origin.advanced` | scratch at the origin | recording a plan, joins, priorities, prunes (`plan.recorded`, `node.planned`, `node.ready`, `node.pruned`) |
 //! | execution | `node.ready` | the step's own worktree | committing the step (`node.started`, `node.completed` / `node.failed`, successors' `node.ready`) |
 //! | evaluation | `node.completed`, `origin.advanced` | scratch at the step (or origin) | recording verdicts (`node.evaluated`) |
@@ -16,17 +16,20 @@
 //! `origin.advanced` means the trunk moved: a human merged into the
 //! default branch, and a process following it recorded the new origin. Exploration starts again from the new origin,
 //! evaluation judges where the trunk now stands against every goal, and
-//! planning re-plans the steps that were moved onto it.
+//! planning decides which steps that have not started move onto it.
 //!
 //! Exploration has a [`Direction`]: forward from a realised node toward the
-//! goals, or backward from a goal — **counter-exploration**, done when the
-//! goal asks for it.
+//! goals, backward from a goal — **counter-exploration**, done when the
+//! goal asks for it — past a failed step (new hypotheses in its place),
+//! ahead of a step not carried out yet (assuming it succeeds), or,
+//! for an agent declared with `scope = "graph"`, across the whole graph.
 //!
 //! Roles never print and never decide *when* they run: a
 //! [`Process`](crate::process::Process) hands them one event at a time.
 //!
 //! An agent knows only its work: a role's prompt carries the task and the
-//! information it needs, never expl, the rest of the graph, or other agents.
+//! information it needs, never expl or other agents; only planning and a
+//! graph-wide exploration see the whole graph.
 //! Operator `instructions` are the only addition.
 
 mod context;
@@ -96,6 +99,7 @@ impl Role {
             Self::Exploration => &[
                 EventKind::GoalAdded,
                 EventKind::NodeEvaluated,
+                EventKind::NodeFailed,
                 EventKind::OriginAdvanced,
                 EventKind::NodeRevisited,
             ],
@@ -124,7 +128,8 @@ impl Role {
     /// (`node.revisited`), if it revisits at all. Exploration does when
     /// `revisit_cooldown` is declared: one exploration never exhausts a
     /// node, so every starting point keeps growing new steps for as long as
-    /// the process runs (bounded by `max_pending`).
+    /// the process runs. Exploration is never held back by how many steps
+    /// wait: crowding is planning's to sort out.
     #[must_use]
     pub fn revisit_cooldown(self, agent: &Agent) -> Option<std::time::Duration> {
         match self {
@@ -137,30 +142,12 @@ impl Role {
     }
 
     /// Whether one reaction covers every event of this role recorded
-    /// before it started. Planning reads the whole graph, so the events
+    /// before it started — or, when its [`Report::covered`] says so, before
+    /// the graph it was shown. Planning reads the whole graph, so the events
     /// that piled up while it was busy need no reaction of their own.
     #[must_use]
     pub fn coalesces(self) -> bool {
         matches!(self, Self::Planning)
-    }
-
-    /// Why an agent of this role should not lease events right now, if it
-    /// should not. Exploration pauses while `max_pending` steps await
-    /// execution, so proposals cannot outrun execution.
-    ///
-    /// # Errors
-    ///
-    /// [`GraphError`] on graph failure.
-    pub fn pause(self, agent: &Agent, graph: &Graph) -> Result<Option<String>, GraphError> {
-        match self {
-            Self::Exploration => {
-                let limit = agent.declaration().max_pending.unwrap_or(usize::MAX);
-                let pending = graph.pending_count()?;
-                Ok((pending >= limit)
-                    .then(|| format!("paused: {pending} steps pending (max_pending = {limit})")))
-            }
-            Self::Planning | Self::Execution | Self::Evaluation => Ok(None),
-        }
     }
 
     /// React to the reaction's event.
@@ -215,6 +202,12 @@ pub enum Direction {
     Forward,
     /// From a goal back toward the origin (counter-exploration).
     Backward,
+    /// From a failed step: new hypotheses in its place.
+    Failure,
+    /// Past a step not carried out yet, assuming it succeeds.
+    Ahead,
+    /// Across the whole graph at once, from no particular node.
+    Survey,
 }
 
 impl fmt::Display for Direction {
@@ -222,6 +215,9 @@ impl fmt::Display for Direction {
         f.write_str(match self {
             Self::Forward => "forward",
             Self::Backward => "backward",
+            Self::Failure => "past the failure",
+            Self::Ahead => "ahead",
+            Self::Survey => "across the graph",
         })
     }
 }
@@ -249,6 +245,19 @@ pub enum Report {
 }
 
 impl Report {
+    /// The newest event this reaction took into account, when it says so:
+    /// a coalescing role covers its events up to here and no further.
+    #[must_use]
+    pub fn covered(&self) -> Option<crate::event::EventId> {
+        match self {
+            Self::Planning(p) => p.covered,
+            Self::Exploration { .. }
+            | Self::Execution(_)
+            | Self::Evaluation(_)
+            | Self::Ignored { .. } => None,
+        }
+    }
+
     /// One line for logs and delivery notes.
     #[must_use]
     pub fn summary(&self) -> String {
@@ -280,11 +289,12 @@ impl Report {
                 .collect::<Vec<_>>()
                 .join("; "),
             Self::Planning(p) => format!(
-                "plan {}: {} path(s), planned {}, joined {}, pruned {}",
+                "plan {}: {} path(s), planned {}, joined {}, rebased {}, pruned {}",
                 p.plan.0,
                 p.paths,
                 ids(&p.planned),
                 ids(&p.joined),
+                ids(&p.rebased),
                 ids(&p.pruned)
             ),
             Self::Execution(e) => format!(

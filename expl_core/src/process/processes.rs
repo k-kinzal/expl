@@ -11,10 +11,18 @@ use crate::store::{self, EPOCH, NOW, StoreError};
 pub const HEARTBEAT_SECONDS: u64 = 2;
 /// A running process that has not beaten for this long is dead.
 pub const STALE_SECONDS: i64 = 15;
+/// A created record must be adopted within this long, or it is abandoned.
+pub const STARTUP_SECONDS: i64 = 30;
+
+/// Created and past its startup deadline (also without one).
+const EXPIRED: &str =
+    "status = 'created' AND COALESCE(start_by, 0) < CAST(strftime('%s','now') AS INTEGER)";
 
 const COLUMNS: &str = "id, name, agent, pid, status, detached, log_path, stop_requested, \
                        activity, exit_reason, created_at, finished_at, \
-                       COALESCE(CAST(strftime('%s','now') AS INTEGER) - heartbeat_at, 0)";
+                       COALESCE(CAST(strftime('%s','now') AS INTEGER) - heartbeat_at, 0), \
+                       strftime('%Y-%m-%dT%H:%M:%SZ', start_by, 'unixepoch'), \
+                       COALESCE(start_by, 0) < CAST(strftime('%s','now') AS INTEGER)";
 
 /// See the [module docs](crate::process).
 pub struct Processes {
@@ -38,7 +46,9 @@ fn record_from_row(row: &Row<'_>) -> rusqlite::Result<ProcessRecord> {
         )
     })?;
     let silence: i64 = row.get(12)?;
+    let overdue: bool = row.get(14)?;
     let state = match status {
+        ProcessStatus::Created if overdue => ProcessState::Dead,
         ProcessStatus::Created => ProcessState::Created,
         ProcessStatus::Running if silence > STALE_SECONDS => ProcessState::Dead,
         ProcessStatus::Running => ProcessState::Running,
@@ -56,6 +66,7 @@ fn record_from_row(row: &Row<'_>) -> rusqlite::Result<ProcessRecord> {
         activity: row.get(8)?,
         exit_reason: row.get(9)?,
         created_at: row.get(10)?,
+        start_by: row.get(13)?,
         finished_at: row.get(11)?,
     })
 }
@@ -73,7 +84,8 @@ impl Processes {
         })
     }
 
-    /// Register a process of `agent`, named `name` or `<agent>-<id>`.
+    /// Register a process of `agent`, named `name` or `<agent>-<id>`, to
+    /// be adopted within [`STARTUP_SECONDS`].
     ///
     /// # Errors
     ///
@@ -84,10 +96,14 @@ impl Processes {
         name: Option<&str>,
         detached: bool,
     ) -> Result<ProcessRecord, rusqlite::Error> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
-            "INSERT INTO processes (name, agent, status, detached, log_path) \
-             VALUES (?1, ?2, 'created', ?3, '')",
+            &format!(
+                "INSERT INTO processes (name, agent, status, detached, log_path, start_by) \
+                 VALUES (?1, ?2, 'created', ?3, '', {EPOCH} + {STARTUP_SECONDS})"
+            ),
             params![
                 name.map_or_else(
                     || format!("{agent}-pending-{}", std::process::id()),
@@ -168,20 +184,58 @@ impl Processes {
         Ok(records)
     }
 
-    /// The OS process `pid` adopted the record and is running.
+    /// The OS process `pid` adopts the record and is running. Adoption is
+    /// one conditional write: it succeeds only while the record is still
+    /// created and within its startup deadline, so a record is adopted at
+    /// most once and never after it was abandoned. Returns whether `pid`
+    /// adopted it.
     ///
     /// # Errors
     ///
     /// SQLite failure.
-    pub fn start(&self, id: ProcessId, pid: u32) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
+    pub fn start(&self, id: ProcessId, pid: u32) -> Result<bool, rusqlite::Error> {
+        let adopted = self.conn.execute(
             &format!(
                 "UPDATE processes SET status = 'running', pid = ?2, heartbeat_at = {EPOCH} \
-                 WHERE id = ?1"
+                 WHERE id = ?1 AND status = 'created' AND start_by >= {EPOCH}"
             ),
             params![id.0, pid],
         )?;
-        Ok(())
+        Ok(adopted == 1)
+    }
+
+    /// Mark every created record past its startup deadline exited, so the
+    /// replica slot an interrupted launch held is free again. Returns the
+    /// records abandoned.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failure.
+    pub fn abandon_unstarted(&self) -> Result<Vec<ProcessRecord>, rusqlite::Error> {
+        let ids = {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT id FROM processes WHERE {EXPIRED} ORDER BY id"
+            ))?;
+            stmt.query_map([], |r| r.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let reason = format!("abandoned: not adopted within {STARTUP_SECONDS}s");
+        let mut abandoned = Vec::new();
+        for id in ids {
+            // Re-checked in the write: the record may have been adopted or
+            // abandoned by someone else since it was read.
+            let changed = self.conn.execute(
+                &format!(
+                    "UPDATE processes SET status = 'exited', activity = NULL, exit_reason = ?2, \
+                     finished_at = {NOW} WHERE id = ?1 AND {EXPIRED}"
+                ),
+                params![id, reason],
+            )?;
+            if changed == 1 {
+                abandoned.push(self.get(ProcessId(id))?);
+            }
+        }
+        Ok(abandoned)
     }
 
     /// Beat; returns whether a stop was requested.
@@ -260,5 +314,69 @@ impl Processes {
         self.conn
             .execute("DELETE FROM processes WHERE id = ?1", [id.0])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table() -> (tempfile::TempDir, Processes) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = Processes::open(&dir.path().join("expl.db"), dir.path()).expect("open");
+        (dir, table)
+    }
+
+    fn age(table: &Processes, id: ProcessId) {
+        table
+            .conn
+            .execute(
+                &format!("UPDATE processes SET start_by = {EPOCH} - 1 WHERE id = ?1"),
+                [id.0],
+            )
+            .expect("age");
+    }
+
+    #[test]
+    fn a_created_record_is_adopted_once() {
+        let (_dir, mut table) = table();
+        let record = table.create("explorer", None, true).expect("create");
+        assert_eq!(record.state, ProcessState::Created);
+        assert!(record.start_by.is_some());
+        assert!(table.start(record.id, 1).expect("start"));
+        assert!(!table.start(record.id, 2).expect("start"));
+        assert_eq!(table.get(record.id).expect("get").pid, Some(1));
+        assert!(table.abandon_unstarted().expect("abandon").is_empty());
+    }
+
+    #[test]
+    fn an_overdue_record_is_dead_abandoned_and_unadoptable() {
+        let (_dir, mut table) = table();
+        let overdue = table.create("explorer", None, true).expect("create");
+        let fresh = table.create("explorer", None, true).expect("create");
+        age(&table, overdue.id);
+        let record = table.get(overdue.id).expect("get");
+        assert_eq!(record.state, ProcessState::Dead);
+        assert!(!record.is_live());
+
+        let abandoned = table.abandon_unstarted().expect("abandon");
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].id, overdue.id);
+        assert_eq!(abandoned[0].state, ProcessState::Exited);
+        assert!(!table.start(overdue.id, 1).expect("start"));
+        assert_eq!(table.get(overdue.id).expect("get").pid, None);
+        assert_eq!(
+            table.get(fresh.id).expect("get").state,
+            ProcessState::Created
+        );
+    }
+
+    #[test]
+    fn an_overdue_record_cannot_be_adopted_before_it_is_abandoned() {
+        let (_dir, mut table) = table();
+        let record = table.create("explorer", None, true).expect("create");
+        age(&table, record.id);
+        assert!(!table.start(record.id, 1).expect("start"));
+        assert_eq!(table.get(record.id).expect("get").state, ProcessState::Dead);
     }
 }

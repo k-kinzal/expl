@@ -36,6 +36,14 @@ pub enum ProcessError {
     /// The graph failed.
     #[error(transparent)]
     Graph(#[from] GraphError),
+    /// The record was no longer there to adopt: it already started,
+    /// exited, or missed its startup deadline (and its replica slot may
+    /// have gone to a replacement).
+    #[error(
+        "process {0} cannot be adopted: it is no longer a created record within its startup \
+         deadline"
+    )]
+    NotAdoptable(ProcessId),
 }
 
 /// How long a process lives.
@@ -53,8 +61,6 @@ pub struct ProcessOptions {
 pub enum ProcessActivity<'a> {
     /// The process adopted its record.
     Started(&'a ProcessRecord),
-    /// Leasing is paused (e.g. too many steps pending).
-    Paused(&'a str),
     /// The trunk moved and the origin followed it.
     Followed(&'a Advance),
     /// The trunk cannot be followed (reported once per distinct reason).
@@ -142,7 +148,8 @@ impl<'a> Process<'a> {
     /// # Errors
     ///
     /// [`ProcessError`] when the database fails; the record is marked
-    /// exited with the error.
+    /// exited with the error. [`ProcessError::NotAdoptable`] when the
+    /// record cannot be adopted; it is left as it is.
     pub fn run(
         &self,
         options: ProcessOptions,
@@ -150,7 +157,9 @@ impl<'a> Process<'a> {
     ) -> Result<String, ProcessError> {
         let project = self.context.project();
         let processes = Processes::open(&project.database_path(), &project.processes_dir())?;
-        processes.start(self.id, std::process::id())?;
+        if !processes.start(self.id, std::process::id())? {
+            return Err(ProcessError::NotAdoptable(self.id));
+        }
         observer.observe(&ProcessActivity::Started(&processes.get(self.id)?));
 
         let finished = AtomicBool::new(false);
@@ -256,15 +265,6 @@ impl<'a> Process<'a> {
                 }
             }
             give_up_abandoned(role, &inbox, &mut graph, observer)?;
-            if let Some(reason) = role.pause(self.agent, &graph)? {
-                processes.set_activity(self.id, Some(&reason))?;
-                observer.observe(&ProcessActivity::Paused(&reason));
-                if options.exit_when_idle {
-                    return Ok(format!("idle ({reason})"));
-                }
-                thread::sleep(POLL * 4);
-                continue;
-            }
             let Some(delivery) =
                 inbox.lease(role.reactions(), self.id, role.is_exclusive(), MAX_ATTEMPTS)?
             else {
@@ -277,8 +277,14 @@ impl<'a> Process<'a> {
                 if role
                     .revisit_cooldown(self.agent)
                     .is_some_and(|cooldown| last_reaction.elapsed() >= cooldown)
-                    && revisit_at_random(&mut graph)?
+                    && revisit_at_random(
+                        &mut graph,
+                        self.agent.declaration().speculate == Some(true),
+                    )?
                 {
+                    // The cooldown runs from the revisit, wherever routing
+                    // sends it, so a role revisits once per cooldown.
+                    last_reaction = Instant::now();
                     waiting = false;
                     continue;
                 }
@@ -290,6 +296,27 @@ impl<'a> Process<'a> {
                 continue;
             };
             waiting = false;
+            // Agents sharing a role by weight react only to the events
+            // routed to them; the others are theirs to acknowledge.
+            if let Some(owner) = self
+                .context
+                .declaration()
+                .route(self.agent.name(), delivery.event.id)
+                .filter(|owner| *owner != self.agent.name())
+            {
+                let report = Report::Ignored {
+                    reason: format!("routed to `{owner}`"),
+                };
+                if holding(inbox.ack(&delivery, Some(&report.summary())))?.is_some() {
+                    observer.observe(&ProcessActivity::Reacted {
+                        delivery: &delivery,
+                        report: &report,
+                    });
+                } else {
+                    observer.observe(&ProcessActivity::LeaseLost(&delivery));
+                }
+                continue;
+            }
             processes.set_activity(self.id, Some(&format!("reacting to {}", delivery.event)))?;
             observer.observe(&ProcessActivity::Reacting(&delivery));
 
@@ -308,7 +335,7 @@ impl<'a> Process<'a> {
             match result {
                 _ if interrupt.lease_lost() => lost(),
                 Ok(report) => {
-                    let coalesced = match covered {
+                    let coalesced = match report.covered().or(covered) {
                         Some(through) if role.coalesces() => {
                             let note = format!("covered by the reaction to {}", delivery.event.id);
                             holding(inbox.ack_through(&delivery, role.reactions(), through, &note))?
@@ -338,6 +365,22 @@ impl<'a> Process<'a> {
                         lost();
                     }
                     return Ok("stopped".to_owned());
+                }
+                // A busy database is transient (another process held the
+                // lock past the busy timeout): give the event back and carry
+                // on, rather than lose the process.
+                Err(RoleError::Graph(error)) if error.is_busy() => {
+                    let error = RoleError::Graph(error);
+                    if holding(inbox.release(&delivery))?.is_some() {
+                        observer.observe(&ProcessActivity::Failed {
+                            delivery: &delivery,
+                            error: &error,
+                            retry: true,
+                        });
+                    } else {
+                        lost();
+                    }
+                    thread::sleep(POLL * 4);
                 }
                 Err(RoleError::Graph(error)) => {
                     // The process gives up on the event, and a step it left
@@ -401,14 +444,15 @@ fn give_up_abandoned(
     Ok(())
 }
 
-/// Record `node.revisited` for a random starting point; `false` when
-/// there is none (no active goals).
-fn revisit_at_random(graph: &mut Graph) -> Result<bool, ProcessError> {
-    let points = graph.starting_points()?;
+/// Record `node.revisited` for a random starting point (steps not carried
+/// out yet among them when exploring `ahead`); `false` when there is none
+/// (no active goals).
+fn revisit_at_random(graph: &mut Graph, ahead: bool) -> Result<bool, ProcessError> {
+    let points = graph.starting_points(ahead)?;
     if points.is_empty() {
         return Ok(false);
     }
-    graph.revisit(points[random_below(points.len())].id)?;
+    graph.revisit(points[random_below(points.len())].id, ahead)?;
     Ok(true)
 }
 
@@ -456,7 +500,7 @@ mod tests {
         let origin = graph
             .create_origin("o", Some("main"), "abc")
             .expect("origin");
-        let goal = graph.add_goal("g", "g", false).expect("goal");
+        let goal = graph.add_goal("g", "g", false, &[]).expect("goal");
         let step = graph
             .propose_step("s", "s", &[origin], &[goal])
             .expect("step");

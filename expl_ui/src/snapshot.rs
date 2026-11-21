@@ -8,9 +8,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use expl_core::{
-    AgentRunRecord, AgentRunStatus, Declaration, Edge, Evaluation, Graph, GraphError, Lineage,
-    Node, NodeFilter, NodeId, NodeKind, NodeStatus, ProcessId, ProcessRecord, ProcessState,
-    Processes, Project, StoreError,
+    AgentRunRecord, AgentRunStatus, Declaration, Edge, Evaluation, GoalTree, Graph, GraphError,
+    Lineage, Node, NodeFilter, NodeId, NodeKind, NodeStatus, ProcessId, ProcessRecord,
+    ProcessState, Processes, Project, StoreError,
 };
 use thiserror::Error;
 
@@ -55,6 +55,8 @@ pub(crate) struct Snapshot {
     pub(crate) candidates: BTreeMap<NodeId, Vec<NodeId>>,
     /// The trunk's history: every origin and what was adopted into it.
     pub(crate) lineage: Lineage,
+    /// Which goals are subgoals of which.
+    pub(crate) goal_tree: GoalTree,
     /// Declared agents (empty when `expl.toml` cannot be read).
     pub(crate) agents: Vec<DeclaredAgent>,
     /// Processes that have not exited (running, starting, or dead).
@@ -85,6 +87,7 @@ impl Snapshot {
         }
 
         let lineage = Lineage::of(&nodes, &edges);
+        let goal_tree = GoalTree::of(&nodes, &edges);
         let runs = graph.agent_runs(None, RUN_TAIL)?;
 
         let records: Vec<ProcessRecord> = processes
@@ -114,6 +117,7 @@ impl Snapshot {
             evaluations,
             candidates,
             lineage,
+            goal_tree,
             agents,
             processes: records,
             runs,
@@ -149,14 +153,16 @@ impl Snapshot {
         verdicts
     }
 
-    /// Goals: the active ones first, then the retired, each by id.
+    /// Goals: the active ones first, then the retired, each set with
+    /// subgoals right under the goals they serve.
     pub(crate) fn goals(&self) -> Vec<&Node> {
-        let mut goals: Vec<&Node> = self
+        let (active, retired): (Vec<&Node>, Vec<&Node>) = self
             .nodes
             .iter()
             .filter(|n| n.kind == NodeKind::Goal)
-            .collect();
-        goals.sort_by_key(|g| (g.status != NodeStatus::Active, g.id));
+            .partition(|g| g.status == NodeStatus::Active);
+        let mut goals = self.goal_tree.ordered(&active);
+        goals.extend(self.goal_tree.ordered(&retired));
         goals
     }
 
@@ -252,7 +258,7 @@ mod tests {
         let origin = graph
             .create_origin("origin", Some("main"), "abc")
             .expect("origin");
-        let goal = graph.add_goal("fast", "be fast", false).expect("goal");
+        let goal = graph.add_goal("fast", "be fast", false, &[]).expect("goal");
         let step = graph
             .propose_step("cache", "add a cache", &[origin], &[goal])
             .expect("step");
@@ -281,6 +287,7 @@ mod tests {
         // The owner adopts the step: the trunk moves, and is judged.
         let next = graph
             .advance_origin(&expl_core::NewOrigin {
+                previous: origin,
                 title: "adopt cache".into(),
                 note: String::new(),
                 branch: Some("main".into()),

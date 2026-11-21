@@ -6,7 +6,9 @@
 //!
 //! With `-d` the record is created here, and a child `expl` adopts it in
 //! its own process group with stdout/stderr going to the log file — the
-//! way `docker run -d` hands a container to the daemon.
+//! way `docker run -d` hands a container to the daemon. The child must
+//! adopt it within its startup deadline; a record left unadopted is
+//! abandoned rather than holding its replica slot forever.
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::process::CommandExt;

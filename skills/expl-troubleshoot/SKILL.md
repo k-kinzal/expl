@@ -32,10 +32,12 @@ ls -t .expl/logs | head                      # newest agent runs
 | step `failed` with "cargo … failed" in its summary | executor could not make tests pass | normal outcome; planning re-plans or prunes it — leave it unless it repeats for the same reason |
 | process `dead` in `expl ps` | crashed or killed without exiting | `expl rm <name>` then `expl up`; its leases expire after 60 s and the events are redelivered |
 | a step stuck `running` with no live executor | executor died mid-run | the lease expires and the redelivered `node.ready` reclaims it; if not, `expl stop`/`up` the executors |
-| explorer shows `paused: N steps pending` forever | executors are not consuming `ready` steps | check executors are running and their logs; check `expl node ls --status ready` |
 | nothing `ready` although steps are `planned` | predecessors not completed, or planner never prioritised them | `expl path ls`, `expl event ls --agent planner` |
 | merged into main but `expl origin ls` shows no new origin | no process is running, or trunk branch mismatch | `expl up`; `trunk = "main"` in `expl.toml`; the process log shows `cannot follow the trunk: …` |
 | `worktree add` / `branch -D` errors | leftover worktree or branch from a crash | `git worktree prune`; inspect `.expl/worktrees`; never delete `expl/node-*` branches of completed steps |
+| `expl` prints nothing and exits (even `--version`) | the binary was overwritten in place with `cp`; macOS kills it (invalid code signature) | reinstall with `skills/expl-operate/scripts/install.sh` (copy + rename) |
+| stray `.../cargo-target/debug/expl -C /var/folders/.../T/.tmp*/repo run …` processes | test sandboxes whose processes outlived an interrupted `cargo test` | kill them: `pkill -f 'cargo-target/debug/expl -C /private/var/folders'` |
+| process exits with `database is locked` (code 5 or 517) | a write raced another process (517) or waited out the busy timeout under heavy load (5) | fixed in 3c8d3ad: writes are `BEGIN IMMEDIATE` and a busy reaction gives its event back; if it recurs, `expl up` and look for a process holding a long write |
 | builds look hung | cargo waits on the shared target dir lock | expected with several agents; check `ps aux | grep cargo` before suspecting a hang |
 
 ## Fixing expl's code
@@ -45,9 +47,11 @@ ls -t .expl/logs | head                      # newest agent runs
    add or extend a test under `expl_core`/`expl_cli` that fails without it.
 3. Gate: `cargo fmt --all --check && cargo clippy --all-targets && cargo test`.
 4. Commit to `main` with a `fix:` message (with the Co-Authored-By trailer).
-5. `cargo install --locked --path expl_cli` (and `--path expl_ui` if the UI changed),
-   then `expl down -t 30 && expl up` so processes run the fix. Restart `expl-ui` if
-   it was rebuilt.
+5. `skills/expl-operate/scripts/install.sh` (`--ui` too if the UI changed). Never
+   `cargo install` (rebuilds gpui from scratch, 20+ minutes) and never plain `cp`
+   over the binary (macOS then kills every launch: invalid code signature). Then
+   `skills/expl-operate/scripts/rolling-restart.sh` so processes run the fix.
+   Restart `expl-ui` if it was rebuilt.
 6. Retry what the bug broke (`expl node retry <id>`), and watch one full cycle.
 
 The DB schema lives in `expl_core/src/store.rs`. Never hand-edit `.expl/expl.db`
@@ -58,3 +62,24 @@ while processes run; if state must be repaired, `expl down` first and keep a cop
 
 - Agents could only use one CLI, and Cursor Agent had no driver. Added the
   `cursor_agent` driver and `[[agent.<name>.alternative]]` routing (rotate + failover).
+- Exploration only reacted to events, so a starting point was explored once and
+  then never again. Added `node.revisited`: an idle explorer revisits a random
+  starting point after `revisit_cooldown` seconds, and exploration prompts list the
+  existing steps (section "Already proposed") so repeats grow new alternatives.
+- Exploration was narrow (`breadth = 3`, and the prompt told agents to drop weak
+  ideas), and several agents of one role all reacted to every event. Exploration now
+  enumerates broadly, planning ranks risky steps low instead of pruning them, and
+  `weight` routes a role's events between agents (mainstream `explorer` / `fringe`).
+- Joins whose merge conflicted always failed: the agent resolved the markers but git
+  still listed the files as unmerged. Fixed by adopting #3 (`Workspace::resume`
+  concludes the merge after checking the markers are gone).
+- A newly declared agent receives every past event of its role (its backlog starts
+  at the whole history). With `weight` it reacts only to its share; expect a few
+  catch-up explorations after adding one.
+- Processes died with `database is locked`: deferred savepoints that read before
+  writing failed at once with `SQLITE_BUSY_SNAPSHOT` when another process had
+  committed. Writes now take the lock up front, and a reaction that still finds the
+  database busy hands its event back and continues.
+- `install.sh` built the working tree, so an install while editing shipped
+  uncommitted code. It now refuses when `*.rs`/`*.toml`/`Cargo.lock` are dirty —
+  develop larger changes in a separate worktree (`git worktree add … -b work/…`).
