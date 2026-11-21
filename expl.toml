@@ -143,7 +143,9 @@ driver = "cursor_agent"
 command = ["cursor-agent"]
 args = ["--model", "claude-opus-5-5-high", "--force", "--trust", "--sandbox", "disabled"]
 env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
-replicas = 1
+# Stopped on the owner's decision: cursor-agent hit its monthly Opus usage
+# limit (resets 2026-12-17). Set back to 1 to resume execution.
+replicas = 0
 instructions = """
 This repository is expl itself (Rust workspace: expl_core, expl_cli, expl_ui). Follow AGENTS.md:
 keep its nouns and responsibilities, document public items, keep errors typed (thiserror).
