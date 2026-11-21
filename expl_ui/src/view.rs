@@ -8,8 +8,12 @@
 //! - **The trunk is the spine.** Origins — every position the default
 //!   branch has held — sit on one straight line, oldest on the left. The
 //!   current origin is the bright one with a ring: exploration grows from
-//!   it. A step adopted into the trunk turns square, and hairlines join it
-//!   to the origin that took it in. Steps explored from an origin the trunk
+//!   it. Work adopted into the trunk reads like a merged branch: its steps
+//!   turn square, the line from the origin it was explored from through
+//!   them is drawn in the trunk's colour, and it joins the spine at the
+//!   origin that took it in with a line as strong as the spine itself. An
+//!   origin that took work in is a merge: it carries a halo, and its label
+//!   counts the steps it merged. Steps explored from an origin the trunk
 //!   has moved past fade, unless they are still candidates.
 //! - **Edges are hairlines.** Edges into goals are drawn only once a step
 //!   satisfies the goal (or the step is selected), so the picture shows
@@ -361,6 +365,8 @@ impl ExplView {
 
     fn edges(&self, viewport: Size<Pixels>, lens: &Lens) -> Vec<Line> {
         let by_id: HashMap<NodeId, &Node> = self.snapshot.nodes.iter().map(|n| (n.id, n)).collect();
+        let lineage = &self.snapshot.lineage;
+        let merged = |n: &Node| n.kind == NodeKind::Step && lineage.in_trunk(n.id);
         let mut lines = Vec::with_capacity(self.snapshot.edges.len());
         for edge in &self.snapshot.edges {
             let (Some(source), Some(target)) = (by_id.get(&edge.source), by_id.get(&edge.target))
@@ -382,6 +388,11 @@ impl ExplView {
                     width = 2.0;
                     theme::alpha(theme::text(), 0.7)
                 }
+                // A merged branch joining the spine: as strong as the spine.
+                (NodeKind::Step, NodeKind::Origin) if merged(source) => {
+                    width = 2.0;
+                    theme::alpha(theme::text(), if selected { 0.95 } else { 0.7 })
+                }
                 // Work taken into the trunk.
                 (_, NodeKind::Origin) => {
                     theme::alpha(theme::text(), if selected { 0.6 } else { 0.3 })
@@ -399,6 +410,13 @@ impl ExplView {
                     } else {
                         continue;
                     }
+                }
+                // Along a merged branch, from where it left the spine.
+                (NodeKind::Origin | NodeKind::Step, NodeKind::Step)
+                    if merged(target) && (source.kind == NodeKind::Origin || merged(source)) =>
+                {
+                    width = 1.5;
+                    theme::alpha(theme::text(), if selected { 0.8 } else { 0.5 })
                 }
                 _ if selected => theme::alpha(theme::bright(), 0.4),
                 _ if source.status == NodeStatus::Pruned || target.status == NodeStatus::Pruned => {
@@ -452,7 +470,20 @@ impl ExplView {
             1.0
         };
         let text = if node.kind == NodeKind::Origin {
-            format!("{}  {}", short(node.head_commit.as_deref()), node.title)
+            let merged = self
+                .snapshot
+                .lineage
+                .epoch(id)
+                .map_or(0, |epoch| epoch.absorbed.len());
+            if merged > 0 {
+                format!(
+                    "{}  +{merged}  {}",
+                    short(node.head_commit.as_deref()),
+                    node.title
+                )
+            } else {
+                format!("{}  {}", short(node.head_commit.as_deref()), node.title)
+            }
         } else {
             node.title.clone()
         };
@@ -571,6 +602,10 @@ impl ExplView {
             .when(current, |el| {
                 el.child(ring(size + 8.0, theme::alpha(theme::text(), 0.6)))
             })
+            // A merge: this origin took work into the trunk.
+            .when(!current && self.merges(node), |el| {
+                el.child(ring(size + 6.0, theme::alpha(theme::text(), 0.45)))
+            })
             .when(selected, |el| {
                 el.child(ring(
                     size + if current { 16.0 } else { 8.0 },
@@ -578,6 +613,16 @@ impl ExplView {
                 ))
             })
             .child(mark)
+    }
+
+    /// Whether `node` is an origin that took steps into the trunk.
+    fn merges(&self, node: &Node) -> bool {
+        node.kind == NodeKind::Origin
+            && self
+                .snapshot
+                .lineage
+                .epoch(node.id)
+                .is_some_and(|epoch| !epoch.adopted.is_empty())
     }
 
     // ------------------------------------------------------------ corners
