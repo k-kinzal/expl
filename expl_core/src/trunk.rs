@@ -10,8 +10,11 @@
 //!
 //! Git is the ground truth for what was taken in. A completed step is
 //! adopted when the new trunk contains its work and the previous one did
-//! not: by history (a merge or fast-forward), or by patch (`git cherry`:
-//! squash merges and cherry-picks of the step's commits).
+//! not: by history (a merge or fast-forward), by patch (`git cherry`:
+//! squash merges and cherry-picks of the step's commits), or by content
+//! (merging the step into the trunk would change nothing: a squash merge
+//! of several commits, of a step together with the not-yet-adopted steps
+//! it built on, or of a joined step and its merges).
 //!
 //! Every running [process](crate::process::Process) follows the trunk, so
 //! it is enough to merge: the origin moves within seconds.
@@ -98,7 +101,8 @@ impl Trunk {
     /// # Errors
     ///
     /// [`TrunkError::MissingBranch`] when the trunk branch does not exist;
-    /// [`TrunkError::Graph`] on graph failure.
+    /// [`TrunkError::Graph`] on graph failure; [`TrunkError::Git`] when git
+    /// fails while checking what the trunk took in.
     pub fn follow(&self, graph: &mut Graph) -> Result<Option<Advance>, TrunkError> {
         let observation = self.observe(graph)?;
         self.record(graph, observation)
@@ -166,8 +170,13 @@ impl Trunk {
             if lineage.in_trunk(step.id) {
                 continue;
             }
-            let already = !previous.is_empty() && self.takes_in(&previous, head);
-            if !already && self.takes_in(&commit, head) {
+            // A step whose tip is still a predecessor's committed nothing.
+            let committed = !graph
+                .predecessors(step.id)?
+                .iter()
+                .any(|p| p.head_commit.as_deref() == Some(head));
+            let already = !previous.is_empty() && self.takes_in(&previous, head, committed)?;
+            if !already && self.takes_in(&commit, head, committed)? {
                 adopted.insert(step.id);
             }
         }
@@ -213,24 +222,39 @@ impl Trunk {
     }
 
     /// Whether `trunk` holds the work of the step whose tip is `head`: by
-    /// history, or because every commit of the step has an equivalent patch
-    /// in `trunk` (squash merges, cherry-picks). A step that committed
-    /// nothing is held only by history.
-    fn takes_in(&self, trunk: &str, head: &str) -> bool {
-        if self.contains(trunk, head) {
-            return true;
+    /// history; because every commit of the step has an equivalent patch in
+    /// `trunk` (squash merges, cherry-picks); or because merging `head`
+    /// into `trunk` yields `trunk`'s own tree (squash merges of several
+    /// commits, of predecessors, or of joins). A step that has not
+    /// `committed` anything is held only by history. Commits git no longer
+    /// knows hold nothing and are not held.
+    fn takes_in(&self, trunk: &str, head: &str, committed: bool) -> Result<bool, TrunkError> {
+        if !self.git.has_commit(trunk)? || !self.git.has_commit(head)? {
+            return Ok(false);
         }
-        let Ok(listing) = self.git.run(&["cherry", trunk, head]) else {
-            return false;
-        };
+        if self.git.is_ancestor(head, trunk)? {
+            return Ok(true);
+        }
+        if !committed {
+            return Ok(false);
+        }
+        let listing = self.git.run(&["cherry", trunk, head])?;
         let lines: Vec<&str> = listing.lines().filter(|l| !l.trim().is_empty()).collect();
-        !lines.is_empty() && lines.iter().all(|l| l.starts_with('-'))
+        if !lines.is_empty() && lines.iter().all(|l| l.starts_with('-')) {
+            return Ok(true);
+        }
+        let Some(merged) = self.git.merge_tree(trunk, head)? else {
+            return Ok(false);
+        };
+        let tree = self.git.run(&["rev-parse", &format!("{trunk}^{{tree}}")])?;
+        Ok(merged == tree)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::EventKind;
     use crate::workspace::Workspaces;
     use std::path::Path;
 
@@ -275,31 +299,42 @@ mod tests {
 
         /// A completed step after `after`, committing `file` (or nothing).
         fn step(&mut self, after: NodeId, file: Option<&str>) -> NodeId {
+            self.join(&[after], file.as_slice())
+        }
+
+        /// A completed step after every node of `after`: its branch starts
+        /// at the first one's commit and merges the others' (as a joined
+        /// step's workspace does), then commits each of `files` in turn.
+        fn join(&mut self, after: &[NodeId], files: &[&str]) -> NodeId {
             let id = self
                 .graph
-                .propose_step("step", "step", &[after], &[])
+                .propose_step("step", "step", after, &[])
                 .expect("step");
-            let base = self
-                .graph
-                .node(after)
-                .expect("after")
-                .head_commit
-                .expect("commit");
+            let commits: Vec<String> = after
+                .iter()
+                .map(|&n| {
+                    self.graph
+                        .node(n)
+                        .expect("after")
+                        .head_commit
+                        .expect("commit")
+                })
+                .collect();
             let branch = Workspaces::branch_name(id);
-            git(&self.root, &["branch", &branch, &base]);
-            let head = if let Some(file) = file {
-                let path = self.project.state_dir().join(format!("wt-{}", id.0));
-                let path_text = path.display().to_string();
-                git(&self.root, &["worktree", "add", "-q", &path_text, &branch]);
+            git(&self.root, &["branch", &branch, &commits[0]]);
+            let path = self.project.state_dir().join(format!("wt-{}", id.0));
+            let path_text = path.display().to_string();
+            git(&self.root, &["worktree", "add", "-q", &path_text, &branch]);
+            for commit in &commits[1..] {
+                git(&path, &["merge", "-q", "--no-ff", "--no-edit", commit]);
+            }
+            for file in files {
                 std::fs::write(path.join(file), format!("{file} by {id}")).expect("write");
                 git(&path, &["add", "."]);
                 git(&path, &["commit", "-q", "-m", file]);
-                let head = git(&path, &["rev-parse", "HEAD"]);
-                git(&self.root, &["worktree", "remove", "--force", &path_text]);
-                head
-            } else {
-                base
-            };
+            }
+            let head = git(&path, &["rev-parse", "HEAD"]);
+            git(&self.root, &["worktree", "remove", "--force", &path_text]);
             self.graph
                 .set_branch(id, &branch, Some(&head))
                 .expect("branch");
@@ -307,6 +342,22 @@ mod tests {
             assert!(self.graph.claim(id, false).expect("claim"));
             self.graph.complete(id, "done").expect("complete");
             id
+        }
+
+        /// Squash-merge `step`'s branch into `main` as one commit.
+        fn squash(&self, step: NodeId, message: &str) {
+            let branch = Workspaces::branch_name(step);
+            git(&self.root, &["merge", "-q", "--squash", &branch]);
+            git(&self.root, &["commit", "-q", "-m", message]);
+        }
+
+        /// Whether `origin.advanced` was recorded for `origin`.
+        fn advanced_to(&self, origin: NodeId) -> bool {
+            self.graph
+                .events(None, usize::MAX)
+                .expect("events")
+                .iter()
+                .any(|e| e.kind == EventKind::OriginAdvanced && e.node == Some(origin))
         }
     }
 
@@ -474,5 +525,82 @@ mod tests {
         git(&fx.root, &["commit", "-q", "-am", "edit"]);
         let trunk = Trunk::new(&fx.project, None);
         assert!(trunk.follow(&mut fx.graph).expect("follow").is_some());
+    }
+
+    #[test]
+    fn squashing_a_step_with_its_predecessor_adopts_both() {
+        let mut fx = Fixture::new();
+        let origin = fx.graph.origin().expect("origin").id;
+        let a = fx.step(origin, Some("a.txt"));
+        let b = fx.step(a, Some("b.txt"));
+        let idle = fx.step(a, None);
+        let trunk = Trunk::new(&fx.project, Some("main"));
+
+        // Neither a nor b is in the trunk; b is squashed as one commit
+        // holding both, so no trunk commit matches either step's patch.
+        fx.squash(b, "squashed b");
+        let advance = trunk.follow(&mut fx.graph).expect("follow").expect("moved");
+        assert!(fx.advanced_to(advance.origin));
+        assert_eq!(
+            advance.adopted,
+            vec![b],
+            "a comes with b; idle committed nothing"
+        );
+        let lineage = fx.graph.lineage().expect("lineage");
+        assert!(lineage.in_trunk(a) && lineage.in_trunk(b));
+        assert!(!lineage.in_trunk(idle));
+        assert_eq!(trunk.follow(&mut fx.graph).expect("again"), None);
+    }
+
+    #[test]
+    fn squashing_a_joined_step_adopts_it() {
+        let mut fx = Fixture::new();
+        let origin = fx.graph.origin().expect("origin").id;
+        let a = fx.step(origin, Some("a.txt"));
+        let c = fx.step(origin, Some("c.txt"));
+        let joined = fx.join(&[a, c], &["j.txt"]);
+        let branch = Workspaces::branch_name(joined);
+        let parents = git(
+            &fx.root,
+            &["log", "-1", "--format=%P", &format!("{branch}~1")],
+        );
+        assert_eq!(parents.split_whitespace().count(), 2, "a merge commit");
+        let trunk = Trunk::new(&fx.project, Some("main"));
+
+        fx.squash(joined, "squashed join");
+        let advance = trunk.follow(&mut fx.graph).expect("follow").expect("moved");
+        assert!(fx.advanced_to(advance.origin));
+        assert_eq!(advance.adopted, vec![joined], "a and c come with it");
+        let lineage = fx.graph.lineage().expect("lineage");
+        assert!(lineage.in_trunk(a) && lineage.in_trunk(c) && lineage.in_trunk(joined));
+    }
+
+    #[test]
+    fn a_partial_squash_adopts_nothing_until_the_rest_follows() {
+        let mut fx = Fixture::new();
+        let origin = fx.graph.origin().expect("origin").id;
+        let step = fx.join(&[origin], &["one.txt", "two.txt"]);
+        let trunk = Trunk::new(&fx.project, Some("main"));
+
+        // Take in the step, but leave `two.txt` out.
+        git(
+            &fx.root,
+            &["merge", "-q", "--squash", &Workspaces::branch_name(step)],
+        );
+        git(&fx.root, &["rm", "-q", "--cached", "two.txt"]);
+        std::fs::remove_file(fx.root.join("two.txt")).expect("remove");
+        git(&fx.root, &["commit", "-q", "-m", "partial"]);
+        let partial = trunk.follow(&mut fx.graph).expect("follow").expect("moved");
+        assert!(partial.adopted.is_empty());
+        assert!(!fx.graph.lineage().expect("lineage").in_trunk(step));
+
+        // The rest arrives in a later commit: now the trunk holds it all.
+        git(
+            &fx.root,
+            &["checkout", &Workspaces::branch_name(step), "--", "two.txt"],
+        );
+        git(&fx.root, &["commit", "-q", "-m", "the rest"]);
+        let rest = trunk.follow(&mut fx.graph).expect("follow").expect("moved");
+        assert_eq!(rest.adopted, vec![step]);
     }
 }
