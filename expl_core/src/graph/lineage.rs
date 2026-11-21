@@ -23,6 +23,9 @@ use crate::graph::{Edge, Node, NodeId, NodeKind, NodeStatus};
 /// [`Graph::advance_origin`](crate::graph::Graph::advance_origin).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewOrigin {
+    /// The active origin this position was observed from: what `adopted`
+    /// was computed against. Recording fails if it is no longer active.
+    pub previous: NodeId,
     /// Short name (typically the commit subject).
     pub title: String,
     /// Why the trunk moved, in the owner's words.

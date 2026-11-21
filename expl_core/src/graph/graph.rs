@@ -307,6 +307,11 @@ impl Graph {
     /// origin is already at `origin.commit` — several processes follow the
     /// trunk, and only the first to see it move records it.
     ///
+    /// `origin.previous` must still be the active origin: adoption is only
+    /// meaningful against the origin it was computed from, and a process
+    /// that observed the trunk before another recorded a newer move must
+    /// not record its older observation on top.
+    ///
     /// The new origin builds on the previous origin and on every adopted
     /// step, so the lineage — what was chosen, and when — stays in the
     /// graph. Steps that have not started yet (`proposed`, `planned`) and
@@ -317,13 +322,20 @@ impl Graph {
     /// # Errors
     ///
     /// [`GraphError::NoOrigin`] when the graph has no origin;
-    /// [`GraphError::NotInStatus`] when an adopted node is not a completed
-    /// step. Nothing is recorded then.
+    /// [`GraphError::OriginMoved`] when `origin.previous` is no longer the
+    /// active origin; [`GraphError::NotInStatus`] when an adopted node is
+    /// not a completed step. Nothing is recorded then.
     pub fn advance_origin(&mut self, origin: &NewOrigin) -> Result<Option<NodeId>, GraphError> {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let previous = current_origin_in(&tx)?.ok_or(GraphError::NoOrigin)?;
+        if previous != origin.previous {
+            return Err(GraphError::OriginMoved {
+                expected: origin.previous,
+                current: previous,
+            });
+        }
         if node_in(&tx, previous)?.head_commit.as_deref() == Some(origin.commit.as_str()) {
             return Ok(None);
         }
@@ -1395,8 +1407,9 @@ mod tests {
         ));
         assert_eq!(ids(&graph, second), [first]);
     }
-    fn new_origin(commit: &str, adopted: &[NodeId]) -> NewOrigin {
+    fn new_origin(previous: NodeId, commit: &str, adopted: &[NodeId]) -> NewOrigin {
         NewOrigin {
+            previous,
             title: "trunk".into(),
             note: String::new(),
             branch: Some("main".into()),
@@ -1420,21 +1433,30 @@ mod tests {
             graph.complete(step, "done").expect("complete");
         }
         assert!(matches!(
-            graph.advance_origin(&new_origin("def", &[open])),
+            graph.advance_origin(&new_origin(first, "def", &[open])),
             Err(GraphError::NotInStatus { .. })
         ));
 
         let second = graph
-            .advance_origin(&new_origin("def", &[adopted]))
+            .advance_origin(&new_origin(first, "def", &[adopted]))
             .expect("advance")
             .expect("moved");
         assert_eq!(
             graph
-                .advance_origin(&new_origin("def", &[]))
+                .advance_origin(&new_origin(second, "def", &[]))
                 .expect("again"),
             None,
             "the trunk is already there"
         );
+        // An observation made from the superseded origin records nothing.
+        let (edges, events) = (graph.edges().expect("edges"), kinds(&graph));
+        assert!(matches!(
+            graph.advance_origin(&new_origin(first, "abc", &[left])),
+            Err(GraphError::OriginMoved { expected, current })
+                if expected == first && current == second
+        ));
+        assert_eq!(graph.edges().expect("edges"), edges);
+        assert_eq!(kinds(&graph), events);
         assert_eq!(graph.origin().expect("origin").id, second);
         assert_eq!(
             graph.node(first).expect("first").status,
