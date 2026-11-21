@@ -3,7 +3,9 @@
 # Each [agent.<name>] is started as processes (`expl run <name>`, or
 # `expl up` for `replicas` of every agent). An agent reacts to the graph
 # events of its role:
-#   exploration — goal.added, node.evaluated, origin.advanced → proposes steps
+#   exploration — goal.added, node.evaluated, origin.advanced → proposes steps;
+#                 when idle, every `revisit_cooldown` seconds it explores again
+#                 from a random starting point (node.revisited)
 #   planning    — node.proposed/evaluated/failed, goal.retired, origin.advanced → paths and priorities
 #   execution   — node.ready                                   → commits on the step's branch
 #   evaluation  — node.completed, origin.advanced → verdicts against goals
@@ -20,6 +22,9 @@
 #
 # All agents share one cargo target directory so that every worktree does
 # not rebuild the dependencies (gpui above all) from scratch.
+#
+# Every agent runs one process (replicas = 1): exploration takes longer, but
+# token use never spikes.
 #
 # Agents run unattended inside expl-owned git worktrees, so these let the
 # CLIs edit files and run commands without asking.
@@ -38,6 +43,7 @@ env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
 replicas = 1
 breadth = 3
 max_pending = 6
+revisit_cooldown = 600
 instructions = """
 AGENTS.md describes the vision and architecture; propose steps that move expl toward it.
 Every step must change Rust code, tests, or configuration. Markdown files (*.md) are
@@ -73,7 +79,7 @@ driver = "cursor_agent"
 command = ["cursor-agent"]
 args = ["--model", "claude-opus-5-5-high", "--force", "--trust", "--sandbox", "disabled"]
 env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
-replicas = 2
+replicas = 1
 instructions = """
 This repository is expl itself (Rust workspace: expl_core, expl_cli, expl_ui). Follow AGENTS.md:
 keep its nouns and responsibilities, document public items, keep errors typed (thiserror).

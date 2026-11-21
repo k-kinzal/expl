@@ -85,6 +85,11 @@ pub struct AgentDeclaration {
     /// Exploration only: pause while this many steps await execution.
     #[serde(default)]
     pub max_pending: Option<usize>,
+    /// Exploration only: seconds an idle process waits after its last
+    /// exploration before it revisits a random starting point. Without it,
+    /// an exploration reacts to events only and never revisits.
+    #[serde(default)]
+    pub revisit_cooldown: Option<u64>,
     /// Further CLIs that can carry out the agent (`[[agent.<name>.alternative]]`).
     /// Invocations are routed across the primary CLI and these in turn, and
     /// fall over to the next one when a CLI fails.
@@ -132,7 +137,9 @@ impl Declaration {
 # Each [agent.<name>] is started as processes (`expl run <name>`, or
 # `expl up` for `replicas` of every agent). An agent reacts to the graph
 # events of its role:
-#   exploration — goal.added, node.evaluated, origin.advanced → proposes steps
+#   exploration — goal.added, node.evaluated, origin.advanced → proposes steps;
+#                 when idle, every `revisit_cooldown` seconds it explores again
+#                 from a random starting point (node.revisited)
 #   planning    — node.proposed/evaluated/failed, goal.retired, origin.advanced → paths and priorities
 #   execution   — node.ready                       → commits on the step's branch
 #   evaluation  — node.completed, origin.advanced → verdicts against goals
@@ -163,6 +170,7 @@ args = ["--permission-mode", "bypassPermissions"]
 replicas = 1
 breadth = 3
 max_pending = 6
+revisit_cooldown = 600          # idle: explore again from a random node every 10 minutes
 
 [agent.planner]
 role = "planning"
@@ -254,10 +262,14 @@ replicas = 1
                     }
                 }
                 Role::Planning | Role::Execution | Role::Evaluation => {
-                    if agent.breadth.is_some() || agent.max_pending.is_some() {
+                    if agent.breadth.is_some()
+                        || agent.max_pending.is_some()
+                        || agent.revisit_cooldown.is_some()
+                    {
                         return invalid(
                             name,
-                            "`breadth` and `max_pending` apply to exploration agents only",
+                            "`breadth`, `max_pending` and `revisit_cooldown` apply to exploration \
+                             agents only",
                         );
                     }
                 }

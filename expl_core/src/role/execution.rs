@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::agent::AgentError;
-use crate::graph::{Graph, Node, NodeId, NodeKind, NodeStatus};
+use crate::event::Event;
+use crate::graph::{Graph, GraphError, Node, NodeId, NodeKind, NodeStatus};
 use crate::prompt::Prompt;
 use crate::role::{Reaction, Report, RoleError};
 use crate::workspace::{Workspace, Workspaces};
@@ -137,6 +138,27 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     }
 }
 
+/// The reaction to `event` ended for good: a step it left `running` fails.
+pub(crate) fn abandon(
+    event: &Event,
+    graph: &mut Graph,
+    why: &str,
+) -> Result<Option<NodeId>, GraphError> {
+    let Some(id) = event.node else {
+        return Ok(None);
+    };
+    let node = match graph.node(id) {
+        Ok(node) => node,
+        Err(GraphError::NodeNotFound(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if node.kind != NodeKind::Step || node.status != NodeStatus::Running {
+        return Ok(None);
+    }
+    graph.fail(id, why)?;
+    Ok(Some(id))
+}
+
 fn fail(
     graph: &mut Graph,
     node: &Node,
@@ -182,4 +204,83 @@ fn prompt(
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::EventKind;
+    use crate::role::Role;
+
+    #[test]
+    fn a_terminally_failed_execution_leaves_its_step_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut graph = Graph::open(&dir.path().join("expl.db")).expect("graph");
+        let origin = graph
+            .create_origin("o", Some("main"), "abc")
+            .expect("origin");
+        let goal = graph.add_goal("g", "g", false).expect("goal");
+        let running = graph
+            .propose_step("r", "r", &[origin], &[goal])
+            .expect("step");
+        let planned = graph
+            .propose_step("p", "p", &[origin], &[goal])
+            .expect("step");
+        graph.plan_step(running, 1).expect("plan");
+        graph.plan_step(planned, 1).expect("plan");
+        let events = graph.events(None, 100).expect("events");
+        let ready = |id| {
+            events
+                .iter()
+                .find(|e| e.kind == EventKind::NodeReady && e.node == Some(id))
+                .cloned()
+                .expect("node.ready")
+        };
+        assert!(graph.claim(running, false).expect("claim"));
+
+        // Only execution leaves steps behind.
+        assert_eq!(
+            Role::Planning
+                .abandon(&ready(running), &mut graph, "gone")
+                .expect("abandon"),
+            None
+        );
+        assert_eq!(
+            graph.node(running).expect("node").status,
+            NodeStatus::Running
+        );
+
+        assert_eq!(
+            Role::Execution
+                .abandon(&ready(running), &mut graph, "its holder died")
+                .expect("abandon"),
+            Some(running)
+        );
+        assert_eq!(
+            graph.node(running).expect("node").status,
+            NodeStatus::Failed
+        );
+        let last = graph.events(None, 100).expect("events");
+        let last = last.last().expect("an event");
+        assert_eq!(
+            (last.kind, last.node),
+            (EventKind::NodeFailed, Some(running))
+        );
+
+        // A step that is not running, or already failed, is left alone.
+        let before = graph.last_event().expect("last");
+        for id in [planned, running] {
+            assert_eq!(
+                Role::Execution
+                    .abandon(&ready(id), &mut graph, "again")
+                    .expect("abandon"),
+                None
+            );
+        }
+        assert_eq!(
+            graph.node(planned).expect("node").status,
+            NodeStatus::Planned
+        );
+        assert_eq!(graph.last_event().expect("last"), before);
+    }
 }
