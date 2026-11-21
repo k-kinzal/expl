@@ -20,6 +20,12 @@
 //! acknowledging, failing, releasing, or coalescing requires the current,
 //! unexpired one — so a process that lost its lease cannot disturb the
 //! process that took the event over ([`InboxError::LeaseLost`]).
+//!
+//! Agents that share a role by weight each still receive every event of
+//! it, but only one of them reacts. Before reacting or acknowledging an
+//! event as routed elsewhere, a process records which of them the event is
+//! assigned to ([`Inbox::assign`]); the first record stands, so processes
+//! that loaded different weights, or restarted with new ones, agree.
 
 // Defining module named for the concept it defines — the path echo is deliberate.
 mod event;

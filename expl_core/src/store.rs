@@ -1,6 +1,7 @@
 //! The project's SQLite database: one file, `.expl/expl.db`, shared by the
-//! [`Graph`](crate::graph::Graph), the [`Inbox`](crate::event::Inbox), and
-//! the [`Processes`](crate::process::Processes) table.
+//! [`Graph`](crate::graph::Graph), the [`Inbox`](crate::event::Inbox) (with
+//! its weighted assignments), and the
+//! [`Processes`](crate::process::Processes) table.
 //!
 //! Every expl process opens its own connection. WAL mode lets readers run
 //! beside the single writer, and the busy timeout makes concurrent writers
@@ -164,6 +165,18 @@ ALTER TABLE deliveries ADD COLUMN lease_token TEXT;
 -- so an interrupted launch cannot hold a replica slot forever. Records
 -- created before deadlines existed have none and count as abandoned.
 ALTER TABLE processes ADD COLUMN start_by INTEGER;
+",
+    r"
+-- Agents sharing a role by weight split its events: the first process to
+-- route an event records the one agent it goes to, and every process obeys
+-- that record, whatever weights it loaded and however often it restarts.
+CREATE TABLE assignments (
+    role       TEXT NOT NULL,
+    event_id   INTEGER NOT NULL REFERENCES events (id),
+    agent      TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (role, event_id)
+);
 ",
 ];
 

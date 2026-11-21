@@ -297,13 +297,18 @@ impl<'a> Process<'a> {
             };
             waiting = false;
             // Agents sharing a role by weight react only to the events
-            // routed to them; the others are theirs to acknowledge.
-            if let Some(owner) = self
+            // assigned to them; the others are theirs to acknowledge. The
+            // assignment is recorded before either, so processes that
+            // loaded different weights still agree on the one recipient.
+            let owner = match self
                 .context
                 .declaration()
                 .route(self.agent.name(), delivery.event.id)
-                .filter(|owner| *owner != self.agent.name())
             {
+                Some(proposed) => Some(inbox.assign(role, delivery.event.id, proposed)?),
+                None => None,
+            };
+            if let Some(owner) = owner.filter(|owner| owner != self.agent.name()) {
                 let report = Report::Ignored {
                     reason: format!("routed to `{owner}`"),
                 };

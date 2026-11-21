@@ -159,7 +159,9 @@ pub struct AgentDeclaration {
     /// event goes to exactly one of them — instead of each reacting to
     /// every event. Agents without a weight react to every event of their
     /// role. Use it to route one role across agents with different
-    /// instructions (e.g. a mainstream and a contrarian exploration).
+    /// instructions (e.g. a mainstream and a contrarian exploration). An
+    /// event's recipient is recorded when it is first routed, so changed
+    /// weights only route the events that come after.
     #[serde(default)]
     pub weight: Option<u32>,
     /// Exploration only: maximum steps proposed per reaction.
@@ -410,8 +412,10 @@ replicas = 1
     /// When the agent named `agent` shares its role's events by weight,
     /// the agent `event` is routed to (possibly `agent` itself); `None`
     /// when `agent` declares no weight, i.e. it reacts to every event. The
-    /// choice depends only on the event and the declaration, so every
-    /// process of every agent agrees on it.
+    /// choice depends only on the event and the declaration; processes that
+    /// loaded different weights may propose differently, so it is only a
+    /// proposal for [`Inbox::assign`](crate::event::Inbox::assign), whose
+    /// recorded assignment every process obeys.
     #[must_use]
     pub fn route(&self, agent: &str, event: EventId) -> Option<&str> {
         let role = self.agent.get(agent)?.role;
