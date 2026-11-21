@@ -26,7 +26,12 @@
 //!   Escape hides them.
 //!
 //! The view polls the database on a background thread and re-renders only
-//! when the snapshot changed. Drag or scroll pans; `0` recentres.
+//! when the snapshot changed. Dragging pans; scrolling zooms the graph
+//! around the pointer, `+` / `-` zoom around the window centre,
+//! `f` fits the whole graph in the window, and `0` resets pan and zoom.
+//! Zooming scales the distances between dots, not the dots or the panels;
+//! when zoomed far out, only the labels that matter (selected, current,
+//! running, candidates) stay.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -64,6 +69,17 @@ const GOALS_W: f32 = 290.0;
 const TRUNK_W: f32 = 320.0;
 /// Origins listed in the trunk panel.
 const TRUNK_ROWS: usize = 6;
+/// Zoom range, the factor of one `+` / `-`, and the zoom below which only
+/// labels that matter are drawn.
+const MIN_ZOOM: f32 = 0.1;
+const MAX_ZOOM: f32 = 3.0;
+const ZOOM_STEP: f32 = 1.25;
+const QUIET_LABELS_BELOW: f32 = 0.55;
+/// Narrowest label once zoomed out.
+const MIN_LABEL_W: f32 = 72.0;
+/// Room `f` leaves around the fitted graph for the corner panels.
+const FIT_INSET_X: f32 = 120.0;
+const FIT_INSET_Y: f32 = 110.0;
 /// Opacity of nodes outside a focused goal, and of steps left behind.
 const OUT_OF_FOCUS: f32 = 0.16;
 const BEHIND: f32 = 0.45;
@@ -79,6 +95,8 @@ pub(crate) struct ExplView {
     error: Option<String>,
     selected: Option<NodeId>,
     pan: Point<Pixels>,
+    /// Scale of the distances between dots (1.0: as laid out).
+    zoom: f32,
     drag: Option<Drag>,
     pressed: Option<NodeId>,
     /// The press came from a panel: bring the node into view on select.
@@ -137,6 +155,7 @@ impl ExplView {
             error: None,
             selected: None,
             pan: Point::default(),
+            zoom: 1.0,
             drag: None,
             pressed: None,
             reveal: false,
@@ -181,19 +200,59 @@ impl ExplView {
         }
     }
 
-    /// Centre of a node's dot in window coordinates.
-    fn centre(&self, id: NodeId, viewport: Size<Pixels>) -> Option<Point<Pixels>> {
-        let slot = self.layout.slots.get(&id)?;
-        let span = small_f32(self.layout.columns.saturating_sub(1)) * COLUMN_STRIDE;
+    /// Where the graph's first column and middle row land at `zoom`,
+    /// before panning: centred while the graph fits, else right-aligned so
+    /// the present and the goals stay in view.
+    fn anchor(&self, zoom: f32, viewport: Size<Pixels>) -> Point<Pixels> {
+        let span = small_f32(self.layout.columns.saturating_sub(1)) * COLUMN_STRIDE * zoom;
         let width = f32::from(viewport.width);
         let left = if span + 2.0 * MARGIN <= width {
             (width - span) / 2.0
         } else {
             width - RIGHT_MARGIN - span
         };
-        let x = left + small_f32(slot.column) * COLUMN_STRIDE;
-        let y = f32::from(viewport.height) / 2.0 + slot.row * ROW_STRIDE;
-        Some(point(px(x), px(y)) + self.pan)
+        point(px(left), px(f32::from(viewport.height) / 2.0))
+    }
+
+    /// Centre of a node's dot in window coordinates.
+    fn centre(&self, id: NodeId, viewport: Size<Pixels>) -> Option<Point<Pixels>> {
+        let slot = self.layout.slots.get(&id)?;
+        let offset = point(
+            px(small_f32(slot.column) * COLUMN_STRIDE * self.zoom),
+            px(slot.row * ROW_STRIDE * self.zoom),
+        );
+        Some(self.anchor(self.zoom, viewport) + offset + self.pan)
+    }
+
+    /// Zoom by `factor`, keeping the graph point under `at` where it is.
+    fn zoom_at(&mut self, factor: f32, at: Point<Pixels>, viewport: Size<Pixels>) {
+        let zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        let unscaled = (at - self.anchor(self.zoom, viewport) - self.pan) / self.zoom;
+        self.zoom = zoom;
+        self.pan = at - self.anchor(zoom, viewport) - unscaled * zoom;
+    }
+
+    /// Zoom and pan so the whole graph fits between the corner panels
+    /// (never enlarging past 1.0).
+    fn fit(&mut self, viewport: Size<Pixels>) {
+        let rows = self.layout.slots.values().map(|slot| slot.row);
+        let (top, bottom) = rows.fold((0.0_f32, 0.0_f32), |(lo, hi), r| (lo.min(r), hi.max(r)));
+        let span_x = small_f32(self.layout.columns.saturating_sub(1)) * COLUMN_STRIDE;
+        let span_y = (bottom - top) * ROW_STRIDE;
+        let room_x = (f32::from(viewport.width) - 2.0 * FIT_INSET_X).max(1.0);
+        let room_y = (f32::from(viewport.height) - 2.0 * FIT_INSET_Y).max(1.0);
+        let zoom = [room_x / span_x, room_y / span_y]
+            .into_iter()
+            .filter(|z| z.is_finite())
+            .fold(1.0_f32, f32::min)
+            .clamp(MIN_ZOOM, 1.0);
+        let middle = point(
+            px(span_x / 2.0),
+            px(f32::midpoint(top, bottom) * ROW_STRIDE),
+        );
+        let window_centre = point(viewport.width / 2.0, viewport.height / 2.0);
+        self.zoom = zoom;
+        self.pan = window_centre - self.anchor(zoom, viewport) - middle * zoom;
     }
 
     /// Pan so `id` is in view, if it is not.
@@ -262,14 +321,25 @@ impl ExplView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.pan += event.delta.pixel_delta(window.line_height());
+        // Scrolling up (or two fingers pushed away) zooms in.
+        let delta = event.delta.pixel_delta(window.line_height());
+        let factor = (f32::from(delta.y) / 240.0).exp();
+        self.zoom_at(factor, event.position, window.viewport_size());
         cx.notify();
     }
 
-    fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<'_, Self>) {
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let viewport = window.viewport_size();
+        let centre = point(viewport.width / 2.0, viewport.height / 2.0);
         match event.keystroke.key.as_str() {
             "escape" => self.selected = None,
-            "0" => self.pan = Point::default(),
+            "0" => {
+                self.pan = Point::default();
+                self.zoom = 1.0;
+            }
+            "=" | "+" => self.zoom_at(ZOOM_STEP, centre, viewport),
+            "-" | "_" => self.zoom_at(1.0 / ZOOM_STEP, centre, viewport),
+            "f" => self.fit(viewport),
             _ => return,
         }
         cx.notify();
@@ -386,9 +456,13 @@ impl ExplView {
         } else {
             node.title.clone()
         };
-        let label = (node.status != NodeStatus::Pruned || selected).then(|| {
+        let running = node.status == NodeStatus::Running;
+        let quiet = self.zoom < QUIET_LABELS_BELOW
+            && !(selected || current || running || candidate || node.kind == NodeKind::Goal);
+        let label_w = (LABEL_W * self.zoom).clamp(MIN_LABEL_W, LABEL_W);
+        let label = ((node.status != NodeStatus::Pruned || selected) && !quiet).then(|| {
             div()
-                .max_w(px(LABEL_W))
+                .max_w(px(label_w))
                 .px_1()
                 .bg(theme::background())
                 .truncate()
@@ -400,9 +474,9 @@ impl ExplView {
         div()
             .id(("node", id.0 as u64))
             .absolute()
-            .left(centre.x - px(LABEL_W / 2.0))
+            .left(centre.x - px(label_w / 2.0))
             .top(centre.y - px(DOT_BOX / 2.0))
-            .w(px(LABEL_W))
+            .w(px(label_w))
             .flex()
             .flex_col()
             .items_center()
