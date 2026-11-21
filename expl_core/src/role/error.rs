@@ -5,7 +5,7 @@ use thiserror::Error;
 use crate::agent::AgentError;
 use crate::declaration::DeclarationError;
 use crate::graph::GraphError;
-use crate::workspace::WorkspaceError;
+use crate::workspace::{ScratchChanges, WorkspaceError};
 
 /// A role could not do its work.
 #[derive(Debug, Error)]
@@ -37,6 +37,16 @@ pub enum RoleError {
         event: String,
         /// Why.
         reason: String,
+    },
+    /// A read-only agent changed its scratch worktree: it moved HEAD,
+    /// changed files, or left untracked files. Its response is not acted
+    /// on.
+    #[error("{role} agent modified its read-only worktree: {changes}")]
+    ScratchModified {
+        /// The role.
+        role: &'static str,
+        /// What changed, naming the changed paths.
+        changes: ScratchChanges,
     },
     /// The agent's response does not decode into the role's contract.
     #[error("{role} response does not match its schema: {source}")]

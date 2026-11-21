@@ -12,7 +12,9 @@
 //! Roles that only read (exploration, planning, evaluation) get a
 //! [`ScratchWorkspace`]: a detached worktree at a node's commit, private to
 //! one reaction and removed afterwards. Concurrent reactions therefore never
-//! share a working tree.
+//! share a working tree. A scratch worktree must come back unchanged:
+//! [`ScratchWorkspace::changes`] reports a moved HEAD, changed files, and
+//! new untracked files ([`ScratchChanges`]).
 //!
 //! Processes run in parallel, so git operations that touch shared
 //! repository state (worktree registration, branches, commits) are
@@ -23,4 +25,4 @@ mod error;
 mod workspace;
 
 pub use error::WorkspaceError;
-pub use workspace::{ScratchWorkspace, Workspace, Workspaces};
+pub use workspace::{ScratchChanges, ScratchWorkspace, Workspace, Workspaces};

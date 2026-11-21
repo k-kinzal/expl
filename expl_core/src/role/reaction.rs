@@ -1,5 +1,7 @@
 //! [`Reaction`] — one agent responding to one delivered event.
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
@@ -10,6 +12,7 @@ use crate::graph::{AgentRunStatus, Graph, NodeId};
 use crate::process::{Interrupt, ProcessId};
 use crate::prompt::Prompt;
 use crate::role::{Context, Report, RoleError};
+use crate::workspace::ScratchWorkspace;
 
 /// Everything a role needs to react to one event.
 #[derive(Debug, Clone, Copy)]
@@ -104,6 +107,39 @@ impl<'a> Reaction<'a> {
         prompt: &Prompt,
         schema: &serde_json::Value,
     ) -> Result<T, RoleError> {
+        self.run(graph, node, directory, None, prompt, schema)
+    }
+
+    /// Invoke the agent once in the read-only `scratch` worktree, as
+    /// [`invoke`](Self::invoke) does, then check that the worktree is
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`RoleError::ScratchModified`], naming what changed, when the agent
+    /// moved HEAD, changed files, or left untracked files — whether or not
+    /// it replied. The violation is appended to the run's log and the run
+    /// is journaled as failed with it; the response is discarded.
+    pub(crate) fn invoke_read_only<T: DeserializeOwned>(
+        &self,
+        graph: &mut Graph,
+        node: Option<NodeId>,
+        scratch: &ScratchWorkspace,
+        prompt: &Prompt,
+        schema: &serde_json::Value,
+    ) -> Result<T, RoleError> {
+        self.run(graph, node, scratch.path(), Some(scratch), prompt, schema)
+    }
+
+    fn run<T: DeserializeOwned>(
+        &self,
+        graph: &mut Graph,
+        node: Option<NodeId>,
+        directory: &Path,
+        scratch: Option<&ScratchWorkspace>,
+        prompt: &Prompt,
+        schema: &serde_json::Value,
+    ) -> Result<T, RoleError> {
         let role = self.agent.role();
         let run_id = graph.begin_agent_run(
             self.agent.name(),
@@ -147,6 +183,23 @@ impl<'a> Reaction<'a> {
                         source,
                     })
             });
+        let outcome = match scratch {
+            Some(scratch) if !matches!(outcome, Err(RoleError::Agent(AgentError::Interrupted))) => {
+                match scratch.changes() {
+                    Ok(changes) if changes.is_empty() => outcome,
+                    Ok(changes) => {
+                        let violation = RoleError::ScratchModified {
+                            role: role.as_str(),
+                            changes,
+                        };
+                        append_to_log(&log, &violation, outcome.as_ref().err());
+                        Err(violation)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            Some(_) | None => outcome,
+        };
         match outcome {
             Ok((decoded, session_id)) => {
                 graph.finish_agent_run(
@@ -166,6 +219,18 @@ impl<'a> Reaction<'a> {
                 graph.finish_agent_run(run_id, status, None, Some(&error.to_string()))?;
                 Err(error)
             }
+        }
+    }
+}
+
+/// Append a read-only `violation` (and the agent's own `failure`, which it
+/// supersedes) to the run's raw log. Best effort: the run's journaled
+/// error records the violation either way.
+fn append_to_log(log: &Path, violation: &RoleError, failure: Option<&RoleError>) {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log) {
+        writeln!(file, "\n[expl] {violation}").ok();
+        if let Some(failure) = failure {
+            writeln!(file, "[expl] the run had also failed: {failure}").ok();
         }
     }
 }

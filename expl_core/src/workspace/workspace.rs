@@ -46,6 +46,46 @@ pub struct ScratchWorkspace {
     repository: Git,
     path: PathBuf,
     lock: PathBuf,
+    /// The commit HEAD was detached at when the worktree was created.
+    head: String,
+}
+
+/// What was changed in a [`ScratchWorkspace`] since it was created; empty
+/// when it is unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScratchChanges {
+    /// The commit the worktree was created at.
+    pub created_at: String,
+    /// The commit HEAD points at now, when it moved away from `created_at`.
+    pub moved_to: Option<String>,
+    /// Changed paths, sorted: those that differ between `created_at` and
+    /// the moved HEAD, plus staged, modified, deleted, and untracked files.
+    pub paths: Vec<String>,
+}
+
+impl ScratchChanges {
+    /// Whether nothing changed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.moved_to.is_none() && self.paths.is_empty()
+    }
+}
+
+impl std::fmt::Display for ScratchChanges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(moved_to) = &self.moved_to {
+            write!(f, "HEAD moved from {} to {moved_to}", self.created_at)?;
+            if !self.paths.is_empty() {
+                f.write_str("; ")?;
+            }
+        }
+        if !self.paths.is_empty() {
+            write!(f, "changed paths: {}", self.paths.join(", "))?;
+        } else if self.moved_to.is_none() {
+            f.write_str("no changes")?;
+        }
+        Ok(())
+    }
 }
 
 /// Holds the cross-process git lock until dropped.
@@ -146,12 +186,14 @@ impl Workspaces {
     ///
     /// # Errors
     ///
-    /// [`WorkspaceError::NoCommit`] when the node was never realised.
+    /// [`WorkspaceError::NoCommit`] when the node was never realised;
+    /// [`WorkspaceError::Git`] when git fails.
     pub fn scratch(&self, node: &Node) -> Result<ScratchWorkspace, WorkspaceError> {
         let commit = node
             .head_commit
             .as_deref()
             .ok_or(WorkspaceError::NoCommit(node.id))?;
+        let commit = self.repository.resolve_commit(commit)?;
         let sequence = SCRATCH_SEQUENCE.fetch_add(1, Ordering::SeqCst);
         let path = self.root.join(format!(
             "scratch-{}-{}-{sequence}",
@@ -162,11 +204,12 @@ impl Workspaces {
         std::fs::create_dir_all(&self.root)?;
         let path_text = path.display().to_string();
         self.repository
-            .run(&["worktree", "add", "--detach", &path_text, commit])?;
+            .run(&["worktree", "add", "--detach", &path_text, &commit])?;
         Ok(ScratchWorkspace {
             repository: self.repository.clone(),
             path,
             lock: self.lock.clone(),
+            head: commit,
         })
     }
 
@@ -372,6 +415,37 @@ impl ScratchWorkspace {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The commit HEAD was detached at when the worktree was created.
+    #[must_use]
+    pub fn head(&self) -> &str {
+        &self.head
+    }
+
+    /// What changed since the worktree was created: whether HEAD moved,
+    /// files changed, or untracked files appeared (ignored files aside).
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Git`] when git fails.
+    pub fn changes(&self) -> Result<ScratchChanges, WorkspaceError> {
+        let git = Git::new(&self.path);
+        let head = git.resolve_commit("HEAD")?;
+        let mut paths = git.status_paths()?;
+        let moved_to = if head == self.head {
+            None
+        } else {
+            paths.extend(git.diff_paths(&self.head, &head)?);
+            Some(head)
+        };
+        paths.sort();
+        paths.dedup();
+        Ok(ScratchChanges {
+            created_at: self.head.clone(),
+            moved_to,
+            paths,
+        })
     }
 }
 

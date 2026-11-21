@@ -532,7 +532,7 @@ fn explore(
     let prompt = prompt(reaction, &task, &known, &schema);
     let scratch = reaction.context().workspaces().scratch(ground)?;
     let response: Response =
-        reaction.invoke(graph, Some(start.id), scratch.path(), &prompt, &schema)?;
+        reaction.invoke_read_only(graph, Some(start.id), &scratch, &prompt, &schema)?;
     drop(scratch);
 
     let mut report = ExplorationReport {
@@ -663,7 +663,7 @@ fn explore_failure(
     let prompt = prompt(reaction, &task, &known, &schema);
     let scratch = reaction.context().workspaces().scratch(&ground)?;
     let response: Response =
-        reaction.invoke(graph, Some(failed.id), scratch.path(), &prompt, &schema)?;
+        reaction.invoke_read_only(graph, Some(failed.id), &scratch, &prompt, &schema)?;
     drop(scratch);
 
     let mut report = ExplorationReport {
@@ -752,7 +752,7 @@ fn explore_ahead(
     let prompt = prompt(reaction, &task, &known, &schema);
     let scratch = reaction.context().workspaces().scratch(&ground)?;
     let response: Response =
-        reaction.invoke(graph, Some(start.id), scratch.path(), &prompt, &schema)?;
+        reaction.invoke_read_only(graph, Some(start.id), &scratch, &prompt, &schema)?;
     drop(scratch);
 
     let mut report = ExplorationReport {
@@ -846,7 +846,7 @@ fn survey(
     let prompt = prompt(reaction, &task, &[], &schema);
     let scratch = reaction.context().workspaces().scratch(&origin)?;
     let response: SurveyResponse =
-        reaction.invoke(graph, None, scratch.path(), &prompt, &schema)?;
+        reaction.invoke_read_only(graph, None, &scratch, &prompt, &schema)?;
     drop(scratch);
 
     let mut report = ExplorationReport {

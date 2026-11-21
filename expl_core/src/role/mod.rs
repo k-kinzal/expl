@@ -24,6 +24,11 @@
 //! ahead of a step not carried out yet (assuming it succeeds), or,
 //! for an agent declared with `scope = "graph"`, across the whole graph.
 //!
+//! The scratch worktrees of exploration, planning, and evaluation are
+//! read-only: an agent that moves HEAD, changes files, or leaves untracked
+//! files there fails its run and the reaction with
+//! [`RoleError::ScratchModified`], and its response is not acted on.
+//!
 //! Roles never print and never decide *when* they run: a
 //! [`Process`](crate::process::Process) hands them one event at a time.
 //!
