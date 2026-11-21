@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 /// One script plays every role. Exploration proposes a step only for a new
 /// goal, so the graph settles; execution writes a file named after its node
 /// and sleeps while `@DIR@/slow` exists. Planning answers with
-/// `@DIR@/plan.json` when present. Every prompt is kept in `@DIR@/prompts/`
-/// for inspection.
+/// `@DIR@/plan.json` and evaluation with `@DIR@/evaluation.sh` when present.
+/// Every prompt is kept in `@DIR@/prompts/` for inspection.
 const AGENT: &str = r#"#!/bin/sh
 mkdir -p "@DIR@/prompts"
 cat > "@DIR@/prompts/$EXPL_ROLE-$$.txt"
@@ -31,7 +31,9 @@ execution)
   echo "node $EXPL_NODE" > "node-$EXPL_NODE.txt"
   echo '{"succeeded":true,"summary":"wrote a file"}' ;;
 evaluation)
-  if ls node-*.txt > /dev/null 2>&1; then
+  if [ -f "@DIR@/evaluation.sh" ]; then
+    sh "@DIR@/evaluation.sh"
+  elif ls node-*.txt > /dev/null 2>&1; then
     echo '{"evaluations":[{"goal":2,"satisfied":true,"score":90,"reason":"file exists"}]}'
   else
     echo '{"evaluations":[{"goal":2,"satisfied":false,"score":0,"reason":"missing"}]}'
@@ -354,6 +356,256 @@ fn planning_joins_paths() {
             "{expected} missing from {files}"
         );
     }
+}
+
+/// A test-only planner policy, the counterexample to parallel search: of
+/// the steps that build on exactly the same nodes (siblings), keep only the
+/// highest-priority one and prune the rest. Joins onto a pruned sibling and
+/// its place on paths go with it.
+fn keep_highest_priority_sibling(
+    plan: &serde_json::Value,
+    predecessors: impl Fn(i64) -> Vec<i64>,
+) -> serde_json::Value {
+    let as_i64 = |v: &serde_json::Value| v.as_i64().expect("an integer");
+    let priorities: Vec<(i64, i64)> = plan["priorities"]
+        .as_array()
+        .expect("priorities")
+        .iter()
+        .map(|p| (as_i64(&p["node"]), as_i64(&p["priority"])))
+        .collect();
+    let mut top: std::collections::BTreeMap<Vec<i64>, (i64, i64)> =
+        std::collections::BTreeMap::new();
+    for &(node, priority) in &priorities {
+        let mut after = predecessors(node);
+        after.sort_unstable();
+        let best = top.entry(after).or_insert((node, priority));
+        if priority > best.1 {
+            *best = (node, priority);
+        }
+    }
+    let kept: std::collections::BTreeSet<i64> = top.values().map(|&(node, _)| node).collect();
+    let pruned: Vec<i64> = priorities
+        .iter()
+        .map(|&(node, _)| node)
+        .filter(|node| !kept.contains(node))
+        .collect();
+
+    let mut policy = plan.clone();
+    policy["summary"] = serde_json::json!("keep only the highest-priority sibling");
+    policy["priorities"] = plan["priorities"]
+        .as_array()
+        .expect("priorities")
+        .iter()
+        .filter(|p| kept.contains(&as_i64(&p["node"])))
+        .cloned()
+        .collect();
+    let mut prune_list = plan["prunes"].as_array().cloned().unwrap_or_default();
+    prune_list.extend(pruned.iter().map(
+        |node| serde_json::json!({"node": node, "reason": "a higher-priority sibling is kept"}),
+    ));
+    policy["prunes"] = prune_list.into();
+    policy["joins"] = plan["joins"]
+        .as_array()
+        .expect("joins")
+        .iter()
+        .filter(|j| {
+            !pruned.contains(&as_i64(&j["node"]))
+                && !j["after"]
+                    .as_array()
+                    .expect("after")
+                    .iter()
+                    .any(|a| pruned.contains(&as_i64(a)))
+        })
+        .cloned()
+        .collect();
+    for path in policy["paths"].as_array_mut().expect("paths") {
+        let nodes: Vec<serde_json::Value> = path["nodes"]
+            .as_array()
+            .expect("nodes")
+            .iter()
+            .filter(|n| !pruned.contains(&as_i64(n)))
+            .cloned()
+            .collect();
+        path["nodes"] = nodes.into();
+    }
+    policy
+}
+
+/// What one planner made of the join fixture.
+struct JoinOutcome {
+    /// The top sibling, the lower-ranked sibling, and the step joining them.
+    top: i64,
+    other: i64,
+    joined: i64,
+    /// The goal the top sibling satisfies alone, and the one that needs both.
+    first: i64,
+    both: i64,
+    /// Steps carried out, in id order.
+    executed: Vec<i64>,
+    /// What the joining step builds on.
+    joined_after: Vec<i64>,
+    /// `(goal, step)` for every candidate.
+    candidates: std::collections::BTreeSet<(i64, i64)>,
+}
+
+/// Two sibling steps build on the origin: the top-ranked one writes what
+/// the first goal needs, the lower-ranked one the second half of what the
+/// second goal needs. A third step builds on the top sibling, and the
+/// existing planner joins it with the other sibling, so it satisfies both.
+/// `policy` may rewrite the existing planner's plan before planning acts.
+fn plan_join_fixture(
+    policy: impl FnOnce(&serde_json::Value, &dyn Fn(i64) -> Vec<i64>) -> serde_json::Value,
+) -> JoinOutcome {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let id = |text: String| text.parse::<i64>().expect("an id");
+    let first = id(ok(
+        repo,
+        &["goal", "add", "Greet", "--objective", "Say hello"],
+    ));
+    let both = id(ok(
+        repo,
+        &[
+            "goal",
+            "add",
+            "Greet and part",
+            "--objective",
+            "Say hello and goodbye",
+        ],
+    ));
+    let top = id(ok(repo, &["node", "add", "Write hello"]));
+    let other = id(ok(repo, &["node", "add", "Write goodbye"]));
+    let joined = id(ok(
+        repo,
+        &["node", "add", "Combine", "--after", &top.to_string()],
+    ));
+    std::fs::write(
+        sandbox.dir.path().join("evaluation.sh"),
+        format!(
+            r#"verdict() {{ if $2; then echo "{{\"goal\":$1,\"satisfied\":true,\"score\":90,\"reason\":\"present\"}}"; else echo "{{\"goal\":$1,\"satisfied\":false,\"score\":10,\"reason\":\"missing\"}}"; fi; }}
+hello=false; goodbye=false
+[ -f node-{top}.txt ] && hello=true
+[ -f node-{other}.txt ] && goodbye=true
+both=false; $hello && $goodbye && both=true
+echo "{{\"evaluations\":[$(verdict {first} $hello),$(verdict {both} $both)]}}"
+"#
+        ),
+    )
+    .expect("evaluation");
+
+    let existing = serde_json::json!({
+        "summary": "both siblings, joined",
+        "paths": [
+            {"goal": first, "nodes": [top], "rationale": "hello alone greets"},
+            {"goal": both, "nodes": [top, other, joined], "rationale": "the join has both"},
+        ],
+        "priorities": [
+            {"node": top, "priority": 3},
+            {"node": other, "priority": 2},
+            {"node": joined, "priority": 1},
+        ],
+        "prunes": [],
+        "joins": [{"node": joined, "after": [other]}],
+    });
+    let predecessors =
+        |step: i64| -> Vec<i64> { node_ids(&node(repo, &step.to_string())["predecessors"]) };
+    let plan = policy(&existing, &predecessors);
+    std::fs::write(sandbox.dir.path().join("plan.json"), plan.to_string()).expect("plan");
+
+    for agent in ["planner", "executor", "evaluator"] {
+        ok(repo, &["run", agent, "--exit-when-idle"]);
+    }
+    let executed = ok(
+        repo,
+        &[
+            "node",
+            "ls",
+            "--kind",
+            "step",
+            "--status",
+            "completed",
+            "-q",
+        ],
+    )
+    .lines()
+    .map(|line| id(line.to_owned()))
+    .collect();
+    let candidates = json_lines(&ok(repo, &["candidate", "ls", "--format", "json"]))
+        .iter()
+        .map(|c| {
+            (
+                c["goal"].as_i64().expect("goal"),
+                c["node"].as_i64().expect("node"),
+            )
+        })
+        .collect();
+    JoinOutcome {
+        top,
+        other,
+        joined,
+        first,
+        both,
+        executed,
+        joined_after: predecessors(joined),
+        candidates,
+    }
+}
+
+/// Sorted node ids from a JSON array.
+fn node_ids(value: &serde_json::Value) -> Vec<i64> {
+    let mut ids: Vec<i64> = value
+        .as_array()
+        .expect("ids")
+        .iter()
+        .filter_map(serde_json::Value::as_i64)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[test]
+fn keeping_only_the_top_sibling_loses_the_joined_candidate() {
+    let existing = plan_join_fixture(|plan, _| plan.clone());
+    let greedy =
+        plan_join_fixture(|plan, predecessors| keep_highest_priority_sibling(plan, predecessors));
+    let JoinOutcome {
+        top,
+        other,
+        joined,
+        first,
+        both,
+        ..
+    } = existing;
+    assert_eq!(
+        (greedy.top, greedy.other, greedy.joined),
+        (top, other, joined)
+    );
+
+    // The existing planner runs both siblings and the step joining them,
+    // which satisfies both goals.
+    assert_eq!(existing.executed, [top, other, joined]);
+    assert_eq!(existing.joined_after, [top, other]);
+    for expected in [(first, top), (first, joined), (both, joined)] {
+        assert!(
+            existing.candidates.contains(&expected),
+            "{expected:?} in {:?}",
+            existing.candidates
+        );
+    }
+
+    // Keeping only the top sibling executes fewer steps: the other sibling
+    // is pruned, so the join never forms. The top sibling still satisfies
+    // the first goal, but no candidate satisfies the second.
+    assert!(greedy.executed.len() < existing.executed.len());
+    assert_eq!(greedy.executed, [top, joined]);
+    assert_eq!(greedy.joined_after, [top]);
+    assert!(greedy.candidates.contains(&(first, top)));
+    assert!(
+        greedy.candidates.iter().all(|&(goal, _)| goal != both),
+        "{:?}",
+        greedy.candidates
+    );
+    assert!(!greedy.candidates.contains(&(both, joined)));
 }
 
 #[test]
