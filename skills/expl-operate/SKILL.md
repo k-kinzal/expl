@@ -30,9 +30,18 @@ yourself — expl does. You only fix what blocks expl from continuing to explore
 | --- | --- | --- | --- |
 | explorer | exploration | claude_code ⇄ codex | 1 |
 | planner | planning | claude_code ⇄ codex | 1 |
-| executor | execution | cursor_agent (`--model claude-opus-5-5-high --force --trust --sandbox disabled`) | 2 |
+| executor | execution | cursor_agent (`--model claude-opus-5-5-high --force --trust --sandbox disabled`) | 1 |
 | evaluator | evaluation | claude_code ⇄ codex | 1 |
 
+- **One replica per agent, on purpose.** The owner prefers slow exploration over
+  bursts of token use. Do not raise `replicas` without being asked.
+- **Random revisits** (`revisit_cooldown = 600` on the explorer): when the explorer
+  has no event to react to, it waits until 10 minutes have passed since its last
+  reaction, then explores again from a random starting point — the active origin,
+  a completed step not yet in the trunk, or a counter-exploration goal
+  (`node.revisited` in `expl event ls`). Starting points are revisited again and
+  again; each prompt lists the steps that already exist so new ones are different.
+  `max_pending` still pauses it. Raise the cooldown if token use is too high.
 - **Routing** (`[[agent.<name>.alternative]]`): each invocation starts at the next
   CLI in turn (per process, seeded by pid) and falls over to the other CLI when
   one fails (usage limit, outage, unusable reply). A run log shows which CLI ran
