@@ -827,6 +827,117 @@ fn planning_settles_only_the_proposals_it_was_shown() {
 }
 
 #[test]
+fn an_invalid_plan_falls_over_to_the_alternative_cli() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let dir = sandbox.dir.path();
+    // A second planning CLI that answers with a well-formed JSON object
+    // missing `summary` and with `paths` of the wrong type.
+    let invalid = dir.join("invalid-planner.sh");
+    std::fs::write(
+        &invalid,
+        format!(
+            "#!/bin/sh\ncat > /dev/null\necho run >> \"{}\"\necho '{{\"paths\":\"none\",\"priorities\":[]}}'\n",
+            dir.join("invalid-runs").display()
+        ),
+    )
+    .expect("invalid planner");
+    let mut perms = std::fs::metadata(&invalid).expect("meta").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&invalid, perms).expect("chmod");
+    let declaration = std::fs::read_to_string(repo.join("expl.toml")).expect("read");
+    std::fs::write(
+        repo.join("expl.toml"),
+        format!(
+            "{declaration}\n[[agent.planner.alternative]]\ndriver = \"generic\"\ncommand = [\"{}\"]\n",
+            invalid.display()
+        ),
+    )
+    .expect("declaration");
+
+    let goal = ok(repo, &["goal", "add", "Say hello"]);
+    let a = ok(repo, &["node", "add", "A", "--before", &goal]);
+    let prompts = dir.join("prompts");
+    let valid_started = || {
+        std::fs::read_dir(&prompts).is_ok_and(|entries| {
+            entries.flatten().any(|e| {
+                e.file_name().to_string_lossy().starts_with("planning-")
+                    && std::fs::read_to_string(e.path()).is_ok_and(|p| p.contains("## Response"))
+            })
+        })
+    };
+
+    // Two plannings in one process: its routes start at different CLIs, so
+    // one of them starts at the invalid one.
+    sandbox.marker("slow-planning", true);
+    let mut planner = Command::new(env!("CARGO_BIN_EXE_expl"))
+        .arg("-C")
+        .arg(repo)
+        .args(["run", "planner", "--exit-when-idle"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("planner");
+    wait_until("the valid planner to start", valid_started);
+    let later = ok(repo, &["node", "add", "Later", "--before", &goal]);
+    std::fs::write(
+        dir.join("plan.json"),
+        format!(
+            r#"{{"summary":"the valid plan","paths":[{{"goal":{goal},"nodes":[{a}],"rationale":"from the valid CLI"}}],"priorities":[{{"node":{a},"priority":3}},{{"node":{later},"priority":4}}],"prunes":[],"joins":[]}}"#
+        ),
+    )
+    .expect("plan");
+    sandbox.marker("slow-planning", false);
+    assert!(planner.wait().expect("planner").success());
+
+    let invalid_runs = std::fs::read_to_string(dir.join("invalid-runs")).expect("invalid runs");
+    assert_eq!(invalid_runs.lines().count(), 1, "{invalid_runs}");
+
+    // The log of the planning that started at the invalid CLI records its
+    // response and why it was rejected, then the valid CLI's answer.
+    let logs: Vec<String> = std::fs::read_dir(repo.join(".expl/logs"))
+        .expect("logs")
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with("-planner.log"))
+        .map(|e| std::fs::read_to_string(e.path()).expect("log"))
+        .collect();
+    assert_eq!(logs.len(), 2, "{logs:?}");
+    let fell_over: Vec<&String> = logs
+        .iter()
+        .filter(|log| log.contains(r#"{"paths":"none","priorities":[]}"#))
+        .collect();
+    assert_eq!(fell_over.len(), 1, "{logs:?}");
+    let log = fell_over[0];
+    let rejected = log
+        .find("=== generic failed: agent response does not match its schema")
+        .unwrap_or_else(|| panic!("no rejection in {log}"));
+    let answered = log
+        .rfind("the valid plan")
+        .unwrap_or_else(|| panic!("no valid plan in {log}"));
+    assert!(rejected < answered, "{log}");
+    assert!(log.contains("falling over to the next CLI"), "{log}");
+
+    // Both plannings were recorded from the valid CLI's plan.
+    let plans = json_lines(&ok(
+        repo,
+        &["event", "ls", "--kind", "plan.recorded", "--format", "json"],
+    ));
+    assert_eq!(plans.len(), 2, "{plans:?}");
+    let listed = expl(repo, &["path", "ls"]);
+    assert!(
+        String::from_utf8_lossy(&listed.stderr).contains("the valid plan"),
+        "{listed:?}"
+    );
+    let paths = json_lines(&ok(repo, &["path", "ls", "--format", "json"]));
+    assert_eq!(paths.len(), 1, "{paths:?}");
+    assert_eq!(paths[0]["rationale"], "from the valid CLI");
+    assert_eq!(node(repo, &a)["node"]["status"], "planned");
+    assert_eq!(node(repo, &a)["node"]["priority"], 3);
+    assert_eq!(node(repo, &later)["node"]["status"], "planned");
+    assert_eq!(node(repo, &later)["node"]["priority"], 4);
+}
+
+#[test]
 fn up_runs_every_agent_until_down() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;

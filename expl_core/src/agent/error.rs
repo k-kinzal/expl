@@ -34,4 +34,8 @@ pub enum AgentError {
     /// The agent finished but its response is not the requested shape.
     #[error("agent response is unusable: {0}")]
     InvalidResponse(String),
+    /// The agent replied with a JSON object, but it does not decode into
+    /// the response the role expects: a field is missing or invalid.
+    #[error("agent response does not match its schema: {0}")]
+    Mismatch(#[source] serde_json::Error),
 }

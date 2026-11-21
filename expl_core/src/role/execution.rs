@@ -172,9 +172,7 @@ fn invoke(
             }
             Err(error)
         }
-        Err(error @ (RoleError::Agent(_) | RoleError::Response { .. })) => {
-            Ok((false, format!("execution agent failed: {error}")))
-        }
+        Err(error @ RoleError::Agent(_)) => Ok((false, format!("execution agent failed: {error}"))),
         Err(error) => {
             graph.fail(id, &error.to_string())?;
             Err(error)

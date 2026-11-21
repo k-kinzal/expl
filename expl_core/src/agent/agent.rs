@@ -4,8 +4,8 @@
 //! `alternative`s). Each invocation is **routed**: it starts at the next
 //! CLI in turn, so the work spreads across them, and falls over to the
 //! following CLI when one fails (a usage limit, an outage, an unusable
-//! reply, a declared `timeout` outrun). Every attempt goes to the same run
-//! log.
+//! reply, a reply that does not decode into the response the role expects,
+//! a declared `timeout` outrun). Every attempt goes to the same run log.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use serde::de::DeserializeOwned;
 
 use crate::agent::{
     AgentDriver, AgentError, AgentRequest, AgentRun, ClaudeCodeDriver, CodexDriver,
@@ -163,18 +165,23 @@ impl Agent {
         &self.declaration
     }
 
-    /// Invoke the agent once and return its structured response: route the
-    /// invocation to the CLI whose turn it is, falling over to the next CLI
-    /// while one fails. An attempt that outruns its CLI's `timeout` is
-    /// stopped and fails like any other.
+    /// Invoke the agent once and return its structured response decoded
+    /// into `R`: route the invocation to the CLI whose turn it is, falling
+    /// over to the next CLI while one fails. An attempt that outruns its
+    /// CLI's `timeout` is stopped and fails like any other, and so does one
+    /// whose reply does not decode into `R`.
     ///
     /// # Errors
     ///
     /// [`AgentError::Interrupted`] as soon as an attempt is interrupted;
     /// otherwise the error of the only CLI (such as
-    /// [`AgentError::TimedOut`]), or [`AgentError::Failed`] naming every
-    /// CLI's failure when each of several failed.
-    pub fn invoke(&self, invocation: &Invocation<'_>) -> Result<AgentRun, AgentError> {
+    /// [`AgentError::TimedOut`] or [`AgentError::Mismatch`]), or
+    /// [`AgentError::Failed`] naming every CLI's failure when each of
+    /// several failed.
+    pub fn invoke<R: DeserializeOwned>(
+        &self,
+        invocation: &Invocation<'_>,
+    ) -> Result<AgentRun<R>, AgentError> {
         let count = self.clis.len();
         let start = self.turn.fetch_add(1, Ordering::Relaxed) % count.max(1);
         let mut log = File::create(invocation.log)?;
@@ -185,7 +192,10 @@ impl Agent {
                 log = OpenOptions::new().append(true).open(invocation.log)?;
                 writeln!(log, "=== falling over to the next CLI ===")?;
             }
-            match self.attempt(cli, invocation, log.try_clone()?) {
+            match self
+                .attempt(cli, invocation, log.try_clone()?)
+                .and_then(AgentRun::decode)
+            {
                 Ok(run) => return Ok(run),
                 Err(AgentError::Interrupted) => return Err(AgentError::Interrupted),
                 Err(error) if count == 1 => return Err(error),
@@ -481,6 +491,13 @@ mod tests {
     }
 
     fn invoke(agent: &Agent, log: &Path) -> Result<AgentRun, AgentError> {
+        invoke_as(agent, log)
+    }
+
+    fn invoke_as<R: DeserializeOwned>(
+        agent: &Agent,
+        log: &Path,
+    ) -> Result<AgentRun<R>, AgentError> {
         let prompt = Prompt::from("p");
         let schema = serde_json::json!({});
         agent.invoke(&Invocation {
@@ -529,6 +546,49 @@ command = ["sh", "-c", "echo '{\"cli\":2}'"]
         let failing = agent_text_all_failing();
         let error = invoke(&agent(&failing), &log).expect_err("all fail");
         assert!(error.to_string().contains("every CLI failed"), "{error}");
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct Typed {
+        cli: i64,
+    }
+
+    #[test]
+    fn a_response_of_the_wrong_shape_falls_over_to_the_next() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("run.log");
+        let routed = agent(&ROUTED.replacen(
+            "echo '{\\\"cli\\\":1}'",
+            "echo '{\\\"cli\\\":\\\"one\\\"}'",
+            1,
+        ));
+        let mut fell_over = false;
+        // Routing alternates the first CLI, so one of two starts at it.
+        for _ in 0..2 {
+            let run = invoke_as::<Typed>(&routed, &log).expect("run");
+            assert_eq!(run.response.cli, 2);
+            let text = std::fs::read_to_string(&log).expect("log");
+            fell_over |= text.contains(r#"{"cli":"one"}"#)
+                && text.contains("generic failed: agent response does not match its schema")
+                && text.contains("falling over to the next CLI");
+        }
+        assert!(
+            fell_over,
+            "no invocation fell over from the invalid response"
+        );
+
+        let single = agent(
+            r#"
+[agent.a]
+role = "planning"
+driver = "generic"
+command = ["sh", "-c", "echo '{\"other\":1}'"]
+replicas = 1
+"#,
+        );
+        let error = invoke_as::<Typed>(&single, &log).expect_err("missing field");
+        assert!(matches!(error, AgentError::Mismatch(_)), "{error:?}");
+        assert!(error.to_string().contains("missing field `cli`"), "{error}");
     }
 
     #[test]

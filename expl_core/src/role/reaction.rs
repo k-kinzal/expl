@@ -166,7 +166,7 @@ impl<'a> Reaction<'a> {
         }
         let outcome = self
             .agent
-            .invoke(&Invocation {
+            .invoke::<T>(&Invocation {
                 directory,
                 prompt,
                 response_schema: schema,
@@ -174,15 +174,8 @@ impl<'a> Reaction<'a> {
                 log: &log,
                 interrupt: self.interrupt,
             })
-            .map_err(RoleError::from)
-            .and_then(|run| {
-                serde_json::from_value::<T>(run.response)
-                    .map(|decoded| (decoded, run.session_id))
-                    .map_err(|source| RoleError::Response {
-                        role: role.as_str(),
-                        source,
-                    })
-            });
+            .map(|run| (run.response, run.session_id))
+            .map_err(RoleError::from);
         let outcome = match scratch {
             Some(scratch) if !matches!(outcome, Err(RoleError::Agent(AgentError::Interrupted))) => {
                 match scratch.changes() {
