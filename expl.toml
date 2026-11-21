@@ -158,7 +158,9 @@ role = "evaluation"
 driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
-env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
+# Its own target directory: sharing the executor's, a test run could pick up
+# a binary another worktree's build had just overwritten.
+env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target-evaluator" }
 replicas = 1
 instructions = """
 Run `cargo clippy --all-targets` and `cargo test`. A goal is never satisfied by a branch on

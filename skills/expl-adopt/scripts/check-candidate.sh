@@ -38,7 +38,9 @@ if ! git -C "$work" merge --quiet --no-ff --no-commit "$branch" >/dev/null 2>&1;
   exit 4
 fi
 
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo/.expl/cargo-target}"
+# Never the agents' target directory: their builds of other worktrees would
+# overwrite the binaries this check runs.
+export CARGO_TARGET_DIR="$repo/.expl/check-target"
 cd "$work"
 cargo fmt --all --check || { echo "REJECT: cargo fmt --check fails"; exit 5; }
 cargo clippy --all-targets --quiet 2>&1 | tail -20
