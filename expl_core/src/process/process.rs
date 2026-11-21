@@ -9,9 +9,9 @@ use thiserror::Error;
 
 use crate::agent::Agent;
 use crate::event::{Delivery, Inbox, InboxError};
-use crate::graph::{Graph, GraphError};
+use crate::graph::{Graph, GraphError, NodeId};
 use crate::process::{HEARTBEAT_SECONDS, Interrupt, ProcessId, ProcessRecord, Processes};
-use crate::role::{Context, Reaction, Report, RoleError};
+use crate::role::{Context, Reaction, Report, Role, RoleError};
 use crate::store::StoreError;
 use crate::trunk::{Advance, Trunk};
 
@@ -86,6 +86,13 @@ pub enum ProcessActivity<'a> {
         error: &'a RoleError,
         /// Whether the event will be delivered again.
         retry: bool,
+    },
+    /// A delivery whose holder died on its last attempt was given up.
+    Abandoned {
+        /// The delivery, as its last holder leased it.
+        delivery: &'a Delivery,
+        /// The step its execution left `running`, now failed.
+        failed: Option<NodeId>,
     },
     /// The process is exiting.
     Exiting(&'a str),
@@ -257,7 +264,9 @@ impl<'a> Process<'a> {
                     }
                 }
             }
-            let Some(delivery) = inbox.lease(role.reactions(), self.id, role.is_exclusive())?
+            give_up_abandoned(role, &inbox, &mut graph, observer)?;
+            let Some(delivery) =
+                inbox.lease(role.reactions(), self.id, role.is_exclusive(), MAX_ATTEMPTS)?
             else {
                 if options.exit_when_idle {
                     return Ok("idle".to_owned());
@@ -374,11 +383,25 @@ impl<'a> Process<'a> {
                     thread::sleep(POLL * 4);
                 }
                 Err(RoleError::Graph(error)) => {
-                    holding(inbox.release(&delivery))?;
+                    // The process gives up on the event, and a step it left
+                    // `running` fails. When even that fails, the lease is
+                    // left to expire: the event comes back, counted, until
+                    // it is abandoned.
+                    let why = format!("gave up after a graph failure: {error}");
+                    if role.abandon(&delivery.event, &mut graph, &why).is_ok() {
+                        holding(inbox.give_up(&delivery, &why))?;
+                    }
                     return Err(error.into());
                 }
                 Err(error) => {
-                    match holding(inbox.fail(&delivery, &error.to_string(), MAX_ATTEMPTS))? {
+                    let why = error.to_string();
+                    // The last attempt: clean up before the delivery is
+                    // settled, so dying in between leaves it to be retried
+                    // or abandoned rather than lost.
+                    if delivery.attempts >= MAX_ATTEMPTS {
+                        role.abandon(&delivery.event, &mut graph, &why)?;
+                    }
+                    match holding(inbox.fail(&delivery, &why, MAX_ATTEMPTS))? {
                         Some(retry) => observer.observe(&ProcessActivity::Failed {
                             delivery: &delivery,
                             error: &error,
@@ -395,6 +418,30 @@ impl<'a> Process<'a> {
             }
         }
     }
+}
+
+/// Give up every delivery of `role` whose holder died on its last attempt,
+/// failing first what its reaction left `running`.
+fn give_up_abandoned(
+    role: Role,
+    inbox: &Inbox,
+    graph: &mut Graph,
+    observer: &dyn ProcessObserver,
+) -> Result<(), ProcessError> {
+    for delivery in inbox.abandoned(role.reactions(), MAX_ATTEMPTS)? {
+        let why = format!(
+            "abandoned: the process reacting to {} died on attempt {} of {MAX_ATTEMPTS}",
+            delivery.event, delivery.attempts
+        );
+        let failed = role.abandon(&delivery.event, graph, &why)?;
+        if inbox.give_up_abandoned(&delivery)? {
+            observer.observe(&ProcessActivity::Abandoned {
+                delivery: &delivery,
+                failed,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Record `node.revisited` for a random starting point (steps not carried
@@ -426,6 +473,88 @@ fn random_below(bound: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::{EventId, EventKind};
+    use crate::graph::NodeStatus;
+    use crate::store::{self, EPOCH};
+
+    /// Remembers which deliveries were abandoned.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(EventId, Option<NodeId>)>>);
+
+    impl ProcessObserver for Recorder {
+        fn observe(&self, activity: &ProcessActivity<'_>) {
+            if let ProcessActivity::Abandoned { delivery, failed } = activity {
+                self.0
+                    .lock()
+                    .expect("lock")
+                    .push((delivery.event.id, *failed));
+            }
+        }
+    }
+
+    #[test]
+    fn an_execution_whose_holders_keep_dying_fails_its_step() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("expl.db");
+        let mut graph = Graph::open(&db).expect("graph");
+        let origin = graph
+            .create_origin("o", Some("main"), "abc")
+            .expect("origin");
+        let goal = graph.add_goal("g", "g", false, &[]).expect("goal");
+        let step = graph
+            .propose_step("s", "s", &[origin], &[goal])
+            .expect("step");
+        graph.plan_step(step, 1).expect("plan"); // node.ready
+        let role = Role::Execution;
+        let mut inbox = Inbox::open(&db, "executor").expect("inbox");
+        let mut ready = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let delivery = inbox
+                .lease(role.reactions(), ProcessId(attempt), false, MAX_ATTEMPTS)
+                .expect("lease")
+                .expect("node.ready");
+            assert_eq!(
+                (delivery.event.kind, delivery.event.node, delivery.attempts),
+                (EventKind::NodeReady, Some(step), attempt)
+            );
+            ready = Some(delivery.event.id);
+            // Each holder claims the step, then dies without settling.
+            assert!(graph.claim(step, attempt > 1).expect("claim"));
+            store::open(&db)
+                .expect("db")
+                .execute(
+                    &format!("UPDATE deliveries SET leased_until = {EPOCH} - 1"),
+                    [],
+                )
+                .expect("expire");
+            let recorder = Recorder::default();
+            give_up_abandoned(role, &inbox, &mut graph, &recorder).expect("give up");
+            let abandoned = recorder.0.into_inner().expect("lock");
+            if attempt < MAX_ATTEMPTS {
+                assert!(abandoned.is_empty(), "attempts are left");
+                assert_eq!(graph.node(step).expect("step").status, NodeStatus::Running);
+            } else {
+                assert_eq!(abandoned, vec![(delivery.event.id, Some(step))]);
+            }
+        }
+
+        let failed = graph.node(step).expect("step");
+        assert_eq!(failed.status, NodeStatus::Failed);
+        let last = graph.events(None, 100).expect("events");
+        let last = last.last().expect("an event");
+        assert_eq!((last.kind, last.node), (EventKind::NodeFailed, Some(step)));
+        assert_eq!(
+            inbox.status_of(ready.expect("leased")).expect("status"),
+            Some("failed".into())
+        );
+        assert!(
+            inbox
+                .lease(role.reactions(), ProcessId(9), false, MAX_ATTEMPTS)
+                .expect("lease")
+                .is_none(),
+            "neither the given-up event nor anything else is delivered"
+        );
+    }
 
     #[test]
     fn random_below_stays_in_bounds_and_spreads() {

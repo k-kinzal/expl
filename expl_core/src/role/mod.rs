@@ -60,8 +60,8 @@ use std::fmt::Write;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::Agent;
-use crate::event::EventKind;
-use crate::graph::Graph;
+use crate::event::{Event, EventKind};
+use crate::graph::{Graph, GraphError, NodeId};
 
 /// One of the four responsibilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -169,6 +169,28 @@ impl Role {
             Self::Evaluation => evaluation::react(reaction, graph),
         }
     }
+
+    /// Clean up after the reaction to `event` ended for good without
+    /// succeeding (its attempts were used up, or the process gave up on
+    /// it), so no work is left hanging. Execution fails a step still
+    /// `running` (records `node.failed` with `why`), so planning can
+    /// replan or prune it; other roles leave nothing behind. Returns the
+    /// step failed, if any.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError`] on graph failure.
+    pub fn abandon(
+        self,
+        event: &Event,
+        graph: &mut Graph,
+        why: &str,
+    ) -> Result<Option<NodeId>, GraphError> {
+        match self {
+            Self::Execution => execution::abandon(event, graph, why),
+            Self::Exploration | Self::Planning | Self::Evaluation => Ok(None),
+        }
+    }
 }
 
 impl fmt::Display for Role {
@@ -244,7 +266,7 @@ impl Report {
     /// One line for logs and delivery notes.
     #[must_use]
     pub fn summary(&self) -> String {
-        let ids = |ids: &[crate::graph::NodeId]| {
+        let ids = |ids: &[NodeId]| {
             if ids.is_empty() {
                 "-".to_owned()
             } else {

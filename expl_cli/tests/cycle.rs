@@ -978,6 +978,28 @@ fn stopping_mid_execution_gives_the_event_back() {
 }
 
 #[test]
+fn a_timed_out_execution_fails_the_step() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let path = repo.join("expl.toml");
+    let declaration = std::fs::read_to_string(&path).expect("declaration");
+    let declaration = declaration.replacen("replicas = 2", "replicas = 2\ntimeout = \"1s\"", 1);
+    std::fs::write(&path, declaration).expect("declaration");
+    ok(repo, &["goal", "add", "g"]);
+    let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
+    sandbox.slow(true);
+
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    let step = node(repo, &a);
+    assert_eq!(step["node"]["status"], "failed", "{step}");
+    let outcome = step["node"]["outcome"].as_str().unwrap_or_default();
+    assert!(outcome.contains("agent timed out after 1s"), "{step}");
+    let run = &step["agent_runs"][0];
+    assert_eq!(run["status"], "failed", "{step}");
+    assert_eq!(run["error"], "agent timed out after 1s", "{step}");
+}
+
+#[test]
 fn losing_the_lease_interrupts_the_reaction() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;

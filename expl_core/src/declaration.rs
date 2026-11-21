@@ -8,7 +8,9 @@
 //! complete [`TEMPLATE`](Declaration::TEMPLATE).
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -45,6 +47,78 @@ pub enum DeclarationError {
     /// No agent has this name.
     #[error("no agent named `{0}` in expl.toml")]
     UnknownAgent(String),
+    /// An agent's `timeout` (or one of its alternatives') is zero or not a
+    /// duration.
+    #[error("agent `{agent}`: invalid `timeout`: {source}")]
+    Timeout {
+        /// The agent declaring it.
+        agent: String,
+        /// Why the value is unusable.
+        #[source]
+        source: TimeoutError,
+    },
+}
+
+/// A declared [`Timeout`] is not a usable duration.
+#[derive(Debug, Error)]
+pub enum TimeoutError {
+    /// The value is zero or negative.
+    #[error("`{0}` is not a positive duration")]
+    NotPositive(Timeout),
+    /// The text is not a duration.
+    #[error("`{value}` is not a duration: {source}")]
+    Unparsable {
+        /// The declared text.
+        value: String,
+        /// Underlying error.
+        #[source]
+        source: humantime::DurationError,
+    },
+}
+
+/// How long one CLI attempt may run before expl stops it: whole seconds
+/// (`timeout = 1800`) or a humantime string (`timeout = "30m"`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Timeout {
+    /// Whole seconds.
+    Seconds(i64),
+    /// A humantime duration such as `"90s"` or `"1h 30m"`.
+    Text(String),
+}
+
+impl Timeout {
+    /// The declared duration.
+    ///
+    /// # Errors
+    ///
+    /// [`TimeoutError`] when the value is zero, negative, or not a duration.
+    pub fn duration(&self) -> Result<Duration, TimeoutError> {
+        let duration = match self {
+            Self::Seconds(seconds) => u64::try_from(*seconds)
+                .map(Duration::from_secs)
+                .map_err(|_| TimeoutError::NotPositive(self.clone()))?,
+            Self::Text(text) => humantime::parse_duration(text.trim()).map_err(|source| {
+                TimeoutError::Unparsable {
+                    value: text.clone(),
+                    source,
+                }
+            })?,
+        };
+        if duration.is_zero() {
+            return Err(TimeoutError::NotPositive(self.clone()));
+        }
+        Ok(duration)
+    }
+}
+
+impl fmt::Display for Timeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Seconds(seconds) => write!(f, "{seconds}"),
+            Self::Text(text) => f.write_str(text),
+        }
+    }
 }
 
 /// The whole `expl.toml`.
@@ -106,6 +180,12 @@ pub struct AgentDeclaration {
     /// whole graph at once, for what no single node would suggest.
     #[serde(default)]
     pub scope: Option<Scope>,
+    /// How long one attempt of a CLI may run before its process group is
+    /// stopped and the attempt fails. Applies to the primary CLI and to
+    /// every alternative that does not declare its own. Without it, an
+    /// attempt runs until the CLI exits.
+    #[serde(default)]
+    pub timeout: Option<Timeout>,
     /// Further CLIs that can carry out the agent (`[[agent.<name>.alternative]]`).
     /// Invocations are routed across the primary CLI and these in turn, and
     /// fall over to the next one when a CLI fails.
@@ -139,10 +219,14 @@ pub struct CliDeclaration {
     /// Extra environment variables for this CLI, over the agent's `env`.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// How long one attempt of this CLI may run, over the agent's `timeout`.
+    #[serde(default)]
+    pub timeout: Option<Timeout>,
 }
 
 impl AgentDeclaration {
-    /// Every CLI of the agent, primary first.
+    /// Every CLI of the agent, primary first, each with the `timeout` that
+    /// bounds it (its own, else the agent's).
     #[must_use]
     pub fn clis(&self) -> Vec<CliDeclaration> {
         let primary = CliDeclaration {
@@ -150,10 +234,13 @@ impl AgentDeclaration {
             command: self.command.clone(),
             args: self.args.clone(),
             env: BTreeMap::new(),
+            timeout: self.timeout.clone(),
         };
-        std::iter::once(primary)
-            .chain(self.alternative.iter().cloned())
-            .collect()
+        let alternatives = self.alternative.iter().map(|cli| CliDeclaration {
+            timeout: cli.timeout.clone().or_else(|| self.timeout.clone()),
+            ..cli.clone()
+        });
+        std::iter::once(primary).chain(alternatives).collect()
     }
 }
 
@@ -180,6 +267,10 @@ impl Declaration {
 # An agent may name further CLIs with [[agent.<name>.alternative]] (driver,
 # command, args, env). Its invocations are then routed across all of them in
 # turn, falling over to the next CLI when one fails.
+#
+# An optional `timeout` (seconds, or a duration such as "30m") bounds each
+# CLI attempt: past it, the CLI is stopped and the attempt fails like any
+# other. An alternative's own `timeout` overrides the agent's.
 #
 # Agents run unattended inside expl-owned git worktrees, so the defaults
 # below let Claude Code edit files and run commands without asking.
@@ -277,6 +368,14 @@ replicas = 1
                 .any(|cli| cli.command.first().is_none_or(|p| p.trim().is_empty()))
             {
                 return invalid(name, "`command` is empty");
+            }
+            for timeout in agent.clis().iter().filter_map(|cli| cli.timeout.as_ref()) {
+                timeout
+                    .duration()
+                    .map_err(|source| DeclarationError::Timeout {
+                        agent: name.clone(),
+                        source,
+                    })?;
             }
             if agent.weight == Some(0) {
                 return invalid(
@@ -435,5 +534,51 @@ mod tests {
         );
         let error = Declaration::parse(&empty).expect_err("empty command");
         assert!(error.to_string().contains("`command` is empty"), "{error}");
+    }
+
+    fn with_timeouts(agent: &str, alternative: &str) -> Result<Declaration, DeclarationError> {
+        Declaration::parse(&format!(
+            "[agent.a]\nrole = \"planning\"\ndriver = \"generic\"\ncommand = [\"x\"]\n\
+             replicas = 1\n{agent}\n\
+             [[agent.a.alternative]]\ndriver = \"generic\"\ncommand = [\"y\"]\n{alternative}\n"
+        ))
+    }
+
+    #[test]
+    fn timeouts_are_parsed_and_bad_ones_rejected() {
+        let template = Declaration::parse(Declaration::TEMPLATE).expect("parses");
+        assert!(template.agent.values().all(|a| a.timeout.is_none()));
+
+        let timeouts = |agent: &str, alternative: &str| -> Vec<Option<Duration>> {
+            with_timeouts(agent, alternative).expect("parses").agent["a"]
+                .clis()
+                .iter()
+                .map(|cli| cli.timeout.as_ref().map(|t| t.duration().expect("valid")))
+                .collect()
+        };
+        let secs = Duration::from_secs;
+        assert_eq!(timeouts("timeout = 90", ""), [Some(secs(90)); 2]);
+        assert_eq!(
+            timeouts("timeout = \"1h 30m\"", "timeout = \"45s\""),
+            [Some(secs(5400)), Some(secs(45))]
+        );
+        assert_eq!(timeouts("", "timeout = 5"), [None, Some(secs(5))]);
+
+        for (agent, alternative, reason) in [
+            ("timeout = 0", "", "not a positive duration"),
+            ("timeout = -5", "", "not a positive duration"),
+            ("timeout = \"0s\"", "", "not a positive duration"),
+            ("timeout = \"soon\"", "", "not a duration"),
+            ("", "timeout = \"\"", "not a duration"),
+        ] {
+            let error = with_timeouts(agent, alternative).expect_err("bad timeout");
+            assert!(
+                matches!(&error, DeclarationError::Timeout { agent, .. } if agent == "a"),
+                "{agent} {alternative}: {error:?}"
+            );
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+        let error = with_timeouts("timeout = 1.5", "").expect_err("float");
+        assert!(matches!(error, DeclarationError::Parse { .. }), "{error:?}");
     }
 }

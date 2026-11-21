@@ -40,6 +40,18 @@ pub enum TrunkError {
     /// The trunk branch does not exist.
     #[error("trunk branch `{0}` does not exist")]
     MissingBranch(String),
+    /// git could not tell whether `trunk` holds `commit` (for instance, a
+    /// commit no longer exists), so what the trunk took in is unknown.
+    #[error("cannot tell whether {trunk} holds {commit}: {source}")]
+    Ancestry {
+        /// The commit that may hold the other.
+        trunk: String,
+        /// The commit that may be held.
+        commit: String,
+        /// What git reported.
+        #[source]
+        source: GitError,
+    },
 }
 
 /// What one move of the trunk recorded.
@@ -101,8 +113,8 @@ impl Trunk {
     /// # Errors
     ///
     /// [`TrunkError::MissingBranch`] when the trunk branch does not exist;
-    /// [`TrunkError::Graph`] on graph failure; [`TrunkError::Git`] when git
-    /// fails while checking what the trunk took in.
+    /// [`TrunkError::Ancestry`] when git cannot tell what the trunk holds
+    /// (nothing is recorded then); [`TrunkError::Graph`] on graph failure.
     pub fn follow(&self, graph: &mut Graph) -> Result<Option<Advance>, TrunkError> {
         let observation = self.observe(graph)?;
         self.record(graph, observation)
@@ -156,7 +168,7 @@ impl Trunk {
         if commit == previous {
             return Ok(None);
         }
-        let descends = previous.is_empty() || self.contains(&commit, &previous);
+        let descends = previous.is_empty() || self.contains(&commit, &previous)?;
 
         let lineage = graph.lineage()?;
         let mut adopted: BTreeSet<NodeId> = BTreeSet::new();
@@ -216,9 +228,15 @@ impl Trunk {
         }))
     }
 
-    /// Whether `ancestor` is in `commit`'s history (unknown commits are not).
-    fn contains(&self, commit: &str, ancestor: &str) -> bool {
-        self.git.is_ancestor(ancestor, commit).unwrap_or(false)
+    /// Whether `ancestor` is in `commit`'s history.
+    ///
+    /// # Errors
+    ///
+    /// [`TrunkError::Ancestry`] when git fails, e.g. on an unknown commit.
+    fn contains(&self, commit: &str, ancestor: &str) -> Result<bool, TrunkError> {
+        self.git
+            .is_ancestor(ancestor, commit)
+            .map_err(|source| ancestry(commit, ancestor, source))
     }
 
     /// Whether `trunk` holds the work of the step whose tip is `head`: by
@@ -226,28 +244,40 @@ impl Trunk {
     /// `trunk` (squash merges, cherry-picks); or because merging `head`
     /// into `trunk` yields `trunk`'s own tree (squash merges of several
     /// commits, of predecessors, or of joins). A step that has not
-    /// `committed` anything is held only by history. Commits git no longer
-    /// knows hold nothing and are not held.
+    /// `committed` anything is held only by history.
+    ///
+    /// # Errors
+    ///
+    /// [`TrunkError::Ancestry`] when git fails, e.g. on an unknown commit.
     fn takes_in(&self, trunk: &str, head: &str, committed: bool) -> Result<bool, TrunkError> {
-        if !self.git.has_commit(trunk)? || !self.git.has_commit(head)? {
-            return Ok(false);
-        }
-        if self.git.is_ancestor(head, trunk)? {
+        if self.contains(trunk, head)? {
             return Ok(true);
         }
         if !committed {
             return Ok(false);
         }
-        let listing = self.git.run(&["cherry", trunk, head])?;
+        let failed = |source| ancestry(trunk, head, source);
+        let listing = self.git.run(&["cherry", trunk, head]).map_err(failed)?;
         let lines: Vec<&str> = listing.lines().filter(|l| !l.trim().is_empty()).collect();
         if !lines.is_empty() && lines.iter().all(|l| l.starts_with('-')) {
             return Ok(true);
         }
-        let Some(merged) = self.git.merge_tree(trunk, head)? else {
+        let Some(merged) = self.git.merge_tree(trunk, head).map_err(failed)? else {
             return Ok(false);
         };
-        let tree = self.git.run(&["rev-parse", &format!("{trunk}^{{tree}}")])?;
+        let tree = self
+            .git
+            .run(&["rev-parse", &format!("{trunk}^{{tree}}")])
+            .map_err(failed)?;
         Ok(merged == tree)
+    }
+}
+
+fn ancestry(trunk: &str, commit: &str, source: GitError) -> TrunkError {
+    TrunkError::Ancestry {
+        trunk: trunk.to_owned(),
+        commit: commit.to_owned(),
+        source,
     }
 }
 
@@ -434,6 +464,38 @@ mod tests {
         let own = trunk.follow(&mut fx.graph).expect("follow").expect("moved");
         assert!(own.adopted.is_empty());
         assert_eq!(fx.graph.origins().expect("origins").len(), 4);
+    }
+
+    #[test]
+    fn a_git_failure_is_an_error_not_a_missed_adoption() {
+        let mut fx = Fixture::new();
+        let origin = fx.graph.origin().expect("origin").id;
+        let step = fx.step(origin, Some("a.txt"));
+        let gone = "0123456789abcdef0123456789abcdef01234567";
+        fx.graph
+            .set_branch(step, &Workspaces::branch_name(step), Some(gone))
+            .expect("branch");
+        std::fs::write(fx.root.join("README"), "edited\n").expect("write");
+        git(&fx.root, &["commit", "-q", "-am", "edit"]);
+
+        let trunk = Trunk::new(&fx.project, Some("main"));
+        match trunk.follow(&mut fx.graph) {
+            Err(TrunkError::Ancestry { commit, .. }) => assert_eq!(commit, gone),
+            other => panic!("expected an ancestry error, got {other:?}"),
+        }
+        assert_eq!(
+            fx.graph.origin().expect("origin").id,
+            origin,
+            "nothing is recorded while git cannot tell what was taken in"
+        );
+        assert!(matches!(
+            trunk.contains("HEAD", gone),
+            Err(TrunkError::Ancestry { .. })
+        ));
+        assert!(matches!(
+            trunk.takes_in("HEAD", gone, true),
+            Err(TrunkError::Ancestry { .. })
+        ));
     }
 
     #[test]
@@ -640,7 +702,10 @@ mod tests {
         let coalescing = CoalesceIdenticalTrees(&trunk);
         let kinds = Role::Evaluation.reactions();
         let mut evaluator = Inbox::open(&fx.project.database_path(), "evaluator").expect("inbox");
-        while let Some(delivery) = evaluator.lease(kinds, ProcessId(1), false).expect("lease") {
+        while let Some(delivery) = evaluator
+            .lease(kinds, ProcessId(1), false, crate::process::MAX_ATTEMPTS)
+            .expect("lease")
+        {
             evaluator.ack(&delivery, None).expect("ack");
         }
         let before = fx.graph.origin().expect("origin");
@@ -672,7 +737,7 @@ mod tests {
         );
         assert!(
             evaluator
-                .lease(kinds, ProcessId(1), false)
+                .lease(kinds, ProcessId(1), false, crate::process::MAX_ATTEMPTS)
                 .expect("lease")
                 .is_none(),
             "origin.advanced delivery dropped"
@@ -689,7 +754,7 @@ mod tests {
         assert_eq!(epoch.previous, Some(before.id));
         assert!(fx.advanced_to(advance.origin));
         let delivery = evaluator
-            .lease(kinds, ProcessId(1), false)
+            .lease(kinds, ProcessId(1), false, crate::process::MAX_ATTEMPTS)
             .expect("lease")
             .expect("origin.advanced delivered to evaluation");
         assert_eq!(delivery.event.kind, EventKind::OriginAdvanced);

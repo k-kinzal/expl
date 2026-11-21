@@ -79,6 +79,28 @@ impl std::fmt::Debug for Inbox {
     }
 }
 
+/// An event as read from its row.
+fn event(
+    id: i64,
+    kind: &str,
+    node: Option<i64>,
+    created_at: String,
+) -> Result<Event, rusqlite::Error> {
+    let kind = kind.parse().map_err(|reason: String| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(reason)),
+        )
+    })?;
+    Ok(Event {
+        id: EventId(id),
+        kind,
+        node: node.map(NodeId),
+        created_at,
+    })
+}
+
 fn kinds_sql(kinds: &[EventKind]) -> String {
     kinds
         .iter()
@@ -109,9 +131,12 @@ impl Inbox {
     /// Lease the oldest deliverable event of `kinds` to `process`.
     ///
     /// Deliverable: never delivered to this agent, released, or leased by a
-    /// process whose lease expired. Events about a node another process of
-    /// this agent is handling wait. With `exclusive`, nothing is leased
-    /// while any process of this agent holds a lease (single-flight roles).
+    /// process whose lease expired before its `max_attempts`-th attempt.
+    /// Every lease counts as an attempt, so a delivery whose holders keep
+    /// dying is [abandoned](Self::abandoned) rather than leased forever.
+    /// Events about a node another process of this agent is handling wait.
+    /// With `exclusive`, nothing is leased while any process of this agent
+    /// holds a lease (single-flight roles).
     ///
     /// # Errors
     ///
@@ -121,6 +146,7 @@ impl Inbox {
         kinds: &[EventKind],
         process: ProcessId,
         exclusive: bool,
+        max_attempts: i64,
     ) -> Result<Option<Delivery>, rusqlite::Error> {
         if kinds.is_empty() {
             return Ok(None);
@@ -149,7 +175,8 @@ impl Inbox {
                      LEFT JOIN deliveries d ON d.agent = ?1 AND d.event_id = e.id \
                      WHERE e.kind IN ({kinds}) \
                      AND (d.event_id IS NULL OR d.status = 'pending' \
-                          OR (d.status = 'leased' AND d.leased_until < {EPOCH})) \
+                          OR (d.status = 'leased' AND d.leased_until < {EPOCH} \
+                              AND d.attempts < ?2)) \
                      AND (e.node_id IS NULL OR NOT EXISTS ( \
                           SELECT 1 FROM deliveries x JOIN events y ON y.id = x.event_id \
                           WHERE x.agent = ?1 AND x.status = 'leased' \
@@ -158,7 +185,7 @@ impl Inbox {
                      ORDER BY e.id LIMIT 1",
                     kinds = kinds_sql(kinds)
                 ),
-                [&self.agent],
+                params![self.agent, max_attempts],
                 |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
@@ -186,20 +213,8 @@ impl Inbox {
             params![self.agent, id, process.0, token],
         )?;
         tx.commit()?;
-        let kind = kind.parse().map_err(|reason: String| {
-            rusqlite::Error::FromSqlConversionFailure(
-                1,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::other(reason)),
-            )
-        })?;
         Ok(Some(Delivery {
-            event: Event {
-                id: EventId(id),
-                kind,
-                node: node.map(NodeId),
-                created_at,
-            },
+            event: event(id, &kind, node, created_at)?,
             attempts: attempts + 1,
             token: LeaseToken(token),
         }))
@@ -354,6 +369,92 @@ impl Inbox {
         }
     }
 
+    /// The reaction to `delivery` failed and must not be retried, whatever
+    /// attempts are left.
+    ///
+    /// # Errors
+    ///
+    /// [`InboxError::LeaseLost`] when this lease is no longer held;
+    /// otherwise SQLite failure.
+    pub fn give_up(&self, delivery: &Delivery, error: &str) -> Result<(), InboxError> {
+        let changed = self.conn.execute(
+            &format!(
+                "UPDATE deliveries SET status = 'failed', leased_until = NULL, \
+                 lease_token = NULL, note = ?4, updated_at = {NOW} \
+                 WHERE agent = ?1 AND event_id = ?2 AND {held}",
+                held = held()
+            ),
+            params![self.agent, delivery.event.id.0, delivery.token.0, error],
+        )?;
+        self.settled(delivery, changed)
+    }
+
+    /// Deliveries of `kinds` whose holder died on their last attempt: the
+    /// lease expired after `max_attempts` attempts, so they are never
+    /// leased again. Each awaits [`give_up_abandoned`](Self::give_up_abandoned)
+    /// once whatever its holder left behind has been cleaned up.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failure.
+    pub fn abandoned(
+        &self,
+        kinds: &[EventKind],
+        max_attempts: i64,
+    ) -> Result<Vec<Delivery>, rusqlite::Error> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT e.id, e.kind, e.node_id, e.created_at, d.attempts, d.lease_token \
+             FROM deliveries d JOIN events e ON e.id = d.event_id \
+             WHERE d.agent = ?1 AND e.kind IN ({kinds}) AND d.status = 'leased' \
+             AND d.leased_until < {EPOCH} AND d.attempts >= ?2 ORDER BY e.id",
+            kinds = kinds_sql(kinds)
+        ))?;
+        let rows = statement.query_map(params![self.agent, max_attempts], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, kind, node, created_at, attempts, token) = row?;
+            Ok(Delivery {
+                event: event(id, &kind, node, created_at)?,
+                attempts,
+                token: LeaseToken(token),
+            })
+        })
+        .collect()
+    }
+
+    /// Record an [abandoned](Self::abandoned) delivery as failed, noting
+    /// that its holder died. `false` when it is no longer abandoned under
+    /// that lease (another process gave it up first).
+    ///
+    /// # Errors
+    ///
+    /// SQLite failure.
+    pub fn give_up_abandoned(&self, delivery: &Delivery) -> Result<bool, rusqlite::Error> {
+        let changed = self.conn.execute(
+            &format!(
+                "UPDATE deliveries SET status = 'failed', \
+                 note = 'its holder, process ' || process_id || ', died during attempt ' \
+                     || attempts || ' and the lease expired; giving up', \
+                 leased_until = NULL, lease_token = NULL, updated_at = {NOW} \
+                 WHERE agent = ?1 AND event_id = ?2 AND status = 'leased' \
+                 AND lease_token = ?3 AND leased_until < {EPOCH}"
+            ),
+            params![self.agent, delivery.event.id.0, delivery.token.0],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Extend the lease of `delivery`. An expired lease cannot be renewed,
     /// even if no other process has taken it over yet.
     ///
@@ -498,7 +599,7 @@ mod tests {
         let mut first = Inbox::open(&f.db, "planner").expect("inbox");
         let mut second = Inbox::open(&f.db, "planner").expect("inbox");
         let stale = first
-            .lease(PROPOSED, ProcessId(1), true)
+            .lease(PROPOSED, ProcessId(1), true, 3)
             .expect("lease")
             .expect("e2");
 
@@ -509,7 +610,7 @@ mod tests {
 
         // The second replica reclaims the event under a new token.
         let replacement = second
-            .lease(PROPOSED, ProcessId(2), true)
+            .lease(PROPOSED, ProcessId(2), true, 3)
             .expect("lease")
             .expect("e2 again");
         assert_eq!(replacement.event.id, stale.event.id);
@@ -536,7 +637,7 @@ mod tests {
         assert_eq!(first.status_of(EventId(3)).expect("status"), None);
         assert!(
             first
-                .lease(PROPOSED, ProcessId(1), true)
+                .lease(PROPOSED, ProcessId(1), true, 3)
                 .expect("lease")
                 .is_none(),
             "the replacement still holds the single-flight lease"
@@ -562,6 +663,128 @@ mod tests {
     }
 
     #[test]
+    fn expired_leases_count_toward_the_limit() {
+        let f = fixture();
+        let mut inbox = Inbox::open(&f.db, "planner").expect("inbox");
+        for attempt in 1..=3 {
+            let delivery = inbox
+                .lease(PROPOSED, ProcessId(attempt), true, 3)
+                .expect("lease")
+                .expect("e2");
+            assert_eq!(
+                (delivery.event.id, delivery.attempts),
+                (EventId(2), attempt)
+            );
+            assert!(inbox.abandoned(PROPOSED, 3).expect("abandoned").is_empty());
+            // The holder dies without settling.
+            expire(&f.db, "planner", delivery.event.id);
+        }
+        let abandoned = inbox.abandoned(PROPOSED, 3).expect("abandoned");
+        assert_eq!(
+            abandoned
+                .iter()
+                .map(|d| (d.event.id, d.attempts))
+                .collect::<Vec<_>>(),
+            vec![(EventId(2), 3)]
+        );
+        // A higher limit would still deliver it again.
+        assert_eq!(inbox.abandoned(PROPOSED, 4).expect("abandoned"), Vec::new());
+    }
+
+    #[test]
+    fn an_exhausted_delivery_is_not_leased_again() {
+        let f = fixture();
+        let mut inbox = Inbox::open(&f.db, "planner").expect("inbox");
+        let mut other = Inbox::open(&f.db, "planner").expect("inbox");
+        let first = inbox
+            .lease(PROPOSED, ProcessId(1), true, 2)
+            .expect("lease")
+            .expect("e2");
+        expire(&f.db, "planner", first.event.id);
+        let last = inbox
+            .lease(PROPOSED, ProcessId(2), true, 2)
+            .expect("lease")
+            .expect("e2 again");
+        assert_eq!((last.event.id, last.attempts), (EventId(2), 2));
+        expire(&f.db, "planner", last.event.id);
+
+        // Its last holder died: e2 is skipped, and the next event is leased.
+        let next = inbox
+            .lease(PROPOSED, ProcessId(3), true, 2)
+            .expect("lease")
+            .expect("e3");
+        assert_eq!(next.event.id, EventId(3));
+        inbox.ack(&next, None).expect("ack");
+        assert!(
+            inbox
+                .lease(PROPOSED, ProcessId(3), true, 2)
+                .expect("lease")
+                .is_none()
+        );
+
+        let abandoned = inbox.abandoned(PROPOSED, 2).expect("abandoned");
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].token, last.token);
+        assert!(inbox.give_up_abandoned(&abandoned[0]).expect("give up"));
+        assert!(
+            !other.give_up_abandoned(&abandoned[0]).expect("give up"),
+            "given up once"
+        );
+        let (status, process, attempts, _, _, note) = {
+            let conn = store::open(&f.db).expect("db");
+            conn.query_row(
+                "SELECT status, process_id, attempts, leased_until, lease_token, note \
+                 FROM deliveries WHERE agent = 'planner' AND event_id = 2",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .expect("row")
+        };
+        assert_eq!((status.as_str(), process, attempts), ("failed", 2, 2));
+        let note = note.expect("note");
+        assert!(note.contains("process 2, died"), "{note}");
+        assert!(inbox.abandoned(PROPOSED, 2).expect("abandoned").is_empty());
+        assert!(
+            other
+                .lease(PROPOSED, ProcessId(4), true, 2)
+                .expect("lease")
+                .is_none(),
+            "a failed delivery is never leased again"
+        );
+        assert_eq!(other.backlog(PROPOSED).expect("backlog"), 0);
+    }
+
+    #[test]
+    fn a_held_delivery_can_be_given_up_with_attempts_left() {
+        let f = fixture();
+        let mut inbox = Inbox::open(&f.db, "planner").expect("inbox");
+        let delivery = inbox
+            .lease(PROPOSED, ProcessId(1), true, 3)
+            .expect("lease")
+            .expect("e2");
+        inbox.give_up(&delivery, "graph broke").expect("give up");
+        assert_eq!(
+            inbox.status_of(delivery.event.id).expect("status"),
+            Some("failed".into())
+        );
+        assert_lost(inbox.give_up(&delivery, "again"), delivery.event.id);
+        let next = inbox
+            .lease(PROPOSED, ProcessId(1), true, 3)
+            .expect("lease")
+            .expect("e3");
+        assert_eq!(next.event.id, EventId(3));
+    }
+
+    #[test]
     fn every_agent_sees_every_event_and_processes_compete() {
         let f = fixture();
         let mut explorer = Inbox::open(&f.db, "explorer").expect("inbox");
@@ -570,30 +793,30 @@ mod tests {
         let mut other = Inbox::open(&f.db, "other-planner").expect("inbox");
 
         let goal = explorer
-            .lease(&[EventKind::GoalAdded], ProcessId(1), false)
+            .lease(&[EventKind::GoalAdded], ProcessId(1), false, 3)
             .expect("lease");
         assert_eq!(goal.map(|d| d.event.id), Some(EventId(1)));
 
         // Two processes of one agent split the events between them…
         let first = planner_1
-            .lease(PROPOSED, ProcessId(2), false)
+            .lease(PROPOSED, ProcessId(2), false, 3)
             .expect("lease")
             .expect("e2");
         let second = planner_2
-            .lease(PROPOSED, ProcessId(3), false)
+            .lease(PROPOSED, ProcessId(3), false, 3)
             .expect("lease")
             .expect("e3");
         assert_eq!((first.event.id, second.event.id), (EventId(2), EventId(3)));
         assert!(
             planner_1
-                .lease(PROPOSED, ProcessId(2), false)
+                .lease(PROPOSED, ProcessId(2), false, 3)
                 .expect("lease")
                 .is_none()
         );
         // …while another agent receives all of them again (fan-out).
         assert_eq!(
             other
-                .lease(PROPOSED, ProcessId(4), false)
+                .lease(PROPOSED, ProcessId(4), false, 3)
                 .expect("lease")
                 .map(|d| d.event.id),
             Some(EventId(2))
@@ -602,7 +825,7 @@ mod tests {
         planner_1.ack(&first, None).expect("ack");
         assert!(planner_2.fail(&second, "boom", 3).expect("fail"), "retried");
         let again = planner_1
-            .lease(PROPOSED, ProcessId(2), false)
+            .lease(PROPOSED, ProcessId(2), false, 3)
             .expect("lease")
             .expect("e3");
         assert_eq!((again.event.id, again.attempts), (EventId(3), 2));
@@ -615,12 +838,12 @@ mod tests {
         let mut planner_1 = Inbox::open(&f.db, "planner").expect("inbox");
         let mut planner_2 = Inbox::open(&f.db, "planner").expect("inbox");
         let first = planner_1
-            .lease(PROPOSED, ProcessId(1), true)
+            .lease(PROPOSED, ProcessId(1), true, 3)
             .expect("lease")
             .expect("e2");
         assert!(
             planner_2
-                .lease(PROPOSED, ProcessId(2), true)
+                .lease(PROPOSED, ProcessId(2), true, 3)
                 .expect("lease")
                 .is_none()
         );
@@ -644,24 +867,24 @@ mod tests {
         let mut one = Inbox::open(&f.db, "watcher").expect("inbox");
         let mut two = Inbox::open(&f.db, "watcher").expect("inbox");
         let first = one
-            .lease(kinds, ProcessId(1), false)
+            .lease(kinds, ProcessId(1), false, 3)
             .expect("lease")
             .expect("e2");
         assert_eq!(first.event.node, Some(a));
         // e3 is about another node; e4 (about `a`) must wait for e2.
         let second = two
-            .lease(kinds, ProcessId(2), false)
+            .lease(kinds, ProcessId(2), false, 3)
             .expect("lease")
             .expect("e3");
         assert_eq!(second.event.id, EventId(3));
         assert!(
-            two.lease(kinds, ProcessId(2), false)
+            two.lease(kinds, ProcessId(2), false, 3)
                 .expect("lease")
                 .is_none()
         );
         one.ack(&first, None).expect("ack");
         assert_eq!(
-            two.lease(kinds, ProcessId(2), false)
+            two.lease(kinds, ProcessId(2), false, 3)
                 .expect("lease")
                 .map(|d| d.event.id),
             Some(EventId(4))

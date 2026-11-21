@@ -4,11 +4,12 @@
 //! `alternative`s). Each invocation is **routed**: it starts at the next
 //! CLI in turn, so the work spreads across them, and falls over to the
 //! following CLI when one fails (a usage limit, an outage, an unusable
-//! reply). Every attempt goes to the same run log.
+//! reply, a declared `timeout` outrun). Every attempt goes to the same run
+//! log.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -21,13 +22,23 @@ use crate::agent::{
     AgentDriver, AgentError, AgentRequest, AgentRun, ClaudeCodeDriver, CodexDriver,
     CursorAgentDriver, DriverKind, GenericDriver,
 };
-use crate::declaration::{AgentDeclaration, CliDeclaration};
+use crate::declaration::{AgentDeclaration, CliDeclaration, DeclarationError, TimeoutError};
 use crate::process::Interrupt;
 use crate::prompt::Prompt;
 use crate::role::Role;
 
-/// How long an interrupted invocation gets to exit after SIGTERM.
+/// How long an interrupted or timed-out invocation gets to exit after
+/// SIGTERM.
 const TERMINATION_GRACE: Duration = Duration::from_secs(5);
+
+/// How long children an exited CLI left behind get to exit after SIGTERM
+/// before they are killed.
+const LEFTOVER_GRACE: Duration = Duration::from_secs(2);
+
+/// How long the output is still read once the CLI and its process group are
+/// gone. A process that escaped the group can hold the pipes open forever;
+/// past this bound, whatever was read so far is the output.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// One request to invoke an agent: what to say, where, and where to log.
 #[derive(Debug, Clone, Copy)]
@@ -62,23 +73,34 @@ struct Cli {
     driver: Box<dyn AgentDriver>,
     /// Environment of this CLI alone, over the agent's `env`.
     env: BTreeMap<String, String>,
+    /// How long one attempt may run.
+    timeout: Option<Duration>,
 }
 
 impl Cli {
-    fn from_declaration(declaration: CliDeclaration) -> Self {
+    fn from_declaration(declaration: CliDeclaration) -> Result<Self, TimeoutError> {
         let CliDeclaration {
             driver,
             command,
             args,
             env,
+            timeout,
         } = declaration;
+        let timeout = timeout
+            .as_ref()
+            .map(crate::declaration::Timeout::duration)
+            .transpose()?;
         let driver: Box<dyn AgentDriver> = match driver {
             DriverKind::ClaudeCode => Box::new(ClaudeCodeDriver::new(command, args)),
             DriverKind::Codex => Box::new(CodexDriver::new(command, args)),
             DriverKind::CursorAgent => Box::new(CursorAgentDriver::new(command, args)),
             DriverKind::Generic => Box::new(GenericDriver::new(command, args)),
         };
-        Self { driver, env }
+        Ok(Self {
+            driver,
+            env,
+            timeout,
+        })
     }
 }
 
@@ -96,20 +118,31 @@ impl std::fmt::Debug for Agent {
 impl Agent {
     /// Bring a declared agent to life: a mechanical field move into the
     /// drivers named by `driver` (and each `alternative`'s).
-    #[must_use]
-    pub fn from_declaration(name: &str, declaration: &AgentDeclaration) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`DeclarationError::Timeout`] when a CLI's `timeout` is not a
+    /// positive duration (a declaration that passed validation never has one).
+    pub fn from_declaration(
+        name: &str,
+        declaration: &AgentDeclaration,
+    ) -> Result<Self, DeclarationError> {
         let clis = declaration
             .clis()
             .into_iter()
             .map(Cli::from_declaration)
-            .collect();
-        Self {
+            .collect::<Result<_, _>>()
+            .map_err(|source| DeclarationError::Timeout {
+                agent: name.to_owned(),
+                source,
+            })?;
+        Ok(Self {
             name: name.to_owned(),
             declaration: declaration.clone(),
             clis,
             // Processes of one agent start their routes at different CLIs.
             turn: AtomicUsize::new(std::process::id() as usize),
-        }
+        })
     }
 
     /// Declared name.
@@ -132,13 +165,15 @@ impl Agent {
 
     /// Invoke the agent once and return its structured response: route the
     /// invocation to the CLI whose turn it is, falling over to the next CLI
-    /// while one fails.
+    /// while one fails. An attempt that outruns its CLI's `timeout` is
+    /// stopped and fails like any other.
     ///
     /// # Errors
     ///
     /// [`AgentError::Interrupted`] as soon as an attempt is interrupted;
-    /// otherwise the error of the only CLI, or [`AgentError::Failed`]
-    /// naming every CLI's failure when each of several failed.
+    /// otherwise the error of the only CLI (such as
+    /// [`AgentError::TimedOut`]), or [`AgentError::Failed`] naming every
+    /// CLI's failure when each of several failed.
     pub fn invoke(&self, invocation: &Invocation<'_>) -> Result<AgentRun, AgentError> {
         let count = self.clis.len();
         let start = self.turn.fetch_add(1, Ordering::Relaxed) % count.max(1);
@@ -211,6 +246,9 @@ impl Agent {
                 command.process.get_program().display()
             ))
         })?;
+        let deadline = cli
+            .timeout
+            .map(|timeout| (Instant::now() + timeout, timeout));
 
         let stdin = child.stdin.take();
         let payload = command.stdin.take();
@@ -234,61 +272,97 @@ impl Agent {
             .take()
             .map(|pipe| tee(pipe, Arc::clone(&log), "[stderr] "));
 
-        let status = wait(&mut child, invocation.interrupt)?;
-        let join = |handle: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>| {
-            handle
-                .map(|h| h.join().unwrap_or_else(|_| Ok(Vec::new())))
+        let end = wait(&mut child, invocation.interrupt, deadline.map(|(at, _)| at))?;
+        let reaped = matches!(end, End::Exited(_)) && reap_group(child.id());
+        let drained_by = Instant::now() + DRAIN_GRACE;
+        let join = |tee: Option<Tee>| {
+            tee.map(|tee| tee.finish(drained_by))
                 .transpose()
                 .map(Option::unwrap_or_default)
         };
         let output = std::process::Output {
-            status: status.unwrap_or_default(),
+            status: match end {
+                End::Exited(status) => status,
+                End::Interrupted | End::TimedOut => ExitStatus::default(),
+            },
             stdout: join(stdout)?,
             stderr: join(stderr)?,
         };
-        feeder.join().unwrap_or(Ok(()))?;
+        if let Some(fed) = join_by(feeder, drained_by) {
+            fed.unwrap_or(Ok(()))?;
+        }
         {
             let mut log = log
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match status {
-                Some(status) => writeln!(log, "=== exit: {status} ===")?,
-                None => writeln!(log, "=== interrupted ===")?,
+            if reaped {
+                writeln!(
+                    log,
+                    "=== note: the CLI exited leaving processes behind; its process group was killed ==="
+                )?;
+            }
+            match end {
+                End::Exited(status) => writeln!(log, "=== exit: {status} ===")?,
+                End::Interrupted => writeln!(log, "=== interrupted ===")?,
+                End::TimedOut => writeln!(log, "=== timed out ===")?,
             }
         }
-        if status.is_none() {
-            return Err(AgentError::Interrupted);
+        match (end, deadline) {
+            (End::Exited(_), _) => cli.driver.interpret(&output, &request),
+            (End::TimedOut, Some((_, after))) => Err(AgentError::TimedOut { after }),
+            (End::Interrupted | End::TimedOut, _) => Err(AgentError::Interrupted),
         }
-        cli.driver.interpret(&output, &request)
     }
 }
 
-/// Wait for the child; on interrupt, stop its whole process group (TERM,
-/// then KILL after a grace period) and return `None`.
-fn wait(child: &mut Child, interrupt: &Interrupt) -> std::io::Result<Option<ExitStatus>> {
+/// How waiting for a child ended.
+#[derive(Debug, Clone, Copy)]
+enum End {
+    /// It exited by itself.
+    Exited(ExitStatus),
+    /// The hosting process was asked to stop, so the child was stopped.
+    Interrupted,
+    /// The deadline passed, so the child was stopped.
+    TimedOut,
+}
+
+/// Wait for the child until it exits; on interrupt, or once `deadline`
+/// passes, stop its whole process group (TERM, then KILL after a grace
+/// period).
+fn wait(
+    child: &mut Child,
+    interrupt: &Interrupt,
+    deadline: Option<Instant>,
+) -> std::io::Result<End> {
     loop {
         if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
+            return Ok(End::Exited(status));
         }
-        if interrupt.is_raised() {
-            signal_group(child.id(), "-TERM");
-            let deadline = Instant::now() + TERMINATION_GRACE;
-            while Instant::now() < deadline {
-                if child.try_wait()?.is_some() {
-                    return Ok(None);
-                }
-                thread::sleep(Duration::from_millis(100));
+        let end = if interrupt.is_raised() {
+            End::Interrupted
+        } else if deadline.is_some_and(|at| Instant::now() >= at) {
+            End::TimedOut
+        } else {
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        };
+        signal_group(child.id(), "-TERM");
+        let grace = Instant::now() + TERMINATION_GRACE;
+        while Instant::now() < grace {
+            if child.try_wait()?.is_some() {
+                return Ok(end);
             }
-            signal_group(child.id(), "-KILL");
-            child.wait()?;
-            return Ok(None);
+            thread::sleep(Duration::from_millis(100));
         }
-        thread::sleep(Duration::from_millis(100));
+        signal_group(child.id(), "-KILL");
+        child.wait()?;
+        return Ok(end);
     }
 }
 
-/// Send `signal` to the process group led by `pid`.
-fn signal_group(pid: u32, signal: &str) {
+/// Send `signal` to the process group led by `pid`; `true` when the group
+/// still had a member to receive it.
+fn signal_group(pid: u32, signal: &str) -> bool {
     // Best effort: the group may already be gone.
     Command::new("kill")
         .arg(signal)
@@ -297,36 +371,103 @@ fn signal_group(pid: u32, signal: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .ok();
+        .is_ok_and(|status| status.success())
+}
+
+/// Stop whatever is left of the process group led by the exited CLI `pid`
+/// (TERM, then KILL after a grace period), so background children cannot
+/// hold its pipes open. `true` when there was something to stop.
+fn reap_group(pid: u32) -> bool {
+    if !signal_group(pid, "-TERM") {
+        return false;
+    }
+    let grace = Instant::now() + LEFTOVER_GRACE;
+    while Instant::now() < grace {
+        if !signal_group(pid, "-0") {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    signal_group(pid, "-KILL");
+    true
+}
+
+/// Join `handle` if its thread finishes by `deadline`; otherwise leave it
+/// running detached and return `None`.
+fn join_by<T>(handle: thread::JoinHandle<T>, deadline: Instant) -> Option<thread::Result<T>> {
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Some(handle.join())
+}
+
+/// A thread copying a child pipe into the shared log, and what it has
+/// captured so far.
+struct Tee {
+    handle: thread::JoinHandle<std::io::Result<()>>,
+    captured: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Tee {
+    /// The captured output once the pipe closes, or what was captured by
+    /// `deadline` if it is still held open then.
+    fn finish(self, deadline: Instant) -> std::io::Result<Vec<u8>> {
+        if let Some(Ok(result)) = join_by(self.handle, deadline) {
+            result?;
+        }
+        let mut captured = self
+            .captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(std::mem::take(&mut *captured))
+    }
 }
 
 /// Copy a child pipe into the shared log line by line while buffering it.
-fn tee(
-    pipe: impl Read + Send + 'static,
-    log: Arc<Mutex<File>>,
-    prefix: &'static str,
-) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
-    thread::spawn(move || {
-        let mut reader = BufReader::new(pipe);
-        let mut captured = Vec::new();
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            if reader.read_until(b'\n', &mut line)? == 0 {
-                break;
-            }
-            captured.extend_from_slice(&line);
+fn tee(pipe: impl Read + Send + 'static, log: Arc<Mutex<File>>, prefix: &'static str) -> Tee {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let buffer = Arc::clone(&captured);
+    let handle = thread::spawn(move || {
+        let mut pipe = pipe;
+        let mut chunk = [0_u8; 8192];
+        let mut pending = Vec::new();
+        let write_line = |line: &[u8]| -> std::io::Result<()> {
             let mut log = log
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             log.write_all(prefix.as_bytes())?;
-            log.write_all(&line)?;
+            log.write_all(line)?;
             if !line.ends_with(b"\n") {
                 log.write_all(b"\n")?;
             }
+            Ok(())
+        };
+        loop {
+            let read = match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(&chunk[..read]);
+            pending.extend_from_slice(&chunk[..read]);
+            while let Some(end) = pending.iter().position(|&b| b == b'\n') {
+                write_line(&pending[..=end])?;
+                pending.drain(..=end);
+            }
         }
-        Ok(captured)
-    })
+        if !pending.is_empty() {
+            write_line(&pending)?;
+        }
+        Ok(())
+    });
+    Tee { handle, captured }
 }
 
 #[cfg(test)]
@@ -336,7 +477,7 @@ mod tests {
 
     fn agent(text: &str) -> Agent {
         let declaration = Declaration::parse(text).expect("declaration");
-        Agent::from_declaration("a", declaration.agent("a").expect("agent"))
+        Agent::from_declaration("a", declaration.agent("a").expect("agent")).expect("agent")
     }
 
     fn invoke(agent: &Agent, log: &Path) -> Result<AgentRun, AgentError> {
@@ -388,6 +529,135 @@ command = ["sh", "-c", "echo '{\"cli\":2}'"]
         let failing = agent_text_all_failing();
         let error = invoke(&agent(&failing), &log).expect_err("all fail");
         assert!(error.to_string().contains("every CLI failed"), "{error}");
+    }
+
+    #[test]
+    fn a_cli_outrunning_its_timeout_is_stopped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("run.log");
+        let pid_file = dir.path().join("pid");
+        let text = format!(
+            r#"
+[agent.a]
+role = "planning"
+driver = "generic"
+command = ["sh", "-c", "echo $$ > {}; sleep 30"]
+replicas = 1
+timeout = 1
+"#,
+            pid_file.display()
+        );
+        let started = Instant::now();
+        let error = invoke(&agent(&text), &log).expect_err("times out");
+        assert!(
+            matches!(error, AgentError::TimedOut { after } if after == Duration::from_secs(1)),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("timed out after 1s"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            std::fs::read_to_string(&log)
+                .expect("log")
+                .contains("=== timed out ==="),
+        );
+
+        // The CLI led its own process group: once stopped, nothing of it
+        // (neither `sh` nor its `sleep`) is left.
+        let group = std::fs::read_to_string(&pid_file).expect("pid");
+        let alive = || {
+            Command::new("kill")
+                .args(["-0", "--", &format!("-{}", group.trim())])
+                .stderr(Stdio::null())
+                .status()
+                .expect("kill")
+                .success()
+        };
+        let gone_by = Instant::now() + Duration::from_secs(3);
+        while alive() && Instant::now() < gone_by {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(), "process group {} survived", group.trim());
+    }
+
+    #[test]
+    fn a_timed_out_cli_falls_over_to_the_next() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("run.log");
+        let routed = agent(
+            &ROUTED
+                .replacen("echo '{\\\"cli\\\":1}'", "sleep 30", 1)
+                .replacen("replicas = 1", "replicas = 1\ntimeout = 1", 1)
+                .replacen(
+                    "[[agent.a.alternative]]",
+                    "[[agent.a.alternative]]\ntimeout = 30",
+                    1,
+                ),
+        );
+        let mut fell_over = false;
+        // Routing alternates the first CLI, so one of two starts at `sleep`.
+        for _ in 0..2 {
+            let started = Instant::now();
+            let run = invoke(&routed, &log).expect("run");
+            assert_eq!(run.response["cli"], 2);
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                started.elapsed()
+            );
+            let text = std::fs::read_to_string(&log).expect("log");
+            fell_over |= text.contains("generic failed: agent timed out after 1s")
+                && text.contains("falling over to the next CLI");
+        }
+        assert!(fell_over, "no invocation fell over from the timed-out CLI");
+    }
+
+    #[test]
+    fn background_children_holding_the_pipes_are_reaped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("run.log");
+        let pid_file = dir.path().join("pid");
+        let text = format!(
+            r#"
+[agent.a]
+role = "planning"
+driver = "generic"
+command = ["sh", "-c", "echo '{{\"ok\":true}}'; sleep 60 & echo $! > {}"]
+replicas = 1
+"#,
+            pid_file.display()
+        );
+        let started = Instant::now();
+        let run = invoke(&agent(&text), &log).expect("run");
+        assert_eq!(run.response["ok"], true);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            std::fs::read_to_string(&log)
+                .expect("log")
+                .contains("its process group was killed"),
+        );
+
+        let sleeper = std::fs::read_to_string(&pid_file).expect("pid");
+        let alive = || {
+            Command::new("kill")
+                .args(["-0", sleeper.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .expect("kill")
+                .success()
+        };
+        let gone_by = Instant::now() + Duration::from_secs(3);
+        while alive() && Instant::now() < gone_by {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(), "background child {} survived", sleeper.trim());
     }
 
     fn agent_text_all_failing() -> String {
