@@ -431,7 +431,7 @@ mod tests {
                 .events(None, 1000)
                 .expect("events")
                 .into_iter()
-                .filter(|e| e.kind == crate::event::EventKind::OriginAdvanced)
+                .filter(|e| e.kind == EventKind::OriginAdvanced)
                 .count()
         };
 
