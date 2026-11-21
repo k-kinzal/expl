@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-use crate::graph::{Evaluation, Graph, GraphError, Node, NodeFilter, NodeId, NodeKind};
+use crate::graph::{Evaluation, Node, NodeId, NodeKind, Snapshot};
 
 /// Longest excerpt of free text (outcomes, reasons) quoted per node.
 const EXCERPT: usize = 600;
@@ -61,19 +61,17 @@ pub(crate) fn numbered_goals(goals: &[Node]) -> String {
     out
 }
 
-/// The steps for planning: every non-pruned node with its edges, outcome,
-/// and latest evaluation per goal.
-pub(crate) fn graph(graph: &Graph) -> Result<String, GraphError> {
-    let nodes = graph.nodes(&NodeFilter::default())?;
-    let edges = graph.edges()?;
+/// The steps for planning: every non-pruned node of `snapshot` with its
+/// edges, outcome, and latest evaluation per goal.
+pub(crate) fn graph(snapshot: &Snapshot) -> String {
     let mut after: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
     let mut before: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-    for edge in &edges {
+    for edge in &snapshot.edges {
         after.entry(edge.target).or_default().push(edge.source);
         before.entry(edge.source).or_default().push(edge.target);
     }
-    let mut latest: BTreeMap<(NodeId, NodeId), Evaluation> = BTreeMap::new();
-    for evaluation in graph.evaluations()? {
+    let mut latest: BTreeMap<(NodeId, NodeId), &Evaluation> = BTreeMap::new();
+    for evaluation in &snapshot.evaluations {
         latest.insert((evaluation.node, evaluation.goal), evaluation);
     }
     let ids = |list: Option<&Vec<NodeId>>| {
@@ -90,7 +88,7 @@ pub(crate) fn graph(graph: &Graph) -> Result<String, GraphError> {
 
     let mut out = String::new();
     let mut pruned = Vec::new();
-    for node in &nodes {
+    for node in &snapshot.nodes {
         if node.status == crate::graph::NodeStatus::Pruned {
             pruned.push(node.id.to_string());
             continue;
@@ -131,5 +129,5 @@ pub(crate) fn graph(graph: &Graph) -> Result<String, GraphError> {
     if !pruned.is_empty() {
         let _ = writeln!(out, "(pruned: {})", pruned.join(", "));
     }
-    Ok(out)
+    out
 }

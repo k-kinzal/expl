@@ -323,7 +323,7 @@ impl<'a> Process<'a> {
             match result {
                 _ if interrupt.lease_lost() => lost(),
                 Ok(report) => {
-                    let coalesced = match covered {
+                    let coalesced = match report.covered().or(covered) {
                         Some(through) if role.coalesces() => {
                             let note = format!("covered by the reaction to {}", delivery.event.id);
                             holding(inbox.ack_through(&delivery, role.reactions(), through, &note))?

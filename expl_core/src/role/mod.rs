@@ -137,7 +137,8 @@ impl Role {
     }
 
     /// Whether one reaction covers every event of this role recorded
-    /// before it started. Planning reads the whole graph, so the events
+    /// before it started — or, when its [`Report::covered`] says so, before
+    /// the graph it was shown. Planning reads the whole graph, so the events
     /// that piled up while it was busy need no reaction of their own.
     #[must_use]
     pub fn coalesces(self) -> bool {
@@ -227,6 +228,19 @@ pub enum Report {
 }
 
 impl Report {
+    /// The newest event this reaction took into account, when it says so:
+    /// a coalescing role covers its events up to here and no further.
+    #[must_use]
+    pub fn covered(&self) -> Option<crate::event::EventId> {
+        match self {
+            Self::Planning(p) => p.covered,
+            Self::Exploration { .. }
+            | Self::Execution(_)
+            | Self::Evaluation(_)
+            | Self::Ignored { .. } => None,
+        }
+    }
+
     /// One line for logs and delivery notes.
     #[must_use]
     pub fn summary(&self) -> String {

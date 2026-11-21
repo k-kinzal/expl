@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 /// (and `shared.txt` too while `@DIR@/shared` exists, so joined steps
 /// conflict) and sleeps while `@DIR@/slow` exists. Facing merge conflicts,
 /// execution resolves them, or claims to while `@DIR@/unresolvable`
-/// exists. Planning answers with `@DIR@/plan.json` when present. Every
-/// prompt is kept in `@DIR@/prompts/` for inspection.
+/// exists. Planning sleeps while `@DIR@/slow-planning` exists and answers
+/// with `@DIR@/plan.json` when present. Every prompt is kept in
+/// `@DIR@/prompts/` for inspection.
 const AGENT: &str = r#"#!/bin/sh
 mkdir -p "@DIR@/prompts"
 cat > "@DIR@/prompts/$EXPL_ROLE-$$.txt"
@@ -23,6 +24,7 @@ exploration)
     echo '{"nodes":[]}'
   fi ;;
 planning)
+  while [ -f "@DIR@/slow-planning" ]; do sleep 0.2; done
   if [ -f "@DIR@/plan.json" ]; then
     cat "@DIR@/plan.json"
   else
@@ -459,6 +461,96 @@ fn planning_joins_paths() {
             "{expected} missing from {files}"
         );
     }
+}
+
+#[test]
+fn planning_settles_only_the_proposals_it_was_shown() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let goal = ok(repo, &["goal", "add", "Say hello"]);
+    let a = ok(repo, &["node", "add", "A", "--before", &goal]);
+    let prompts = sandbox.dir.path().join("prompts");
+    let planning_prompts = || -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(&prompts) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .map(|e| e.expect("entry").path())
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("planning-"))
+            })
+            .collect();
+        paths.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        paths
+            .iter()
+            .map(|p| std::fs::read_to_string(p).expect("prompt"))
+            .collect()
+    };
+
+    // A step proposed while the planner's agent is working.
+    sandbox.marker("slow-planning", true);
+    let mut planner = Command::new(env!("CARGO_BIN_EXE_expl"))
+        .arg("-C")
+        .arg(repo)
+        .args(["run", "planner", "--once"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("planner");
+    wait_until("the planner's agent to start", || {
+        planning_prompts()
+            .first()
+            .is_some_and(|p| p.contains("## Response"))
+    });
+    let later = ok(repo, &["node", "add", "Later", "--before", &goal]);
+    // Even a priority for the unseen step is not taken.
+    std::fs::write(
+        sandbox.dir.path().join("plan.json"),
+        format!(
+            r#"{{"summary":"s","paths":[],"priorities":[{{"node":{a},"priority":3}},{{"node":{later},"priority":4}}],"prunes":[],"joins":[]}}"#
+        ),
+    )
+    .expect("plan");
+    sandbox.marker("slow-planning", false);
+    assert!(planner.wait().expect("planner").success());
+
+    let first = planning_prompts();
+    assert_eq!(first.len(), 1);
+    assert!(first[0].contains(" A\n"), "{}", first[0]);
+    assert!(!first[0].contains("Later"), "{}", first[0]);
+    assert_eq!(node(repo, &a)["node"]["status"], "planned");
+    assert_eq!(node(repo, &a)["node"]["priority"], 3);
+    assert_eq!(node(repo, &later)["node"]["status"], "proposed");
+    let unsettled = |repo: &Path| -> Vec<i64> {
+        json_lines(&ok(
+            repo,
+            &[
+                "event",
+                "ls",
+                "--agent",
+                "planner",
+                "--kind",
+                "node.proposed",
+                "--format",
+                "json",
+            ],
+        ))
+        .iter()
+        .filter(|e| e["delivery"] != "done")
+        .filter_map(|e| e["node"].as_i64())
+        .collect()
+    };
+    assert_eq!(unsettled(repo), [later.parse::<i64>().expect("id")]);
+
+    // The next planning is shown the step, and settles it.
+    ok(repo, &["run", "planner", "--exit-when-idle"]);
+    let second = planning_prompts();
+    assert_eq!(second.len(), 2);
+    assert!(second[1].contains("Later"), "{}", second[1]);
+    assert_eq!(node(repo, &later)["node"]["status"], "planned");
+    assert_eq!(node(repo, &later)["node"]["priority"], 4);
+    assert!(unsettled(repo).is_empty());
 }
 
 #[test]

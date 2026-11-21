@@ -21,6 +21,8 @@
 //! - [`Evaluation`] — the evaluator's verdict on one completed step against
 //!   one goal. Satisfied evaluations are the **candidates** a human selects
 //!   from.
+//! - [`Snapshot`] — nodes, edges, and evaluations read together with the
+//!   newest event, so what a role was shown and the events behind it agree.
 //! - [`AgentRunRecord`] — the journal of agent invocations, linking each
 //!   run to its agent, process, event, node, and raw log.
 //!
@@ -40,6 +42,7 @@ mod graph;
 mod lineage;
 mod node;
 mod plan;
+mod snapshot;
 
 pub use agent_run::{AgentRunId, AgentRunRecord, AgentRunStatus};
 pub use edge::Edge;
@@ -49,3 +52,4 @@ pub use graph::Graph;
 pub use lineage::{Epoch, Lineage, NewOrigin};
 pub use node::{Node, NodeFilter, NodeId, NodeKind, NodeStatus};
 pub use plan::{Plan, PlanId, PlannedPath};
+pub use snapshot::Snapshot;
