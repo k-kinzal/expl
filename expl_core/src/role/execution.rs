@@ -101,8 +101,11 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
         Ok(response) => (response.succeeded, response.summary),
         Err(error @ RoleError::Agent(AgentError::Interrupted)) => {
             // Stopping, not failing: give the step back so the redelivered
-            // event can claim it again.
-            graph.unclaim(id)?;
+            // event can claim it again — unless the lease was lost, when the
+            // step may already belong to the process that took it over.
+            if !reaction.lease_lost() {
+                graph.unclaim(id)?;
+            }
             return Err(error);
         }
         Err(error @ (RoleError::Agent(_) | RoleError::Response { .. })) => {

@@ -64,6 +64,14 @@ impl<'a> Reaction<'a> {
         self.delivery.attempts
     }
 
+    /// Whether the process lost its lease on the event, so another process
+    /// may already be reacting to it. The reaction is interrupted then, and
+    /// must leave the graph to the new holder.
+    #[must_use]
+    pub fn lease_lost(&self) -> bool {
+        self.interrupt.lease_lost()
+    }
+
     /// The node the event is about.
     ///
     /// # Errors

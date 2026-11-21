@@ -431,6 +431,56 @@ fn stopping_mid_execution_gives_the_event_back() {
 }
 
 #[test]
+fn losing_the_lease_interrupts_the_reaction() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    ok(repo, &["goal", "add", "g"]);
+    let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
+    sandbox.slow(true);
+    let name = ok(repo, &["run", "executor", "-d"]);
+    wait_until("the step to start", || {
+        node(repo, &a)["node"]["status"] == "running"
+    });
+
+    // Its lease runs out and another executor takes the event over, in one
+    // step so the process cannot reclaim the event itself first.
+    let db = rusqlite::Connection::open(repo.join(".expl/expl.db")).expect("db");
+    db.busy_timeout(Duration::from_secs(30)).expect("timeout");
+    let taken = db
+        .execute(
+            "UPDATE deliveries SET lease_token = 'replacement', process_id = 999, \
+             attempts = attempts + 1, \
+             leased_until = CAST(strftime('%s','now') AS INTEGER) + 600 \
+             WHERE agent = 'executor' AND status = 'leased'",
+            [],
+        )
+        .expect("take over");
+    assert_eq!(taken, 1);
+
+    wait_until("the loss to be reported", || {
+        ok(repo, &["logs", &name]).contains("lost the lease")
+    });
+    let step = node(repo, &a);
+    assert_eq!(step["agent_runs"][0]["status"], "interrupted", "{step}");
+    // The step is left to the new holder, not given back to the plan.
+    assert_eq!(step["node"]["status"], "running", "{step}");
+    let record = json(&ok(repo, &["process", "inspect", &name]));
+    assert_eq!(record["state"], "running", "{record}");
+
+    ok(repo, &["stop", &name]);
+    let lease: (String, i64, String) = db
+        .query_row(
+            "SELECT status, process_id, lease_token FROM deliveries \
+             WHERE agent = 'executor' AND event_id = (SELECT MAX(id) FROM events \
+             WHERE kind = 'node.ready' AND node_id = ?1)",
+            [a.parse::<i64>().expect("id")],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("lease");
+    assert_eq!(lease, ("leased".into(), 999, "replacement".into()));
+}
+
+#[test]
 fn usage_errors_exit_with_code_one() {
     let sandbox = sandbox();
     let out = expl(&sandbox.repo, &["node", "inspect", "99"]);
