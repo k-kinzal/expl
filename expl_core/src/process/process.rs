@@ -36,6 +36,14 @@ pub enum ProcessError {
     /// The graph failed.
     #[error(transparent)]
     Graph(#[from] GraphError),
+    /// The record was no longer there to adopt: it already started,
+    /// exited, or missed its startup deadline (and its replica slot may
+    /// have gone to a replacement).
+    #[error(
+        "process {0} cannot be adopted: it is no longer a created record within its startup \
+         deadline"
+    )]
+    NotAdoptable(ProcessId),
 }
 
 /// How long a process lives.
@@ -133,7 +141,8 @@ impl<'a> Process<'a> {
     /// # Errors
     ///
     /// [`ProcessError`] when the database fails; the record is marked
-    /// exited with the error.
+    /// exited with the error. [`ProcessError::NotAdoptable`] when the
+    /// record cannot be adopted; it is left as it is.
     pub fn run(
         &self,
         options: ProcessOptions,
@@ -141,7 +150,9 @@ impl<'a> Process<'a> {
     ) -> Result<String, ProcessError> {
         let project = self.context.project();
         let processes = Processes::open(&project.database_path(), &project.processes_dir())?;
-        processes.start(self.id, std::process::id())?;
+        if !processes.start(self.id, std::process::id())? {
+            return Err(ProcessError::NotAdoptable(self.id));
+        }
         observer.observe(&ProcessActivity::Started(&processes.get(self.id)?));
 
         let finished = AtomicBool::new(false);
