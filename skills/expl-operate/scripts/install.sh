@@ -14,6 +14,13 @@ repo="$(git rev-parse --show-toplevel)"
 cd "$repo"
 bin="$(dirname "$(command -v expl)")"
 
+# cargo builds the working tree, not a commit: uncommitted edits would be
+# installed and every restarted process would run them.
+if [ -n "$(git status --porcelain --untracked-files=no -- '*.rs' '*.toml' Cargo.lock)" ]; then
+  echo "uncommitted source changes; commit or stash them before installing" >&2
+  exit 2
+fi
+
 place() {
   cp "target/release/$1" "$bin/$1.new"
   mv -f "$bin/$1.new" "$bin/$1"

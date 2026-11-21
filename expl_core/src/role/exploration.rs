@@ -14,6 +14,19 @@
 //!   never exhausts a starting point, so the same node is explored again
 //!   and again, each time growing new steps.
 //!
+//! - `node.failed` → a step could not be carried out: explore past the
+//!   failure — new hypotheses that build on what the failed step built on
+//!   and head for its goals, informed by what went wrong. A failed step is
+//!   also a starting point that revisits come back to.
+//!
+//! An agent declared with `scope = "graph"` reacts to the same events
+//! differently: it surveys the whole graph at once — every step with its
+//! outcome and evaluations — for what no single node would suggest (gaps
+//! between paths, combinations of separate paths, patterns across
+//! failures), and decides itself where each proposal attaches. A survey
+//! covers every event recorded before it started, so events already older
+//! than the agent's latest survey are passed over.
+//!
 //! Every exploration is told which steps already exist around it (the
 //! ones built on its starting point, and all open work), so a repeated
 //! exploration proposes alternatives instead of the same steps again.
@@ -22,15 +35,17 @@
 //! from (the origin, for backward exploration), so its proposals are
 //! grounded in the actual code. Its prompt holds only the goals it explores
 //! toward; where proposals attach in the graph is decided here, not by the
-//! agent.
+//! agent — except in a survey, whose point is to attach anywhere.
 
+use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::declaration::Scope;
 use crate::event::EventKind;
-use crate::graph::{Graph, Node, NodeFilter, NodeId, NodeKind, NodeStatus};
+use crate::graph::{Evaluation, Graph, Lineage, Node, NodeFilter, NodeId, NodeKind, NodeStatus};
 use crate::prompt::Prompt;
 use crate::role::{Direction, Reaction, Report, RoleError, digest};
 
@@ -67,6 +82,43 @@ struct ProposedNode {
     objective: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SurveyResponse {
+    nodes: Vec<SurveyedNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SurveyedNode {
+    title: String,
+    objective: String,
+    after: Vec<i64>,
+    before: Vec<i64>,
+}
+
+fn survey_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["nodes"],
+        "properties": {
+            "nodes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["title", "objective", "after", "before"],
+                    "properties": {
+                        "title": {"type": "string", "description": "Short imperative name of the step."},
+                        "objective": {"type": "string", "description": "What the step must achieve, concretely enough to be done in one session and checked afterwards."},
+                        "after": {"type": "array", "items": {"type": "integer"}, "description": "Ids of the nodes it builds on: the origin, or completed steps. Several ids join their work; empty means the origin."},
+                        "before": {"type": "array", "items": {"type": "integer"}, "description": "Ids of the goals it heads toward; empty means every goal listed."}
+                    }
+                }
+            }
+        }
+    })
+}
+
 fn schema() -> serde_json::Value {
     json!({
         "type": "object",
@@ -91,6 +143,9 @@ fn schema() -> serde_json::Value {
 
 pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, RoleError> {
     let subject = graph.node(reaction.subject()?)?;
+    if reaction.agent().declaration().scope == Some(Scope::Graph) {
+        return survey_on(reaction, graph, &subject);
+    }
     let explorations = match reaction.event().kind {
         EventKind::GoalAdded => {
             if subject.status != NodeStatus::Active {
@@ -155,7 +210,9 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
                     subject.id, subject.status, subject.kind
                 )));
             }
-            if subject.kind == NodeKind::Goal {
+            if subject.status == NodeStatus::Failed {
+                vec![explore_failure(reaction, graph, &subject)?]
+            } else if subject.kind == NodeKind::Goal {
                 let goals = [subject.clone()];
                 vec![explore(
                     reaction,
@@ -194,13 +251,24 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
                 &goals,
             )?]
         }
+        EventKind::NodeFailed => {
+            if subject.kind != NodeKind::Step || subject.status != NodeStatus::Failed {
+                return Ok(Reaction::ignore(format!(
+                    "{} is a {} {}",
+                    subject.id, subject.status, subject.kind
+                )));
+            }
+            if graph.goals()?.is_empty() {
+                return Ok(Reaction::ignore("no active goals"));
+            }
+            vec![explore_failure(reaction, graph, &subject)?]
+        }
         other @ (EventKind::GoalRetired
         | EventKind::NodeProposed
         | EventKind::NodePlanned
         | EventKind::NodeReady
         | EventKind::NodeStarted
         | EventKind::NodeCompleted
-        | EventKind::NodeFailed
         | EventKind::NodePruned
         | EventKind::PlanRecorded) => {
             return Ok(Reaction::ignore(format!(
@@ -228,14 +296,14 @@ fn goals_from(graph: &Graph, start: &Node) -> Result<Vec<Node>, RoleError> {
 /// Most steps an exploration is told already exist.
 const KNOWN_STEPS: usize = 40;
 
-/// The steps that already exist around an exploration from `start`: those
-/// built on it (forward) or leading to it (backward), whatever became of
-/// them, and every step still open anywhere — newest first.
-fn known_steps(graph: &Graph, direction: Direction, start: &Node) -> Result<Vec<Node>, RoleError> {
-    let mut steps = match direction {
-        Direction::Forward => graph.successors(start.id)?,
-        Direction::Backward => graph.predecessors(start.id)?,
-    };
+/// Longest excerpt of a failed step's outcome quoted to an exploration
+/// past it.
+const FAILURE_EXCERPT: usize = 2000;
+
+/// The steps that already exist around an exploration: `around` (the
+/// neighbours of where it starts), whatever became of them, and every step
+/// still open anywhere — newest first.
+fn known_steps(graph: &Graph, mut steps: Vec<Node>) -> Result<Vec<Node>, RoleError> {
     steps.extend(graph.nodes(&NodeFilter {
         kinds: vec![NodeKind::Step],
         statuses: vec![
@@ -251,9 +319,57 @@ fn known_steps(graph: &Graph, direction: Direction, start: &Node) -> Result<Vec<
     Ok(steps)
 }
 
-/// Explore from `start` toward `goals`. Forward proposals build on `start`
-/// and lead to `goals`; backward proposals (`start` is the goal) build on
-/// the origin and lead to `start`.
+/// Where new work on top of `nodes` can start: completed steps not yet in
+/// the trunk stay themselves; origins and steps already in the trunk
+/// become the active `origin`; anything else (open, failed, pruned work,
+/// goals) is dropped. The origin is dropped next to a step, which already
+/// builds on an origin. Never empty: the origin when nothing is left.
+fn realised_base(lineage: &Lineage, origin: &Node, nodes: &[&Node]) -> Vec<NodeId> {
+    let mut base = Vec::new();
+    for node in nodes {
+        let id = match (node.kind, node.status) {
+            (NodeKind::Step, NodeStatus::Completed) if !lineage.in_trunk(node.id) => node.id,
+            (NodeKind::Origin, _) | (NodeKind::Step, NodeStatus::Completed) => origin.id,
+            _ => continue,
+        };
+        if !base.contains(&id) {
+            base.push(id);
+        }
+    }
+    if base.len() > 1 {
+        base.retain(|id| *id != origin.id);
+    }
+    if base.is_empty() {
+        base.push(origin.id);
+    }
+    base
+}
+
+/// Add one proposal to the graph, noting it in `report`.
+fn record(
+    graph: &mut Graph,
+    report: &mut ExplorationReport,
+    title: &str,
+    objective: &str,
+    after: &[NodeId],
+    before: &[NodeId],
+) {
+    match graph.propose_step(title.trim(), objective.trim(), after, before) {
+        Ok(id) => report.proposed.push(id),
+        Err(error) => report.rejected.push(Rejection {
+            title: title.to_owned(),
+            reason: error.to_string(),
+        }),
+    }
+}
+
+fn breadth(reaction: &Reaction<'_>) -> usize {
+    reaction.agent().declaration().breadth.unwrap_or(1)
+}
+
+/// Explore from `start` toward `goals`, forward or backward. Forward
+/// proposals build on `start` and lead to `goals`; backward proposals
+/// (`start` is the goal) build on the origin and lead to `start`.
 fn explore(
     reaction: &Reaction<'_>,
     graph: &mut Graph,
@@ -262,15 +378,43 @@ fn explore(
     goals: &[Node],
 ) -> Result<ExplorationReport, RoleError> {
     let origin = graph.origin()?;
-    let (ground, after, before): (&Node, Vec<NodeId>, Vec<NodeId>) = match direction {
-        Direction::Forward => (start, vec![start.id], goals.iter().map(|g| g.id).collect()),
-        Direction::Backward => (&origin, vec![origin.id], vec![start.id]),
+    let backward = direction == Direction::Backward;
+    let (ground, after, before): (&Node, Vec<NodeId>, Vec<NodeId>) = if backward {
+        (&origin, vec![origin.id], vec![start.id])
+    } else {
+        (start, vec![start.id], goals.iter().map(|g| g.id).collect())
     };
-    let scratch = reaction.context().workspaces().scratch(ground)?;
-    let breadth = reaction.agent().declaration().breadth.unwrap_or(1);
-    let known = known_steps(graph, direction, start)?;
+    let breadth = breadth(reaction);
+    let known = if backward {
+        known_steps(graph, graph.predecessors(start.id)?)?
+    } else {
+        known_steps(graph, graph.successors(start.id)?)?
+    };
+    let task = if backward {
+        format!(
+            "## Task\n\n\
+             The target below is a state this repository should reach. Work backward from it: \
+             propose up to {breadth} possible steps that could be realised immediately before \
+             the target is reached. The working directory holds the repository as it is now; read it to \
+             ground your proposals. Do not modify files.\n\n\
+             ## Target\n\n{target}",
+            target = digest::goals(std::slice::from_ref(start)),
+        )
+    } else {
+        format!(
+            "## Task\n\n\
+             Propose up to {breadth} possible next steps that could move this repository toward \
+             the goal{s} below. The working directory holds the repository as it is now; read it to ground \
+             your proposals. Do not modify files.\n\n\
+             ## Goal{s}\n\n{goals}{judged}",
+            s = if goals.len() == 1 { "" } else { "s" },
+            goals = digest::goals(goals),
+            judged = judgement(graph, start)?,
+        )
+    };
     let schema = schema();
-    let prompt = prompt(reaction, direction, start, goals, &known, breadth, &schema);
+    let prompt = prompt(reaction, &task, &known, &schema);
+    let scratch = reaction.context().workspaces().scratch(ground)?;
     let response: Response =
         reaction.invoke(graph, Some(start.id), scratch.path(), &prompt, &schema)?;
     drop(scratch);
@@ -282,53 +426,264 @@ fn explore(
         rejected: Vec::new(),
     };
     for proposal in response.nodes.into_iter().take(breadth) {
-        match graph.propose_step(
-            proposal.title.trim(),
-            proposal.objective.trim(),
+        record(
+            graph,
+            &mut report,
+            &proposal.title,
+            &proposal.objective,
             &after,
             &before,
-        ) {
-            Ok(id) => report.proposed.push(id),
-            Err(error) => report.rejected.push(Rejection {
-                title: proposal.title,
-                reason: error.to_string(),
-            }),
-        }
+        );
     }
     Ok(report)
 }
 
-/// The prompt: the goals, the task, and the steps that already exist —
-/// nothing else about the graph.
+/// What the step an exploration starts from did and how it was judged
+/// (its latest verdict per goal), so the next steps can aim at where it
+/// fell short; empty for the origin or a step never judged.
+fn judgement(graph: &Graph, start: &Node) -> Result<String, RoleError> {
+    if start.kind != NodeKind::Step {
+        return Ok(String::new());
+    }
+    let mut latest: BTreeMap<NodeId, Evaluation> = BTreeMap::new();
+    for evaluation in graph.evaluations_of(start.id)? {
+        latest.insert(evaluation.goal, evaluation);
+    }
+    if latest.is_empty() {
+        return Ok(String::new());
+    }
+    let mut out = format!(
+        "\n## Where the work stands\n\n\
+         The working directory already holds this step, carried out and judged:\n\n- {}\n",
+        start.title
+    );
+    if let Some(outcome) = &start.outcome {
+        let _ = writeln!(out, "  Outcome: {}", digest::excerpt(outcome));
+    }
+    for evaluation in latest.values() {
+        let _ = writeln!(
+            out,
+            "  Judged {}/100 ({}): {}",
+            evaluation.score,
+            if evaluation.satisfied {
+                "satisfied"
+            } else {
+                "not satisfied"
+            },
+            digest::excerpt(&evaluation.reason)
+        );
+    }
+    out.push_str("\nAim the next steps at what it still falls short of.\n");
+    Ok(out)
+}
+
+/// Explore past `failed`: new hypotheses in its place, building on what it
+/// built on and heading for its goals, informed by what went wrong.
+fn explore_failure(
+    reaction: &Reaction<'_>,
+    graph: &mut Graph,
+    failed: &Node,
+) -> Result<ExplorationReport, RoleError> {
+    let origin = graph.origin()?;
+    let lineage = graph.lineage()?;
+    let predecessors = graph.predecessors(failed.id)?;
+    let base = realised_base(&lineage, &origin, &predecessors.iter().collect::<Vec<_>>());
+    let goals = goals_from(graph, failed)?;
+    let ground = match base.as_slice() {
+        [only] if *only != origin.id => graph.node(*only)?,
+        _ => origin.clone(),
+    };
+    let mut around = Vec::new();
+    for id in &base {
+        around.extend(graph.successors(*id)?);
+    }
+    let known = known_steps(graph, around)?;
+    let breadth = breadth(reaction);
+
+    let mut attempt = format!("- {}\n", failed.title);
+    if !failed.objective.trim().is_empty() {
+        let _ = writeln!(
+            attempt,
+            "  Objective: {}",
+            digest::excerpt(&failed.objective)
+        );
+    }
+    let _ = writeln!(
+        attempt,
+        "  What went wrong: {}",
+        failed.outcome.as_deref().map_or_else(
+            || "(not recorded)".to_owned(),
+            |o| digest::excerpt_to(o, FAILURE_EXCERPT)
+        )
+    );
+    if let Some(branch) = &failed.branch {
+        let _ = writeln!(
+            attempt,
+            "  Whatever the attempt left is on branch `{branch}` (inspect it read-only, e.g. \
+             `git log` / `git diff` against it)."
+        );
+    }
+    let task = format!(
+        "## Task\n\n\
+         A step toward the goal{s} below was attempted and could not be carried out. A failure \
+         is information: work out what it reveals — a wrong assumption, a step too large, a \
+         missing prerequisite, an approach that cannot work here — and propose up to {breadth} \
+         new hypotheses it suggests: alternatives that avoid the cause, smaller or preparatory \
+         steps, investigations into why it failed, or a different way to reach the same aim. \
+         Each will be attempted in place of the failed step, from the same starting point. The \
+         working directory holds that starting point; read it to ground your proposals. Do not \
+         modify files.\n\n\
+         ## Failed step\n\n{attempt}\n\
+         ## Goal{s}\n\n{goals}",
+        s = if goals.len() == 1 { "" } else { "s" },
+        goals = digest::goals(&goals),
+    );
+    let schema = schema();
+    let prompt = prompt(reaction, &task, &known, &schema);
+    let scratch = reaction.context().workspaces().scratch(&ground)?;
+    let response: Response =
+        reaction.invoke(graph, Some(failed.id), scratch.path(), &prompt, &schema)?;
+    drop(scratch);
+
+    let before: Vec<NodeId> = goals.iter().map(|g| g.id).collect();
+    let mut report = ExplorationReport {
+        direction: Direction::Failure,
+        from: failed.id,
+        proposed: Vec::new(),
+        rejected: Vec::new(),
+    };
+    for proposal in response.nodes.into_iter().take(breadth) {
+        record(
+            graph,
+            &mut report,
+            &proposal.title,
+            &proposal.objective,
+            &base,
+            &before,
+        );
+    }
+    Ok(report)
+}
+
+/// A graph-wide exploration's reaction to any event: survey toward the
+/// goal just added, or toward every active goal — unless a survey started
+/// after the event was recorded, which already saw what it brought.
+fn survey_on(
+    reaction: &Reaction<'_>,
+    graph: &mut Graph,
+    subject: &Node,
+) -> Result<Report, RoleError> {
+    let event = reaction.event();
+    let goals = if event.kind == EventKind::GoalAdded {
+        if subject.status != NodeStatus::Active {
+            return Ok(Reaction::ignore(format!(
+                "goal {} is {}",
+                subject.id, subject.status
+            )));
+        }
+        vec![subject.clone()]
+    } else {
+        graph.goals()?
+    };
+    if goals.is_empty() {
+        return Ok(Reaction::ignore("no active goals"));
+    }
+    if let Some(last) = graph.last_success(reaction.agent().name())?
+        && last > event.created_at
+    {
+        return Ok(Reaction::ignore(format!(
+            "the whole graph was surveyed at {last}, after this event"
+        )));
+    }
+    Ok(Report::Exploration {
+        explorations: vec![survey(reaction, graph, &goals)?],
+    })
+}
+
+/// Survey the whole graph toward `goals`; the agent chooses where each
+/// proposal attaches, within what can be built on.
+fn survey(
+    reaction: &Reaction<'_>,
+    graph: &mut Graph,
+    goals: &[Node],
+) -> Result<ExplorationReport, RoleError> {
+    let origin = graph.origin()?;
+    let lineage = graph.lineage()?;
+    let snapshot = graph.snapshot()?;
+    let breadth = breadth(reaction);
+    let task = format!(
+        "## Task\n\n\
+         Below is the whole map of the work toward the goals: every step proposed so far, what \
+         it builds on (`after`) and heads for (`before`), what became of it, and how it was \
+         judged. Look across the whole map rather than out from any one node, for what no single \
+         node would suggest:\n\
+         - gaps: parts of a goal no path addresses;\n\
+         - combinations: separate paths whose results could be joined or built on together;\n\
+         - patterns: causes shared by several failures or weak evaluations, and what would \
+           remove them;\n\
+         - assumptions every path shares that might be wrong;\n\
+         - places nobody has explored from.\n\n\
+         Propose up to {breadth} new steps. For each, give the ids of the nodes it builds on \
+         (`after`: the origin {origin} or completed steps — several ids join their work) and of \
+         the goals it heads toward (`before`). The working directory holds the repository at \
+         the origin; read it to ground your proposals. Do not modify files.\n\n\
+         ## Goals\n\n{goals}\n\
+         ## Map\n\n{map}",
+        origin = origin.id,
+        goals = digest::numbered_goals(goals),
+        map = digest::graph(&snapshot),
+    );
+    let schema = survey_schema();
+    let prompt = prompt(reaction, &task, &[], &schema);
+    let scratch = reaction.context().workspaces().scratch(&origin)?;
+    let response: SurveyResponse =
+        reaction.invoke(graph, None, scratch.path(), &prompt, &schema)?;
+    drop(scratch);
+
+    let all_goals: Vec<NodeId> = goals.iter().map(|g| g.id).collect();
+    let mut report = ExplorationReport {
+        direction: Direction::Survey,
+        from: origin.id,
+        proposed: Vec::new(),
+        rejected: Vec::new(),
+    };
+    for proposal in response.nodes.into_iter().take(breadth) {
+        let named: Vec<&Node> = proposal
+            .after
+            .iter()
+            .filter_map(|id| snapshot.node(NodeId(*id)))
+            .collect();
+        let after = realised_base(&lineage, &origin, &named);
+        let mut before: Vec<NodeId> = proposal
+            .before
+            .iter()
+            .map(|id| NodeId(*id))
+            .filter(|id| all_goals.contains(id))
+            .collect();
+        before.dedup();
+        if before.is_empty() {
+            before.clone_from(&all_goals);
+        }
+        record(
+            graph,
+            &mut report,
+            &proposal.title,
+            &proposal.objective,
+            &after,
+            &before,
+        );
+    }
+    Ok(report)
+}
+
+/// The prompt: the task (with what it needs to know), the steps that
+/// already exist, the guidelines, and the response format.
 fn prompt(
     reaction: &Reaction<'_>,
-    direction: Direction,
-    start: &Node,
-    goals: &[Node],
+    task: &str,
     known: &[Node],
-    breadth: usize,
     schema: &serde_json::Value,
 ) -> Prompt {
-    let task = match direction {
-        Direction::Forward => format!(
-            "## Task\n\n\
-             Propose up to {breadth} possible next steps that could move this repository toward \
-             the goal{s} below. The working directory holds the repository as it is now; read it to ground \
-             your proposals. Do not modify files.\n\n\
-             ## Goal{s}\n\n{goals}",
-            s = if goals.len() == 1 { "" } else { "s" },
-            goals = digest::goals(goals),
-        ),
-        Direction::Backward => format!(
-            "## Task\n\n\
-             The target below is a state this repository should reach. Work backward from it: \
-             propose up to {breadth} possible steps that could be realised immediately before \
-             the target is reached. The working directory holds the repository as it is now; read it to \
-             ground your proposals. Do not modify files.\n\n\
-             ## Target\n\n{target}",
-            target = digest::goals(std::slice::from_ref(start)),
-        ),
-    };
     let known = if known.is_empty() {
         String::new()
     } else {

@@ -91,6 +91,32 @@ driver = "codex"
 command = ["codex"]
 args = ["--dangerously-bypass-approvals-and-sandbox"]
 
+[agent.surveyor]
+role = "exploration"
+scope = "graph"
+driver = "claude_code"
+command = ["claude"]
+args = ["--permission-mode", "bypassPermissions"]
+env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
+replicas = 1
+weight = 1
+breadth = 8
+max_pending = 20
+instructions = """
+AGENTS.md describes the vision and architecture. You see the whole map at once: look for what
+explorations from single nodes cannot see — goals or parts of goals no path covers, separate
+paths that would be stronger joined, causes shared by several failures or weak evaluations,
+assumptions all paths share. Start each title with "Survey:". Every step must be a concrete,
+verifiable change to Rust code, tests, or configuration, or an investigation that answers a
+question about the code. Markdown files (*.md) are frozen: never propose a step whose purpose
+is to add, edit, or delete a .md file.
+"""
+
+[[agent.surveyor.alternative]]
+driver = "codex"
+command = ["codex"]
+args = ["--dangerously-bypass-approvals-and-sandbox"]
+
 [agent.planner]
 role = "planning"
 driver = "claude_code"

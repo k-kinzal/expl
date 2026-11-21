@@ -66,3 +66,40 @@ pub enum GraphError {
         value: String,
     },
 }
+
+impl GraphError {
+    /// Whether the database was only busy: another process held its lock
+    /// past the busy timeout. Trying again later can succeed.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(failure, _))
+                if matches!(
+                    failure.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqlite(code: std::ffi::c_int) -> GraphError {
+        GraphError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            None,
+        ))
+    }
+
+    #[test]
+    fn only_a_busy_database_is_transient() {
+        assert!(sqlite(rusqlite::ffi::SQLITE_BUSY).is_busy());
+        assert!(sqlite(rusqlite::ffi::SQLITE_BUSY_SNAPSHOT).is_busy());
+        assert!(sqlite(rusqlite::ffi::SQLITE_LOCKED).is_busy());
+        assert!(!sqlite(rusqlite::ffi::SQLITE_CORRUPT).is_busy());
+        assert!(!GraphError::NoOrigin.is_busy());
+    }
+}

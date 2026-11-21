@@ -8,7 +8,7 @@
 set -uo pipefail
 repo="${1:-$(git rev-parse --show-toplevel)}"
 interval="${2:-10}"
-pattern='completed on|failed on|failed:|giving up|trunk .* moved|cannot follow|exiting|/100|explored (forward|backward)'
+pattern='completed on|failed on|failed:|giving up|trunk .* moved|cannot follow|exiting|/100|explored '
 state="$(mktemp -d "${TMPDIR:-/tmp}/expl-watch-XXXX")"
 trap 'rm -rf "$state"' EXIT
 for log in "$repo"/.expl/proc/*.log; do

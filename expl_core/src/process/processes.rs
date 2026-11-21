@@ -84,7 +84,9 @@ impl Processes {
         name: Option<&str>,
         detached: bool,
     ) -> Result<ProcessRecord, rusqlite::Error> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO processes (name, agent, status, detached, log_path) \
              VALUES (?1, ?2, 'created', ?3, '')",

@@ -99,11 +99,27 @@ pub struct AgentDeclaration {
     /// an exploration reacts to events only and never revisits.
     #[serde(default)]
     pub revisit_cooldown: Option<u64>,
+    /// Exploration only: what one exploration looks at — `"node"` (the
+    /// default) explores from the node an event names; `"graph"` surveys the
+    /// whole graph at once, for what no single node would suggest.
+    #[serde(default)]
+    pub scope: Option<Scope>,
     /// Further CLIs that can carry out the agent (`[[agent.<name>.alternative]]`).
     /// Invocations are routed across the primary CLI and these in turn, and
     /// fall over to the next one when a CLI fails.
     #[serde(default)]
     pub alternative: Vec<CliDeclaration>,
+}
+
+/// What one exploration looks at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    /// The node an event names (or a goal, for counter-exploration).
+    #[default]
+    Node,
+    /// The whole graph at once.
+    Graph,
 }
 
 /// One alternative CLI of an agent: the same fields that declare the
@@ -280,11 +296,12 @@ replicas = 1
                     if agent.breadth.is_some()
                         || agent.max_pending.is_some()
                         || agent.revisit_cooldown.is_some()
+                        || agent.scope.is_some()
                     {
                         return invalid(
                             name,
-                            "`breadth`, `max_pending` and `revisit_cooldown` apply to exploration \
-                             agents only",
+                            "`breadth`, `max_pending`, `revisit_cooldown` and `scope` apply to \
+                             exploration agents only",
                         );
                     }
                 }

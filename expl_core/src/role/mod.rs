@@ -8,7 +8,7 @@
 //!
 //! | Role | Reacts to | Works in | Changes the graph by (events) |
 //! | --- | --- | --- | --- |
-//! | exploration | `goal.added`, `node.evaluated`, `origin.advanced`, `node.revisited` | scratch at the starting node | proposing steps (`node.proposed`) |
+//! | exploration | `goal.added`, `node.evaluated`, `node.failed`, `origin.advanced`, `node.revisited` | scratch at the starting node | proposing steps (`node.proposed`) |
 //! | planning | `node.proposed`, `node.evaluated`, `node.failed`, `goal.retired`, `origin.advanced` | scratch at the origin | recording a plan, joins, priorities, prunes (`plan.recorded`, `node.planned`, `node.ready`, `node.pruned`) |
 //! | execution | `node.ready` | the step's own worktree | committing the step (`node.started`, `node.completed` / `node.failed`, successors' `node.ready`) |
 //! | evaluation | `node.completed`, `origin.advanced` | scratch at the step (or origin) | recording verdicts (`node.evaluated`) |
@@ -19,14 +19,16 @@
 //! planning re-plans the steps that were moved onto it.
 //!
 //! Exploration has a [`Direction`]: forward from a realised node toward the
-//! goals, or backward from a goal — **counter-exploration**, done when the
-//! goal asks for it.
+//! goals, backward from a goal — **counter-exploration**, done when the
+//! goal asks for it — past a failed step (new hypotheses in its place), or,
+//! for an agent declared with `scope = "graph"`, across the whole graph.
 //!
 //! Roles never print and never decide *when* they run: a
 //! [`Process`](crate::process::Process) hands them one event at a time.
 //!
 //! An agent knows only its work: a role's prompt carries the task and the
-//! information it needs, never expl, the rest of the graph, or other agents.
+//! information it needs, never expl or other agents; only planning and a
+//! graph-wide exploration see the whole graph.
 //! Operator `instructions` are the only addition.
 
 mod context;
@@ -96,6 +98,7 @@ impl Role {
             Self::Exploration => &[
                 EventKind::GoalAdded,
                 EventKind::NodeEvaluated,
+                EventKind::NodeFailed,
                 EventKind::OriginAdvanced,
                 EventKind::NodeRevisited,
             ],
@@ -205,6 +208,10 @@ pub enum Direction {
     Forward,
     /// From a goal back toward the origin (counter-exploration).
     Backward,
+    /// From a failed step: new hypotheses in its place.
+    Failure,
+    /// Across the whole graph at once, from no particular node.
+    Survey,
 }
 
 impl fmt::Display for Direction {
@@ -212,6 +219,8 @@ impl fmt::Display for Direction {
         f.write_str(match self {
             Self::Forward => "forward",
             Self::Backward => "backward",
+            Self::Failure => "past the failure",
+            Self::Survey => "across the graph",
         })
     }
 }

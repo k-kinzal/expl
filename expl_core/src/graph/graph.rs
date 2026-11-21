@@ -264,6 +264,17 @@ impl Graph {
         Ok(NodeId(conn.last_insert_rowid()))
     }
 
+    /// Begin a write: take the database's write lock up front
+    /// (`BEGIN IMMEDIATE`), waiting out other writers with the busy timeout.
+    /// A deferred transaction that reads before it writes would instead fail
+    /// at once (`SQLITE_BUSY_SNAPSHOT`) whenever another process committed in
+    /// between, and the busy timeout cannot help it.
+    fn write(&mut self) -> Result<rusqlite::Transaction<'_>, GraphError> {
+        Ok(self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?)
+    }
+
     /// Create the first origin at `base_commit`, read from the trunk
     /// `branch` (if any). The origin exists before anything happens, so it
     /// records no event.
@@ -285,7 +296,7 @@ impl Graph {
         if exists {
             return Err(GraphError::OriginExists);
         }
-        let tx = self.conn.savepoint()?;
+        let tx = self.write()?;
         let id = Self::insert_node(
             &tx,
             NodeKind::Origin,
@@ -326,9 +337,7 @@ impl Graph {
     /// active origin; [`GraphError::NotInStatus`] when an adopted node is
     /// not a completed step. Nothing is recorded then.
     pub fn advance_origin(&mut self, origin: &NewOrigin) -> Result<Option<NodeId>, GraphError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = self.write()?;
         let previous = current_origin_in(&tx)?.ok_or(GraphError::NoOrigin)?;
         if previous != origin.previous {
             return Err(GraphError::OriginMoved {
@@ -407,7 +416,7 @@ impl Graph {
         objective: &str,
         counter_exploration: bool,
     ) -> Result<NodeId, GraphError> {
-        let tx = self.conn.savepoint()?;
+        let tx = self.write()?;
         let id = Self::insert_node(
             &tx,
             NodeKind::Goal,
@@ -434,7 +443,7 @@ impl Graph {
         after: &[NodeId],
         before: &[NodeId],
     ) -> Result<NodeId, GraphError> {
-        let tx = self.conn.savepoint()?;
+        let tx = self.write()?;
         let id = Self::insert_node(
             &tx,
             NodeKind::Step,
@@ -469,7 +478,7 @@ impl Graph {
                            step not in the trunk, or an active counter-exploration goal)",
             });
         }
-        let tx = self.conn.savepoint()?;
+        let tx = self.write()?;
         emit(&tx, EventKind::NodeRevisited, Some(id))?;
         tx.commit()?;
         Ok(())
@@ -497,7 +506,7 @@ impl Graph {
     /// complete); [`GraphError::InvalidEndpoint`] or [`GraphError::Cycle`]
     /// for an edge the graph cannot hold.
     pub fn join(&mut self, target: NodeId, sources: &[NodeId]) -> Result<(), GraphError> {
-        let tx = self.conn.savepoint()?;
+        let tx = self.write()?;
         let node = node_in(&tx, target)?;
         if node.kind != NodeKind::Step
             || !matches!(node.status, NodeStatus::Proposed | NodeStatus::Planned)
@@ -532,7 +541,7 @@ impl Graph {
     ///
     /// [`GraphError`] on SQLite failure.
     pub fn plan_step(&mut self, id: NodeId, priority: i64) -> Result<(), GraphError> {
-        let tx = self.conn.savepoint()?;
+        let tx = self.write()?;
         let node = node_in(&tx, id)?;
         if node.kind == NodeKind::Step
             && matches!(node.status, NodeStatus::Proposed | NodeStatus::Planned)
@@ -560,7 +569,7 @@ impl Graph {
     ///
     /// [`GraphError::NotInStatus`] unless it is a failed step.
     pub fn replan(&mut self, id: NodeId) -> Result<(), GraphError> {
-        let tx = self.conn.savepoint()?;
+        let tx = self.write()?;
         let node = node_in(&tx, id)?;
         if node.kind != NodeKind::Step || node.status != NodeStatus::Failed {
             return Err(GraphError::NotInStatus {
@@ -585,7 +594,7 @@ impl Graph {
     ///
     /// [`GraphError`] on SQLite failure.
     pub fn claim(&mut self, id: NodeId, reclaim: bool) -> Result<bool, GraphError> {
-        let tx = self.conn.savepoint()?;
+        let tx = self.write()?;
         let changed = tx.execute(
             &format!(
                 "UPDATE nodes SET status = 'running', updated_at = {NOW} \
@@ -650,7 +659,7 @@ impl Graph {
     ///
     /// [`GraphError`] on SQLite failure.
     pub fn complete(&mut self, id: NodeId, outcome: &str) -> Result<(), GraphError> {
-        let tx = self.conn.savepoint()?;
+        let tx = self.write()?;
         set_status_in(&tx, id, NodeStatus::Completed, Some(outcome))?;
         emit(&tx, EventKind::NodeCompleted, Some(id))?;
         for successor in nodes_where(
@@ -670,7 +679,7 @@ impl Graph {
     ///
     /// [`GraphError`] on SQLite failure.
     pub fn fail(&mut self, id: NodeId, outcome: &str) -> Result<(), GraphError> {
-        let tx = self.conn.savepoint()?;
+        let tx = self.write()?;
         set_status_in(&tx, id, NodeStatus::Failed, Some(outcome))?;
         emit(&tx, EventKind::NodeFailed, Some(id))?;
         tx.commit()?;
@@ -685,7 +694,7 @@ impl Graph {
     /// [`GraphError::NotInStatus`] for the origin, running or completed
     /// steps, and goals that are not active.
     pub fn prune(&mut self, id: NodeId, reason: &str) -> Result<(), GraphError> {
-        let tx = self.conn.savepoint()?;
+        let tx = self.write()?;
         let node = node_in(&tx, id)?;
         let kind = match (node.kind, node.status) {
             (NodeKind::Goal, NodeStatus::Active) => EventKind::GoalRetired,
@@ -715,7 +724,7 @@ impl Graph {
         summary: &str,
         paths: &[PlannedPath],
     ) -> Result<PlanId, GraphError> {
-        let tx = self.conn.savepoint()?;
+        let tx = self.write()?;
         tx.execute("INSERT INTO plans (summary) VALUES (?1)", [summary])?;
         let plan_id = tx.last_insert_rowid();
         for path in paths {
@@ -747,7 +756,7 @@ impl Graph {
         node: NodeId,
         evaluations: &[NewEvaluation],
     ) -> Result<(), GraphError> {
-        let tx = self.conn.savepoint()?;
+        let tx = self.write()?;
         for evaluation in evaluations {
             tx.execute(
                 "INSERT INTO evaluations (node_id, goal_id, satisfied, score, reason) \
@@ -847,8 +856,9 @@ impl Graph {
 
     /// Every node exploration can start from again: the active origin,
     /// each completed step whose work is not yet in the trunk (forward),
-    /// and each active counter-exploration goal (backward). Empty while
-    /// there are no active goals.
+    /// each failed step (new hypotheses in its place), and each active
+    /// counter-exploration goal (backward). Empty while there are no
+    /// active goals.
     ///
     /// # Errors
     ///
@@ -863,7 +873,7 @@ impl Graph {
         points.extend(
             self.nodes(&NodeFilter {
                 kinds: vec![NodeKind::Step],
-                statuses: vec![NodeStatus::Completed],
+                statuses: vec![NodeStatus::Completed, NodeStatus::Failed],
             })?
             .into_iter()
             .filter(|step| !lineage.in_trunk(step.id)),
@@ -1163,6 +1173,24 @@ impl Graph {
         Ok(())
     }
 
+    /// When the newest run of `agent` that succeeded started (UTC, RFC
+    /// 3339, comparable with event times), if it ever succeeded.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError`] on SQLite failure.
+    pub fn last_success(&self, agent: &str) -> Result<Option<String>, GraphError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT started_at FROM agent_runs WHERE agent = ?1 AND status = 'succeeded' \
+                 ORDER BY id DESC LIMIT 1",
+                params![agent],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Agent runs, newest first, optionally only those about `node`.
     ///
     /// # Errors
@@ -1205,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn starting_points_are_realised_nodes_and_counter_goals() {
+    fn starting_points_are_realised_or_failed_steps_and_counter_goals() {
         let mut graph = Graph::in_memory().expect("graph");
         let origin = graph
             .create_origin("origin", Some("main"), "abc")
@@ -1221,6 +1249,10 @@ mod tests {
             .set_branch(a, "expl/node-a", Some("def"))
             .expect("branch");
         graph.complete(a, "done").expect("complete");
+        let c = graph.propose_step("c", "c", &[origin], &[goal]).expect("c");
+        graph.plan_step(c, 1).expect("plan");
+        assert!(graph.claim(c, false).expect("claim"));
+        graph.fail(c, "did not compile").expect("fail");
 
         let ids: Vec<NodeId> = graph
             .starting_points()
@@ -1228,7 +1260,7 @@ mod tests {
             .iter()
             .map(|n| n.id)
             .collect();
-        assert_eq!(ids, [origin, a, counter]);
+        assert_eq!(ids, [origin, a, c, counter]);
 
         graph.revisit(a).expect("revisit a");
         graph.revisit(counter).expect("revisit counter");

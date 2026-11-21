@@ -6,7 +6,9 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 /// One script plays every role. Exploration proposes a step only for a new
-/// goal, so the graph settles; execution writes a file named after its node
+/// goal or a failed step, so the graph settles (a survey answers with
+/// `@DIR@/survey.json`); execution fails while `@DIR@/fail` exists, else
+/// writes a file named after its node
 /// (and `shared.txt` too while `@DIR@/shared` exists, so joined steps
 /// conflict) and sleeps while `@DIR@/slow` exists. Facing merge conflicts,
 /// execution resolves them, or claims to while `@DIR@/unresolvable`
@@ -18,8 +20,12 @@ mkdir -p "@DIR@/prompts"
 cat > "@DIR@/prompts/$EXPL_ROLE-$$.txt"
 case "$EXPL_ROLE" in
 exploration)
-  if [ "$EXPL_EVENT" = goal.added ]; then
+  if grep -q '^## Map' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
+    cat "@DIR@/survey.json"
+  elif [ "$EXPL_EVENT" = goal.added ]; then
     echo '{"nodes":[{"title":"Write hello","objective":"Create hello.txt"}]}'
+  elif [ "$EXPL_EVENT" = node.failed ]; then
+    echo '{"nodes":[{"title":"Write hello in smaller steps","objective":"Create an empty hello.txt"}]}'
   else
     echo '{"nodes":[]}'
   fi ;;
@@ -38,6 +44,10 @@ execution)
       for f in $conflicted; do echo resolved > "$f"; done
     fi
     echo '{"succeeded":true,"summary":"resolved conflicts"}'
+    exit 0
+  fi
+  if [ -f "@DIR@/fail" ]; then
+    echo '{"succeeded":false,"summary":"could not compile hello.rs"}'
     exit 0
   fi
   echo "node $EXPL_NODE" > "node-$EXPL_NODE.txt"
@@ -937,4 +947,109 @@ fn a_new_goal_is_explored_even_while_exploration_is_paused() {
             .starts_with("idle (paused")),
         "{exited:?}"
     );
+}
+
+#[test]
+fn a_failed_step_grows_new_hypotheses_in_its_place() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    ok(repo, &["goal", "add", "Say hello"]);
+    ok(repo, &["run", "explorer", "--exit-when-idle"]);
+    ok(repo, &["run", "planner", "--exit-when-idle"]);
+    sandbox.marker("fail", true);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    assert_eq!(node(repo, "3")["node"]["status"], "failed");
+
+    // Exploration reacts to the failure: a new hypothesis that builds on
+    // what the failed step built on and heads for its goal.
+    ok(repo, &["run", "explorer", "--exit-when-idle"]);
+    let steps = json_lines(&ok(repo, &["node", "ls", "--format", "json"]));
+    let derived = steps
+        .iter()
+        .find(|n| n["title"] == "Write hello in smaller steps")
+        .unwrap_or_else(|| panic!("no hypothesis past the failure: {steps:?}"));
+    let derived = node(repo, &derived["id"].to_string());
+    assert_eq!(derived["predecessors"], serde_json::json!([1]));
+    assert_eq!(derived["successors"], serde_json::json!([2]));
+    // The exploration is journaled on the failed step, and was told what
+    // went wrong.
+    let failed = node(repo, "3");
+    assert!(
+        failed["agent_runs"]
+            .as_array()
+            .expect("runs")
+            .iter()
+            .any(|r| r["role"] == "exploration"),
+        "{failed}"
+    );
+    let prompts = sandbox.dir.path().join("prompts");
+    let told = std::fs::read_dir(&prompts)
+        .expect("prompts")
+        .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("prompt"))
+        .any(|text| text.contains("## Failed step") && text.contains("could not compile hello.rs"));
+    assert!(told, "no exploration prompt described the failure");
+}
+
+#[test]
+fn a_graph_wide_exploration_surveys_and_attaches_anywhere() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    ok(repo, &["goal", "add", "Say hello"]);
+    ok(repo, &["run", "explorer", "--exit-when-idle"]);
+    ok(repo, &["run", "planner", "--exit-when-idle"]);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    assert_eq!(node(repo, "3")["node"]["status"], "completed");
+
+    let declaration = std::fs::read_to_string(repo.join("expl.toml")).expect("read");
+    let explorer = declaration
+        .split("\n[agent.")
+        .find(|section| section.starts_with("explorer]"))
+        .expect("explorer section")
+        .to_owned();
+    let surveyor = explorer.replacen("explorer]", "surveyor]", 1);
+    std::fs::write(
+        repo.join("expl.toml"),
+        format!(
+            "{declaration}\n[agent.{}\nscope = \"graph\"\n",
+            surveyor.trim_end()
+        ),
+    )
+    .expect("declaration");
+    // Attach one proposal after the completed step (an unknown id is
+    // dropped), one after a goal (not buildable: the origin instead).
+    std::fs::write(
+        sandbox.dir.path().join("survey.json"),
+        r#"{"nodes":[
+            {"title":"Build on hello","objective":"x","after":[3,999],"before":[2,77]},
+            {"title":"Start over","objective":"y","after":[2],"before":[]}
+        ]}"#,
+    )
+    .expect("survey");
+
+    // Its inbox holds the whole history (goal.added, node.evaluated…): the
+    // first event surveys, and every older one is already covered.
+    ok(repo, &["run", "surveyor", "--exit-when-idle"]);
+    let prompts = sandbox.dir.path().join("prompts");
+    let surveys: Vec<String> = std::fs::read_dir(&prompts)
+        .expect("prompts")
+        .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("prompt"))
+        .filter(|text| text.contains("## Map"))
+        .collect();
+    assert_eq!(surveys.len(), 1, "surveys: {}", surveys.len());
+    assert!(surveys[0].contains("Write hello"), "{}", surveys[0]);
+
+    let steps = json_lines(&ok(repo, &["node", "ls", "--format", "json"]));
+    let id = |title: &str| {
+        steps
+            .iter()
+            .find(|n| n["title"] == title)
+            .unwrap_or_else(|| panic!("no {title}: {steps:?}"))["id"]
+            .to_string()
+    };
+    let built = node(repo, &id("Build on hello"));
+    assert_eq!(built["predecessors"], serde_json::json!([3]));
+    assert_eq!(built["successors"], serde_json::json!([2]));
+    let over = node(repo, &id("Start over"));
+    assert_eq!(over["predecessors"], serde_json::json!([1]));
+    assert_eq!(over["successors"], serde_json::json!([2]));
 }

@@ -365,6 +365,22 @@ impl<'a> Process<'a> {
                     }
                     return Ok("stopped".to_owned());
                 }
+                // A busy database is transient (another process held the
+                // lock past the busy timeout): give the event back and carry
+                // on, rather than lose the process.
+                Err(RoleError::Graph(error)) if error.is_busy() => {
+                    let error = RoleError::Graph(error);
+                    if holding(inbox.release(&delivery))?.is_some() {
+                        observer.observe(&ProcessActivity::Failed {
+                            delivery: &delivery,
+                            error: &error,
+                            retry: true,
+                        });
+                    } else {
+                        lost();
+                    }
+                    thread::sleep(POLL * 4);
+                }
                 Err(RoleError::Graph(error)) => {
                     holding(inbox.release(&delivery))?;
                     return Err(error.into());
