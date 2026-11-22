@@ -133,7 +133,10 @@ impl Inbox {
         &self.agent
     }
 
-    /// Lease the oldest deliverable event of `kinds` to `process`.
+    /// Lease the next deliverable event of `kinds` to `process`: the
+    /// oldest, except that `node.ready` events go first, highest current
+    /// priority of their step first, so the most promising step is tried
+    /// first however long ago it became ready.
     ///
     /// Deliverable: never delivered to this agent, released, or leased by a
     /// process whose lease expired before its `max_attempts`-th attempt.
@@ -178,6 +181,7 @@ impl Inbox {
                     "SELECT e.id, e.kind, e.node_id, e.created_at, COALESCE(d.attempts, 0) \
                      FROM events e \
                      LEFT JOIN deliveries d ON d.agent = ?1 AND d.event_id = e.id \
+                     LEFT JOIN nodes n ON n.id = e.node_id \
                      WHERE e.kind IN ({kinds}) \
                      AND (d.event_id IS NULL OR d.status = 'pending' \
                           OR (d.status = 'leased' AND d.leased_until < {EPOCH} \
@@ -187,7 +191,8 @@ impl Inbox {
                           WHERE x.agent = ?1 AND x.status = 'leased' \
                           AND x.leased_until >= {EPOCH} \
                           AND y.node_id = e.node_id AND x.event_id <> e.id)) \
-                     ORDER BY e.id LIMIT 1",
+                     ORDER BY CASE WHEN e.kind = 'node.ready' THEN n.priority END DESC, \
+                     e.id LIMIT 1",
                     kinds = kinds_sql(kinds)
                 ),
                 params![self.agent, max_attempts],
@@ -744,6 +749,37 @@ mod tests {
         assert_lost(second.ack(&replacement, None), replacement.event.id);
         assert_lost(first.release(&stale), stale.event.id);
         assert_eq!(second.backlog(PROPOSED).expect("backlog"), 0);
+    }
+
+    #[test]
+    fn ready_steps_are_leased_by_current_priority() {
+        let mut f = fixture();
+        let a = NodeId(3);
+        let b = NodeId(4);
+        // a becomes ready first, at a high priority; b later, at a low one.
+        f.graph.plan_step(a, 100).expect("plan a"); // node.planned, node.ready
+        f.graph.plan_step(b, 1).expect("plan b");
+        let mut inbox = Inbox::open(&f.db, "executor").expect("inbox");
+        let kinds = &[EventKind::NodeReady, EventKind::NodeProposed];
+        let mut next = || {
+            let delivery = inbox.lease(kinds, ProcessId(1), false, 3).expect("lease")?;
+            inbox.ack(&delivery, None).expect("ack");
+            Some((delivery.event.kind, delivery.event.node))
+        };
+        // The planner then ranks a below b: its current priority counts, not
+        // the one it had when it became ready, nor which became ready first.
+        f.graph.plan_step(a, 0).expect("lower a");
+        let order: Vec<_> = std::iter::from_fn(&mut next).collect();
+        assert_eq!(
+            order,
+            vec![
+                (EventKind::NodeReady, Some(b)),
+                (EventKind::NodeReady, Some(a)),
+                // Other kinds after every ready step, oldest first.
+                (EventKind::NodeProposed, Some(a)),
+                (EventKind::NodeProposed, Some(b)),
+            ]
+        );
     }
 
     #[test]
