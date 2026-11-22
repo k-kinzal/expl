@@ -55,7 +55,7 @@ use crate::graph::{
     Evaluation, Graph, Lineage, NewStep, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Snapshot,
 };
 use crate::prompt::Prompt;
-use crate::role::{Direction, Reaction, Report, RoleError, digest};
+use crate::role::{Direction, Reaction, Report, Role, RoleError, digest};
 
 /// What one exploration did.
 #[derive(Debug, Clone, Serialize)]
@@ -300,6 +300,18 @@ impl Aim {
 
 pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, RoleError> {
     let subject = graph.node(reaction.subject()?)?;
+    if reaction.event().kind == EventKind::NodeFailed
+        && reaction
+            .context()
+            .declaration()
+            .agent
+            .values()
+            .any(|a| a.role == Role::Evaluation)
+    {
+        return Ok(Reaction::ignore(
+            "evaluation concludes about a failure first: it is explored on node.evaluated",
+        ));
+    }
     if reaction.agent().declaration().scope == Some(Scope::Graph) {
         return survey_on(reaction, graph, &subject);
     }
@@ -397,6 +409,16 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
                     &aim,
                 )?]
             }
+        }
+        // Evaluated: concluded about, and judged unless it failed. A failure
+        // reaches exploration here, with evaluation's account of why.
+        EventKind::NodeEvaluated
+            if subject.kind == NodeKind::Step && subject.status == NodeStatus::Failed =>
+        {
+            if graph.goals()?.is_empty() {
+                return Ok(Reaction::ignore("no active goals"));
+            }
+            vec![explore_failure(reaction, graph, &subject)?]
         }
         EventKind::NodeEvaluated => {
             if subject.kind != NodeKind::Step || subject.status != NodeStatus::Completed {
@@ -583,7 +605,8 @@ fn explore(
         )
     };
     let schema = schema(!backward);
-    let prompt = prompt(reaction, &task, &known, &schema);
+    let map = Map::of(graph)?;
+    let prompt = prompt(reaction, &task, &known, &map, &schema);
     let scratch = reaction.context().workspaces().scratch(ground)?;
     let response: Response =
         reaction.invoke_read_only(graph, Some(start.id), &scratch, &prompt, &schema)?;
@@ -629,7 +652,8 @@ fn judgement(graph: &Graph, start: &Node) -> Result<String, RoleError> {
     for evaluation in graph.evaluations_of(start.id)? {
         latest.insert(evaluation.goal, evaluation);
     }
-    if latest.is_empty() {
+    let concluded = graph.conclusions_of(start.id)?;
+    if latest.is_empty() && concluded.is_empty() {
         return Ok(String::new());
     }
     let mut out = format!(
@@ -639,6 +663,17 @@ fn judgement(graph: &Graph, start: &Node) -> Result<String, RoleError> {
     );
     if let Some(outcome) = &start.outcome {
         let _ = writeln!(out, "  Outcome: {}", digest::excerpt(outcome));
+    }
+    if let Some(conclusion) = concluded.last() {
+        let (found, follows) = digest::labels(conclusion.decision);
+        let _ = writeln!(
+            out,
+            "  Concluded {}.\n  Hypothesis: {}\n  {found}: {}\n  {follows}: {}",
+            conclusion.decision,
+            digest::excerpt(&conclusion.hypothesis),
+            digest::excerpt(&conclusion.finding),
+            digest::excerpt(&conclusion.consequence),
+        );
     }
     for evaluation in latest.values() {
         let _ = writeln!(
@@ -653,7 +688,9 @@ fn judgement(graph: &Graph, start: &Node) -> Result<String, RoleError> {
             digest::excerpt(&evaluation.reason)
         );
     }
-    out.push_str("\nAim the next steps at what it still falls short of.\n");
+    out.push_str(
+        "\nAim the next steps at what it still falls short of, and build on what it changes.\n",
+    );
     Ok(out)
 }
 
@@ -703,6 +740,15 @@ fn explore_failure(
              `git log` / `git diff` against it)."
         );
     }
+    let concluded = graph.conclusions_of(failed.id)?;
+    if !concluded.is_empty() {
+        attempt.push_str(
+            "\nWhat evaluation concluded about it, after checking the attempt (oldest first):\n\n",
+        );
+        for conclusion in &concluded {
+            attempt.push_str(&digest::conclusion(conclusion));
+        }
+    }
     let mut grown = String::new();
     for step in graph.derived_from(failed.id)? {
         let _ = writeln!(grown, "- {}", digest::headline(&step));
@@ -733,7 +779,8 @@ fn explore_failure(
         goals = aim.describe(graph)?,
     );
     let schema = schema(true);
-    let prompt = prompt(reaction, &task, &known, &schema);
+    let map = Map::of(graph)?;
+    let prompt = prompt(reaction, &task, &known, &map, &schema);
     let scratch = reaction.context().workspaces().scratch(&ground)?;
     let response: Response =
         reaction.invoke_read_only(graph, Some(failed.id), &scratch, &prompt, &schema)?;
@@ -827,7 +874,8 @@ fn explore_ahead(
         goals = aim.describe(graph)?,
     );
     let schema = schema(true);
-    let prompt = prompt(reaction, &task, &known, &schema);
+    let map = Map::of(graph)?;
+    let prompt = prompt(reaction, &task, &known, &map, &schema);
     let scratch = reaction.context().workspaces().scratch(&ground)?;
     let response: Response =
         reaction.invoke_read_only(graph, Some(start.id), &scratch, &prompt, &schema)?;
@@ -887,7 +935,7 @@ fn survey_on(
             "the whole graph was surveyed at {last}, after this event"
         )));
     }
-    let failed = (event.kind == EventKind::NodeFailed
+    let failed = (matches!(event.kind, EventKind::NodeFailed | EventKind::NodeEvaluated)
         && subject.kind == NodeKind::Step
         && subject.status == NodeStatus::Failed)
         .then_some(subject);
@@ -937,7 +985,8 @@ fn survey(
         map = digest::graph(&snapshot),
     );
     let schema = survey_schema();
-    let prompt = prompt(reaction, &task, &[], &schema);
+    let map = Map::of(graph)?;
+    let prompt = prompt(reaction, &task, &[], &map, &schema);
     let scratch = reaction.context().workspaces().scratch(&origin)?;
     let response: SurveyResponse =
         reaction.invoke_read_only(graph, None, &scratch, &prompt, &schema)?;
@@ -980,6 +1029,7 @@ fn prompt(
     reaction: &Reaction<'_>,
     task: &str,
     known: &[Node],
+    map: &Map,
     schema: &serde_json::Value,
 ) -> Prompt {
     let known = if known.is_empty() {
@@ -1007,11 +1057,57 @@ fn prompt(
          - Propose investigations, not only changes, wherever a question is worth answering \
            first: whether a premise holds, why something failed, what a change would affect. \
            A goal that asks a question is reached by investigations alone.\n\n\
-         {kinds}{instructions}{response}",
+         {kinds}{map}{instructions}{response}",
         kinds = digest::STEP_KINDS,
+        map = map.section(),
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),
     ))
+}
+
+/// The whole graph as a JSON file outside the working directory, for an
+/// exploration to analyse beyond what its prompt shows. Removed when
+/// dropped, once the agent is done.
+struct Map {
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+impl Map {
+    fn of(graph: &Graph) -> Result<Self, RoleError> {
+        let snapshot = graph.snapshot()?;
+        let map = serde_json::json!({
+            "origin": graph.origin()?.id,
+            "nodes": snapshot.nodes,
+            "edges": snapshot.edges,
+            "evaluations": snapshot.evaluations,
+            "conclusions": snapshot.conclusions,
+            "plan": graph.latest_plan()?,
+        });
+        let dir = tempfile::Builder::new().prefix("map-").tempdir()?;
+        let path = dir.path().join("map.json");
+        std::fs::write(&path, map.to_string())?;
+        Ok(Self { _dir: dir, path })
+    }
+
+    /// The prompt section pointing at it.
+    fn section(&self) -> String {
+        format!(
+            "\n## The whole map\n\n\
+             This prompt shows only part of the work so far. All of it is in a JSON file you may \
+             read and analyse as freely as you like — with jq, Python, or anything else. It is a \
+             copy: nothing you do to it changes anything.\n\n\
+             `{path}`\n\n\
+             It holds `nodes` (every origin, step and goal, with its status, objective, and \
+             outcome or finding), `edges` (`source` to `target`: the target builds on the source, \
+             or a step heads for a goal), `evaluations` (verdicts on steps and origins against \
+             goals), `conclusions` (for each step judged: whether it was done, abandoned or \
+             continued, the hypothesis it stood for, what was found, and what that changes) and \
+             `plan` (the latest prioritised paths). Look there for what earlier steps \
+             established, and why others failed, before you propose.\n",
+            path = self.path.display()
+        )
+    }
 }
 
 #[cfg(test)]

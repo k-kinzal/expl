@@ -3,9 +3,9 @@
 //! A node *is* a branch (`expl/node-<id>`, or `expl/node-<id>-<n>` when a
 //! ref already takes that name: branches are only ever created, never
 //! replaced or deleted, so an earlier attempt, an unrelated branch, or the
-//! trunk keeps its name). Execution gets the node's own [`Workspace`]: a new
-//! branch checked out in its own worktree under `.expl/worktrees/`, started
-//! from its predecessors (the first one's tip,
+//! trunk keeps its name). Each execution attempt gets its own [`Workspace`]:
+//! a new branch checked out at a unique path under `.expl/worktrees/`, started
+//! from the node's predecessors (the first one's tip,
 //! merged with the others in order when paths join). A conflicting merge is
 //! left in the worktree to be resolved; [`Workspace::resume`] then concludes
 //! it and merges the remaining predecessors, so the branch contains every

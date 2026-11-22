@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-use crate::graph::{Evaluation, GoalTree, Node, NodeId, NodeKind, Snapshot};
+use crate::graph::{Conclusion, Decision, Evaluation, GoalTree, Node, NodeId, NodeKind, Snapshot};
 
 /// Longest excerpt of free text (step objectives, outcomes, reasons) quoted per node.
 const EXCERPT: usize = 600;
@@ -20,6 +20,34 @@ pub(crate) fn excerpt_to(text: &str, width: usize) -> String {
     } else {
         let cut: String = flat.chars().take(width).collect();
         format!("{cut}…")
+    }
+}
+
+/// What evaluation concluded about a step, as a list item: the decision,
+/// the hypothesis, what was found, and what it changes.
+pub(crate) fn conclusion(conclusion: &Conclusion) -> String {
+    let (found, follows) = labels(conclusion.decision);
+    format!(
+        "- concluded {decision}{reopened}\n  hypothesis: {hypothesis}\n  {found}: {finding}\n  \
+         {follows}: {consequence}\n",
+        decision = conclusion.decision,
+        reopened = if conclusion.decision == Decision::Continue && !conclusion.reopened {
+            " (not run again)"
+        } else {
+            ""
+        },
+        hypothesis = excerpt(&conclusion.hypothesis),
+        finding = excerpt(&conclusion.finding),
+        consequence = excerpt(&conclusion.consequence),
+    )
+}
+
+/// What a conclusion's finding and consequence are, by decision.
+pub(crate) fn labels(decision: Decision) -> (&'static str, &'static str) {
+    match decision {
+        Decision::Done => ("established", "what it changes"),
+        Decision::Abandoned => ("why it cannot work", "what that rules out or suggests"),
+        Decision::Continue => ("how far it got", "what remains"),
     }
 }
 
@@ -206,6 +234,16 @@ pub(crate) fn graph(snapshot: &Snapshot) -> String {
                 "outcome"
             };
             let _ = writeln!(out, "    {label}: {}", excerpt(outcome));
+        }
+        if let Some(concluded) = snapshot.conclusion(node.id) {
+            let (found, follows) = labels(concluded.decision);
+            let _ = writeln!(
+                out,
+                "    concluded {}: {found}: {} — {follows}: {}",
+                concluded.decision,
+                excerpt(&concluded.finding),
+                excerpt(&concluded.consequence)
+            );
         }
         for ((_, goal), evaluation) in
             latest.range((node.id, NodeId(i64::MIN))..=(node.id, NodeId(i64::MAX)))

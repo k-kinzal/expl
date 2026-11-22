@@ -26,6 +26,12 @@ impl LeaseToken {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// A deterministic token for tests that create worktrees without an inbox.
+    #[cfg(test)]
+    pub(crate) fn for_test(value: u128) -> Self {
+        Self(format!("{value:032x}"))
+    }
 }
 
 impl std::fmt::Display for LeaseToken {

@@ -12,7 +12,7 @@
 //! | a completed or failed step whose branch or head commit is missing, or whose branch tip is not its head commit | none: which side is right is the human's call |
 //! | a running step whose `node.ready` nobody holds a lease on (an expired lease is left to the inbox, which delivers it again) | unclaimed: back to `planned`, with `node.ready` recorded again so execution is delivered it anew |
 //! | an origin whose commit no longer exists | none: the trunk's history is gone from git |
-//! | a node worktree registered with git for a step that is settled (completed, failed, pruned) or unknown | registration pruned when its directory is gone; otherwise the worktree is removed when clean, keeping its branch |
+//! | a worktree or leftover attempt directory for a step that is settled (completed, failed, pruned) or unknown | registration removed when its directory is gone; registered worktree removed when clean, keeping its branch; unregistered directory removed when empty |
 //!
 //! A failed step need not have committed anything (it can fail before its
 //! worktree exists, or while joining its predecessors), so only what it
@@ -104,14 +104,14 @@ pub enum Inconsistency {
         /// The recorded commit, if any.
         commit: Option<String>,
     },
-    /// A node worktree registered with git for a step that is settled or
-    /// unknown.
+    /// A worktree or leftover attempt directory for a step that is settled
+    /// or unknown.
     StaleWorktree {
         /// The node the worktree is named for.
         node: NodeId,
         /// The step's status; `None` when no step has this id.
         status: Option<NodeStatus>,
-        /// Where git has the worktree registered.
+        /// The worktree's path.
         path: PathBuf,
     },
 }
@@ -204,7 +204,7 @@ impl fmt::Display for Inconsistency {
                 path,
             } => write!(
                 f,
-                "worktree {} is registered for {status} step {node}",
+                "worktree path {} was left by {status} step {node}",
                 path.display()
             ),
             Self::StaleWorktree {
@@ -213,7 +213,7 @@ impl fmt::Display for Inconsistency {
                 path,
             } => write!(
                 f,
-                "worktree {} is registered for unknown step {node}",
+                "worktree path {} belongs to unknown step {node}",
                 path.display()
             ),
         }
@@ -278,7 +278,7 @@ impl Doctor {
                 });
             }
         }
-        let mut worktrees = self.workspaces.registered()?;
+        let mut worktrees = self.workspaces.node_paths()?;
         worktrees.sort();
         for (node, path) in worktrees {
             let status = match owner(graph, node)? {
@@ -301,9 +301,9 @@ impl Doctor {
     ///
     /// # Errors
     ///
-    /// [`DoctorError`] when the graph or git fails other than by refusing to
-    /// remove a worktree that has changes or is locked (reported as not
-    /// repaired).
+    /// [`DoctorError`] when the graph, git or the filesystem fails. A
+    /// worktree that is locked or has changes, or a nonempty unregistered
+    /// directory, is reported as not repaired.
     pub fn repair(
         &self,
         graph: &mut Graph,
@@ -412,20 +412,17 @@ impl Doctor {
             Err(WorkspaceError::Git(GitError::Failed { stderr, .. })) => {
                 return Ok((false, format!("kept: {stderr}")));
             }
+            Err(WorkspaceError::Io(error))
+                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty =>
+            {
+                return Ok((false, "kept: directory contains files".to_owned()));
+            }
             Err(error) => return Err(error.into()),
-        }
-        if self
-            .workspaces
-            .registered()?
-            .iter()
-            .any(|(_, registered)| registered == path)
-        {
-            return Ok((false, "kept: git keeps it registered (locked?)".to_owned()));
         }
         Ok(if existed {
             (
                 true,
-                "removed the clean worktree; its branch is kept".to_owned(),
+                "removed the worktree directory; any branch is kept".to_owned(),
             )
         } else {
             (true, "pruned the registration".to_owned())
@@ -464,8 +461,8 @@ fn owner(graph: &Graph, node: NodeId) -> Result<Owner, GraphError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{Delivery, EventKind, Inbox};
-    use crate::graph::NewOrigin;
+    use crate::event::{Delivery, EventKind, Inbox, LeaseToken};
+    use crate::graph::{ChangeResult, NewOrigin};
     use crate::process::{ProcessId, Processes};
     use crate::store::{self, EPOCH};
 
@@ -552,48 +549,48 @@ mod tests {
         /// which it claimed and gave a worktree, as execution does.
         fn executing(&mut self) -> NodeId {
             let id = self.planned();
-            self.claim(id);
+            let delivery = self.claim(id);
             let node = self.graph.node(id).expect("node");
             let origin = self.graph.origin().expect("origin");
             self.workspaces()
-                .create(&node, &[origin], &[])
+                .create(&node, &delivery.token, &[origin], &[])
                 .expect("create");
             id
         }
 
         /// A step executed as execution does: in its own worktree, which
         /// commits `file` and is left in place; then `complete`d or failed.
-        fn executed(&mut self, file: &str, complete: bool) -> NodeId {
+        fn executed(&mut self, file: &str, complete: bool) -> (NodeId, PathBuf) {
             let id = self.planned();
             let delivery = self.claim(id);
             let node = self.graph.node(id).expect("node");
             let origin = self.graph.origin().expect("origin");
             let workspace = self
                 .workspaces()
-                .create(&node, &[origin], &[])
+                .create(&node, &delivery.token, &[origin], &[])
                 .expect("create");
             std::fs::write(workspace.path().join(file), file).expect("write");
             let head = workspace.commit(file).expect("commit");
             self.graph
-                .set_branch(id, &delivery.token, workspace.branch(), Some(&head))
-                .expect("branch");
-            if complete {
-                self.graph
-                    .complete(id, &delivery.token, "done")
-                    .expect("complete");
-            } else {
-                self.graph
-                    .fail(id, &delivery.token, "broken")
-                    .expect("fail");
-            }
+                .publish(
+                    id,
+                    &delivery.token,
+                    &ChangeResult {
+                        branch: workspace.branch(),
+                        head_commit: Some(&head),
+                        completed: complete,
+                        outcome: if complete { "done" } else { "broken" },
+                    },
+                )
+                .expect("publish");
             self.inbox().ack(&delivery, None).expect("ack");
-            id
+            (id, workspace.path().to_owned())
         }
 
         /// Like [`executed`](Self::executed), without leaving the worktree.
         fn settled(&mut self, file: &str, complete: bool) -> NodeId {
-            let id = self.executed(file, complete);
-            let path = self.workspaces().path_of(id).display().to_string();
+            let (id, path) = self.executed(file, complete);
+            let path = path.display().to_string();
             git(&self.root, &["worktree", "remove", "--force", &path]);
             id
         }
@@ -839,14 +836,18 @@ mod tests {
     #[test]
     fn stale_worktrees_are_detected_and_pruned() {
         let mut fx = Fixture::new();
-        let completed = fx.executed("done.txt", true);
-        let dirty = fx.executed("broken.txt", false);
-        std::fs::write(fx.workspaces().path_of(dirty).join("wip.txt"), "wip").expect("write");
-        let pruned = fx.executed("pruned.txt", false);
+        let (completed, completed_path) = fx.executed("done.txt", true);
+        let (dirty, dirty_path) = fx.executed("broken.txt", false);
+        let workspaces = fx.workspaces();
+        std::fs::write(dirty_path.join("wip.txt"), "wip").expect("write");
+        let (pruned, _) = fx.executed("pruned.txt", false);
         fx.graph.prune(pruned, "by operator").expect("prune");
 
         let unknown = NodeId(999);
-        let unknown_path = fx.workspaces().path_of(unknown);
+        let unknown_path = fx
+            .project
+            .worktrees_dir()
+            .join(format!("node-{}", unknown.0));
         git(
             &fx.root,
             &[
@@ -859,10 +860,13 @@ mod tests {
                 "main",
             ],
         );
-        // Creating a node worktree prunes registrations whose directory is
-        // gone, so the directory goes last.
         let running = fx.executing();
         std::fs::remove_dir_all(&unknown_path).expect("remove");
+        let empty_attempt = workspaces.path_of(completed, &LeaseToken::for_test(2));
+        std::fs::create_dir(&empty_attempt).expect("empty leftover");
+        let dirty_attempt = workspaces.path_of(dirty, &LeaseToken::for_test(2));
+        std::fs::create_dir(&dirty_attempt).expect("leftover");
+        std::fs::write(dirty_attempt.join("wip.txt"), "wip").expect("write");
 
         let found = fx.examine();
         let stale: Vec<(NodeId, Option<NodeStatus>)> = found
@@ -878,6 +882,8 @@ mod tests {
             stale,
             vec![
                 (completed, Some(NodeStatus::Completed)),
+                (completed, Some(NodeStatus::Completed)),
+                (dirty, Some(NodeStatus::Failed)),
                 (dirty, Some(NodeStatus::Failed)),
                 (pruned, Some(NodeStatus::Pruned)),
                 (unknown, None),
@@ -897,16 +903,18 @@ mod tests {
             outcome,
             vec![
                 (completed, true),
+                (completed, true),
+                (dirty, false),
                 (dirty, false),
                 (pruned, true),
                 (unknown, true)
             ]
         );
-        assert!(!fx.workspaces().path_of(completed).exists());
-        assert!(
-            fx.workspaces().path_of(dirty).join("wip.txt").exists(),
-            "uncommitted work is never removed"
-        );
+        assert!(!completed_path.exists());
+        assert!(!empty_attempt.exists());
+        for path in [dirty_path, dirty_attempt] {
+            assert!(path.join("wip.txt").exists(), "uncommitted work is kept");
+        }
         let branches = Git::new(&fx.root);
         for id in [completed, pruned, unknown] {
             assert!(
@@ -918,7 +926,7 @@ mod tests {
         }
 
         let remaining = fx.examine();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].node(), dirty);
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().all(|i| i.node() == dirty));
     }
 }

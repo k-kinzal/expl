@@ -9,9 +9,9 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::event::{Event, EventId, EventKind, LeaseToken};
 use crate::graph::{
-    AgentRunId, AgentRunRecord, AgentRunStatus, Answer, Edge, Evaluation, GoalTree, GraphError,
-    Lineage, NewEvaluation, NewOrigin, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Plan,
-    PlanId, PlannedPath, Snapshot,
+    AgentRunId, AgentRunRecord, AgentRunStatus, Answer, Conclusion, Decision, Edge, Evaluation,
+    GoalTree, GraphError, Lineage, NewConclusion, NewEvaluation, NewOrigin, Node, NodeFilter,
+    NodeId, NodeKind, NodeStatus, Plan, PlanId, PlannedPath, Snapshot,
 };
 use crate::store::{self, EPOCH, NOW};
 
@@ -19,6 +19,21 @@ const NODE_COLUMNS: &str = "id, kind, status, title, objective, priority, counte
                             branch, head_commit, outcome, created_at, updated_at, investigation, \
                             answer, derived_from, proposed_by";
 const EVALUATION_COLUMNS: &str = "id, node_id, goal_id, satisfied, score, reason, created_at";
+const CONCLUSION_COLUMNS: &str = "id, node_id, decision, hypothesis, finding, consequence, \
+                                  resume_commit, reopened, created_at, agent";
+/// What an attempt at a change step left, settled by [`Graph::publish`].
+#[derive(Debug, Clone, Copy)]
+pub struct ChangeResult<'a> {
+    /// The attempt's own branch.
+    pub branch: &'a str,
+    /// The attempt's tip commit; `None` when it failed before committing.
+    pub head_commit: Option<&'a str>,
+    /// Whether the step completed (it failed otherwise).
+    pub completed: bool,
+    /// The agent's summary or the failure.
+    pub outcome: &'a str,
+}
+
 /// A step about to be proposed ([`Graph::propose`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NewStep<'a> {
@@ -99,6 +114,24 @@ fn evaluation_from_row(row: &Row<'_>) -> rusqlite::Result<Evaluation> {
     })
 }
 
+fn conclusion_from_row(row: &Row<'_>) -> rusqlite::Result<Conclusion> {
+    let decision: String = row.get(2)?;
+    Ok(Conclusion {
+        id: row.get(0)?,
+        node: NodeId(row.get(1)?),
+        decision: decision.parse().map_err(|e: String| {
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, e.into())
+        })?,
+        hypothesis: row.get(3)?,
+        finding: row.get(4)?,
+        consequence: row.get(5)?,
+        resume_commit: row.get(6)?,
+        reopened: row.get(7)?,
+        created_at: row.get(8)?,
+        agent: row.get(9)?,
+    })
+}
+
 fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<AgentRunRecord> {
     Ok(AgentRunRecord {
         id: AgentRunId(row.get(0)?),
@@ -151,6 +184,27 @@ fn nodes_where(conn: &Connection, clause: &str, id: NodeId) -> Result<Vec<Node>,
     ))?;
     let rows = stmt.query_map([id.0], node_from_row)?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+fn insert_evaluations(
+    conn: &Connection,
+    node: NodeId,
+    evaluations: &[NewEvaluation],
+) -> Result<(), GraphError> {
+    for evaluation in evaluations {
+        conn.execute(
+            "INSERT INTO evaluations (node_id, goal_id, satisfied, score, reason) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                node.0,
+                evaluation.goal.0,
+                evaluation.satisfied,
+                evaluation.score.clamp(0, 100),
+                evaluation.reason
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn set_status_in(
@@ -895,7 +949,11 @@ impl Graph {
         Ok(changed == 1)
     }
 
-    /// Record the branch (and, when known, the tip commit) of a claimed step.
+    /// Record the branch a claimed change step's attempt works on. The
+    /// attempt has committed nothing yet, so whatever tip the step recorded
+    /// before — an earlier attempt's — is cleared: a branch is never shown
+    /// paired with another attempt's commit. Its tip, outcome and events
+    /// follow at once with [`publish`](Self::publish).
     ///
     /// # Errors
     ///
@@ -906,17 +964,74 @@ impl Graph {
         id: NodeId,
         token: &LeaseToken,
         branch: &str,
-        head_commit: Option<&str>,
     ) -> Result<(), GraphError> {
         let tx = self.write()?;
         ensure_holder(&tx, id, token)?;
         tx.execute(
             &format!(
-                "UPDATE nodes SET branch = ?2, head_commit = COALESCE(?3, head_commit), \
-                 updated_at = {NOW} WHERE id = ?1"
+                "UPDATE nodes SET branch = ?2, head_commit = NULL, updated_at = {NOW} \
+                 WHERE id = ?1"
             ),
-            params![id.0, branch, head_commit],
+            params![id.0, branch],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Settle a running change step with what its attempt left: its branch,
+    /// tip commit, status and outcome, and `node.completed` (with
+    /// `node.ready` for every successor that can run now) or `node.failed`,
+    /// all in one transaction under the delivery's lease. A delivery that
+    /// lost the step publishes nothing, so the step never pairs one
+    /// attempt's branch with another's tip or outcome.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError::LeaseLost`] when the delivery does not hold the step,
+    /// [`GraphError::Uncommitted`] when a completion has no tip commit,
+    /// [`GraphError::NotInStatus`] when the held step is an investigation,
+    /// or [`GraphError::Sqlite`] on SQLite failure.
+    pub fn publish(
+        &mut self,
+        id: NodeId,
+        token: &LeaseToken,
+        result: &ChangeResult<'_>,
+    ) -> Result<(), GraphError> {
+        let status = if result.completed {
+            NodeStatus::Completed
+        } else {
+            NodeStatus::Failed
+        };
+        if result.completed && result.head_commit.is_none() {
+            return Err(GraphError::Uncommitted(id));
+        }
+        let tx = self.write()?;
+        ensure_holder(&tx, id, token)?;
+        let changed = tx.execute(
+            &format!(
+                "UPDATE nodes SET status = ?2, outcome = ?3, branch = ?4, head_commit = ?5, \
+                 holder_token = NULL, updated_at = {NOW} \
+                 WHERE id = ?1 AND kind = 'step' AND investigation = 0 AND status = 'running'"
+            ),
+            params![
+                id.0,
+                status.as_str(),
+                result.outcome,
+                result.branch,
+                result.head_commit
+            ],
+        )?;
+        if changed == 0 {
+            return Err(GraphError::NotInStatus {
+                node: id,
+                expected: "a running change step",
+            });
+        }
+        if result.completed {
+            emit_completion(&tx, id)?;
+        } else {
+            emit(&tx, EventKind::NodeFailed, Some(id))?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1073,25 +1188,134 @@ impl Graph {
         evaluations: &[NewEvaluation],
     ) -> Result<(), GraphError> {
         let tx = self.write()?;
-        for evaluation in evaluations {
-            tx.execute(
-                "INSERT INTO evaluations (node_id, goal_id, satisfied, score, reason) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    node.0,
-                    evaluation.goal.0,
-                    evaluation.satisfied,
-                    evaluation.score.clamp(0, 100),
-                    evaluation.reason
-                ],
-            )?;
-        }
+        insert_evaluations(&tx, node, evaluations)?;
         emit(&tx, EventKind::NodeEvaluated, Some(node))?;
         tx.commit()?;
         Ok(())
     }
 
+    /// Record what evaluation concluded about the step `node`, judged on
+    /// the strength of `event` (its `node.completed` or `node.failed`), with
+    /// its verdicts against the goals, in one transaction.
+    ///
+    /// Nothing is recorded when the step was started again after `event`:
+    /// the judgement is about an attempt that no longer stands, and the new
+    /// attempt gets its own. Returns `None` then.
+    ///
+    /// A [`Decision::Continue`] puts the step back to run again (records
+    /// `node.planned`, and `node.ready` when it can run now): its answer is
+    /// cleared, and a change step's next attempt starts from the commit
+    /// this one left. It is not put back when it is no longer completed or
+    /// failed (someone pruned or replanned it meanwhile), when a step built
+    /// on it is running or completed (their work stands on this attempt),
+    /// or when the trunk adopted it. The verdicts are recorded unless it is
+    /// put back. Anything else, and a continue not put back, records
+    /// `node.evaluated`, so exploration and planning take it from there.
+    /// Returns whether the step was put back.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError::NotInStatus`] when `node` is not a step;
+    /// [`GraphError`] on SQLite failure.
+    pub fn conclude(
+        &mut self,
+        node: NodeId,
+        event: EventId,
+        conclusion: &NewConclusion,
+        evaluations: &[NewEvaluation],
+    ) -> Result<Option<bool>, GraphError> {
+        let tx = self.write()?;
+        let step = node_in(&tx, node)?;
+        if step.kind != NodeKind::Step {
+            return Err(GraphError::NotInStatus {
+                node,
+                expected: "a step",
+            });
+        }
+        let restarted: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM events WHERE node_id = ?1 AND kind = ?2 AND id > ?3)",
+            params![node.0, EventKind::NodeStarted.as_str(), event.0],
+            |row| row.get(0),
+        )?;
+        if restarted {
+            return Ok(None);
+        }
+        let built_on: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM edges e JOIN nodes s ON s.id = e.target_id \
+             WHERE e.source_id = ?1 AND (s.kind = 'origin' \
+             OR (s.kind = 'step' AND s.status IN ('running', 'completed'))))",
+            [node.0],
+            |row| row.get(0),
+        )?;
+        let reopen = conclusion.decision == Decision::Continue
+            && matches!(step.status, NodeStatus::Completed | NodeStatus::Failed)
+            && !built_on;
+        let resume = (conclusion.decision == Decision::Continue && !step.investigation)
+            .then_some(step.head_commit.as_deref())
+            .flatten();
+        if !reopen {
+            insert_evaluations(&tx, node, evaluations)?;
+        }
+        tx.execute(
+            "INSERT INTO conclusions \
+             (node_id, decision, hypothesis, finding, consequence, resume_commit, reopened, \
+              agent) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                node.0,
+                conclusion.decision.as_str(),
+                conclusion.hypothesis,
+                conclusion.finding,
+                conclusion.consequence,
+                resume,
+                reopen,
+                conclusion.agent
+            ],
+        )?;
+        if reopen {
+            tx.execute(
+                &format!(
+                    "UPDATE nodes SET status = 'planned', answer = NULL, updated_at = {NOW} \
+                     WHERE id = ?1"
+                ),
+                [node.0],
+            )?;
+            emit(&tx, EventKind::NodePlanned, Some(node))?;
+            emit_if_ready(&tx, node)?;
+        } else {
+            emit(&tx, EventKind::NodeEvaluated, Some(node))?;
+        }
+        tx.commit()?;
+        Ok(Some(reopen))
+    }
+
     // ----------------------------------------------------------------- reads
+
+    /// What evaluation concluded about `node`, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError`] on SQLite failure.
+    pub fn conclusions_of(&self, node: NodeId) -> Result<Vec<Conclusion>, GraphError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CONCLUSION_COLUMNS} FROM conclusions WHERE node_id = ?1 ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([node.0], conclusion_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Every conclusion, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError`] on SQLite failure.
+    pub fn conclusions(&self) -> Result<Vec<Conclusion>, GraphError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CONCLUSION_COLUMNS} FROM conclusions ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], conclusion_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
 
     /// The node with `id`.
     ///
@@ -1458,6 +1682,7 @@ impl Graph {
             nodes: self.nodes(&NodeFilter::default())?,
             edges: self.edges()?,
             evaluations: self.evaluations()?,
+            conclusions: self.conclusions()?,
             through: self.last_event()?,
         };
         tx.commit()?;
@@ -1603,6 +1828,77 @@ mod tests {
             .into_iter()
             .map(|e| (e.kind, e.node.map(|n| n.0)))
             .collect()
+    }
+
+    #[test]
+    fn a_change_step_publishes_its_branch_tip_outcome_and_events_at_once() {
+        let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
+        let step = graph.propose_step("a", "a", &[origin], &[goal]).expect("a");
+        let next = graph.propose_step("b", "b", &[step], &[goal]).expect("b");
+        graph.plan_step(step, 1).expect("plan");
+        graph.plan_step(next, 1).expect("plan");
+        let delivery = lease_ready(&mut inbox, 1, step);
+        assert!(graph.claim(step, &delivery.token).expect("claim"));
+        graph
+            .set_branch(step, &delivery.token, "expl/node-a")
+            .expect("branch");
+        let before = kinds(&graph).len();
+
+        assert!(matches!(
+            graph.publish(
+                step,
+                &delivery.token,
+                &ChangeResult {
+                    branch: "expl/node-a",
+                    head_commit: None,
+                    completed: true,
+                    outcome: "done",
+                },
+            ),
+            Err(GraphError::Uncommitted(id)) if id == step
+        ));
+        assert_eq!(kinds(&graph).len(), before, "nothing was published");
+
+        graph
+            .publish(
+                step,
+                &delivery.token,
+                &ChangeResult {
+                    branch: "expl/node-a",
+                    head_commit: Some("def"),
+                    completed: true,
+                    outcome: "done",
+                },
+            )
+            .expect("publish");
+        let node = graph.node(step).expect("node");
+        assert_eq!(node.status, NodeStatus::Completed);
+        assert_eq!(node.branch.as_deref(), Some("expl/node-a"));
+        assert_eq!(node.head_commit.as_deref(), Some("def"));
+        assert_eq!(node.outcome.as_deref(), Some("done"));
+        assert_eq!(
+            kinds(&graph)[before..],
+            [
+                (EventKind::NodeCompleted, Some(step.0)),
+                (EventKind::NodeReady, Some(next.0))
+            ]
+        );
+
+        // Settled, the step is no longer the delivery's to publish.
+        assert!(matches!(
+            graph.publish(
+                step,
+                &delivery.token,
+                &ChangeResult {
+                    branch: "expl/node-a-2",
+                    head_commit: None,
+                    completed: false,
+                    outcome: "late",
+                },
+            ),
+            Err(GraphError::LeaseLost(id)) if id == step
+        ));
+        assert_eq!(graph.node(step).expect("node"), node);
     }
 
     #[test]
@@ -1823,11 +2119,17 @@ mod tests {
         let delivery = lease_ready(&mut inbox, 1, a);
         assert!(graph.claim(a, &delivery.token).expect("claim"));
         graph
-            .set_branch(a, &delivery.token, "expl/node-a", Some("def"))
-            .expect("branch");
-        graph
-            .complete(a, &delivery.token, "done")
-            .expect("complete");
+            .publish(
+                a,
+                &delivery.token,
+                &ChangeResult {
+                    branch: "expl/node-a",
+                    head_commit: Some("def"),
+                    completed: true,
+                    outcome: "done",
+                },
+            )
+            .expect("publish");
         inbox.ack(&delivery, None).expect("ack");
         let c = graph.propose_step("c", "c", &[origin], &[goal]).expect("c");
         graph.plan_step(c, 1).expect("plan");
@@ -2234,5 +2536,201 @@ mod tests {
             )
             .expect("eval");
         assert!(graph.candidates().expect("candidates").is_empty());
+    }
+
+    fn concluded(decision: Decision) -> NewConclusion {
+        NewConclusion {
+            agent: "evaluator".to_owned(),
+            decision,
+            hypothesis: "writing hello works".to_owned(),
+            finding: "stopped at the compiler".to_owned(),
+            consequence: "finish hello.rs".to_owned(),
+        }
+    }
+
+    /// The newest event: what an evaluation of a step just settled reacts to.
+    fn newest(graph: &Graph) -> EventId {
+        graph.last_event().expect("events").expect("an event")
+    }
+
+    /// A step that ran, left `commit`, and `failed` or completed.
+    fn ran(
+        graph: &mut Graph,
+        inbox: &mut Inbox,
+        origin: NodeId,
+        goal: NodeId,
+        failed: bool,
+    ) -> NodeId {
+        let step = graph
+            .propose_step("hello", "write hello", &[origin], &[goal])
+            .expect("step");
+        graph.plan_step(step, 1).expect("plan");
+        let delivery = lease_ready(inbox, 1, step);
+        assert!(graph.claim(step, &delivery.token).expect("claim"));
+        graph
+            .publish(
+                step,
+                &delivery.token,
+                &ChangeResult {
+                    branch: "expl/node-3",
+                    head_commit: Some("left"),
+                    completed: !failed,
+                    outcome: if failed { "timed out" } else { "done, it says" },
+                },
+            )
+            .expect("publish");
+        inbox.ack(&delivery, None).expect("ack");
+        step
+    }
+
+    #[test]
+    fn a_step_continued_runs_again_from_what_it_left() {
+        let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
+        let step = ran(&mut graph, &mut inbox, origin, goal, true);
+
+        let reopened = graph
+            .conclude(step, newest(&graph), &concluded(Decision::Continue), &[])
+            .expect("conclude");
+
+        assert_eq!(reopened, Some(true));
+        assert_eq!(graph.node(step).expect("node").status, NodeStatus::Planned);
+        let tail: Vec<_> = kinds(&graph).into_iter().rev().take(2).collect();
+        assert_eq!(
+            tail,
+            [
+                (EventKind::NodeReady, Some(step.0)),
+                (EventKind::NodePlanned, Some(step.0))
+            ]
+        );
+        let conclusion = &graph.conclusions_of(step).expect("conclusions")[0];
+        assert_eq!(conclusion.decision, Decision::Continue);
+        assert!(conclusion.reopened);
+        assert_eq!(conclusion.resume_commit.as_deref(), Some("left"));
+        assert_eq!(conclusion.finding, "stopped at the compiler");
+    }
+
+    #[test]
+    fn a_step_others_build_on_is_not_continued_but_explored_past() {
+        let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
+        let step = ran(&mut graph, &mut inbox, origin, goal, false);
+        let next = graph
+            .propose_step("next", "after hello", &[step], &[goal])
+            .expect("next");
+        graph.plan_step(next, 1).expect("plan");
+        let delivery = lease_ready(&mut inbox, 1, next);
+        assert!(graph.claim(next, &delivery.token).expect("claim"));
+
+        let reopened = graph
+            .conclude(step, newest(&graph), &concluded(Decision::Continue), &[])
+            .expect("conclude");
+
+        assert_eq!(reopened, Some(false));
+        assert_eq!(
+            graph.node(step).expect("node").status,
+            NodeStatus::Completed
+        );
+        assert_eq!(
+            kinds(&graph).last(),
+            Some(&(EventKind::NodeEvaluated, Some(step.0)))
+        );
+        assert!(!graph.conclusions_of(step).expect("conclusions")[0].reopened);
+    }
+
+    #[test]
+    fn an_abandoned_failure_stays_failed_with_why_and_is_explored_past() {
+        let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
+        let step = ran(&mut graph, &mut inbox, origin, goal, true);
+
+        let reopened = graph
+            .conclude(step, newest(&graph), &concluded(Decision::Abandoned), &[])
+            .expect("conclude");
+
+        assert_eq!(reopened, Some(false));
+        assert_eq!(graph.node(step).expect("node").status, NodeStatus::Failed);
+        assert_eq!(
+            kinds(&graph).last(),
+            Some(&(EventKind::NodeEvaluated, Some(step.0)))
+        );
+        let conclusion = &graph.conclusions_of(step).expect("conclusions")[0];
+        assert_eq!(conclusion.decision, Decision::Abandoned);
+        assert_eq!(conclusion.resume_commit, None);
+        let snapshot = graph.snapshot().expect("snapshot");
+        assert_eq!(
+            snapshot.conclusion(step).map(|c| c.decision),
+            Some(Decision::Abandoned)
+        );
+    }
+
+    #[test]
+    fn a_step_done_is_judged_against_its_goals_in_the_same_record() {
+        let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
+        let step = ran(&mut graph, &mut inbox, origin, goal, false);
+
+        graph
+            .conclude(
+                step,
+                newest(&graph),
+                &concluded(Decision::Done),
+                &[NewEvaluation {
+                    goal,
+                    satisfied: true,
+                    score: 90,
+                    reason: "hello exists".to_owned(),
+                }],
+            )
+            .expect("conclude");
+
+        assert_eq!(graph.evaluations_of(step).expect("evaluations").len(), 1);
+        assert_eq!(graph.candidates().expect("candidates").len(), 1);
+        assert!(
+            graph
+                .conclude(origin, newest(&graph), &concluded(Decision::Done), &[])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_judgement_of_an_attempt_that_was_started_again_is_not_recorded() {
+        let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
+        let step = ran(&mut graph, &mut inbox, origin, goal, true);
+        let failed = newest(&graph);
+        graph.replan(step).expect("replan");
+        let delivery = lease_ready(&mut inbox, 1, step);
+        assert!(graph.claim(step, &delivery.token).expect("claim"));
+
+        let recorded = graph
+            .conclude(step, failed, &concluded(Decision::Continue), &[])
+            .expect("conclude");
+
+        assert_eq!(recorded, None);
+        assert!(graph.conclusions_of(step).expect("conclusions").is_empty());
+        assert_eq!(graph.node(step).expect("node").status, NodeStatus::Running);
+    }
+
+    #[test]
+    fn an_adopted_step_is_not_continued() {
+        let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
+        let step = ran(&mut graph, &mut inbox, origin, goal, false);
+        let completed = newest(&graph);
+        graph
+            .advance_origin(&NewOrigin {
+                previous: origin,
+                title: "adopted".to_owned(),
+                note: String::new(),
+                branch: Some("main".to_owned()),
+                commit: "def".to_owned(),
+                adopted: vec![step],
+            })
+            .expect("advance");
+
+        let reopened = graph
+            .conclude(step, completed, &concluded(Decision::Continue), &[])
+            .expect("conclude");
+
+        assert_eq!(reopened, Some(false));
+        assert_eq!(
+            graph.node(step).expect("node").status,
+            NodeStatus::Completed
+        );
     }
 }

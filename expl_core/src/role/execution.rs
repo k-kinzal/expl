@@ -2,10 +2,16 @@
 //!
 //! Reacts to `node.ready`. The step is claimed (`node.started`), its branch
 //! starts from its predecessors (merged when paths join), the agent works
-//! in the step's worktree, and expl commits whatever it left there as the
+//! in the attempt's worktree, and expl commits whatever it left there as the
 //! branch tip: `node.completed` (with `node.ready` for successors that can
 //! now run) or `node.failed`. A failed run still commits its work so it can
 //! be inspected.
+//!
+//! An attempt records its new branch as soon as it has one, clearing any tip
+//! an earlier attempt left, and publishes its tip, outcome and events with
+//! the branch in one transaction checked against its lease
+//! ([`Graph::publish`]). An attempt that lost the step publishes nothing,
+//! so the step never pairs one attempt's branch with another's tip.
 //!
 //! When joining paths conflicts, the agent first resolves each conflicting
 //! merge on its own, and the remaining predecessors are merged after it;
@@ -19,6 +25,12 @@
 //! no or unknown, with evidence — and no branch or commit of its own. Its
 //! `head_commit` is that code, so steps after it start from the same place.
 //!
+//! A step evaluation decided to **continue** ([`Decision::Continue`]) runs
+//! again with what evaluation found — how far the last attempt got, why it
+//! stopped, what remains — in its prompt; a change step's new branch starts
+//! from the commit the last attempt left, so the work carries on rather
+//! than starting over.
+//!
 //! Each ready step is its own event, so as many steps run at once as there
 //! are execution processes.
 
@@ -27,11 +39,14 @@ use serde_json::json;
 
 use crate::agent::AgentError;
 use crate::event::{Delivery, LeaseToken};
-use crate::graph::{Answer, Graph, GraphError, Node, NodeId, NodeKind, NodeStatus};
+use crate::graph::{
+    Answer, ChangeResult, Conclusion, Decision, Graph, GraphError, Node, NodeId, NodeKind,
+    NodeStatus,
+};
 use crate::prompt::Prompt;
 use crate::role::{Reaction, Report, RoleError};
 use crate::trunk::Trunk;
-use crate::workspace::Workspace;
+use crate::workspace::{Workspace, WorkspaceError};
 
 /// What one execution did.
 #[derive(Debug, Clone, Serialize)]
@@ -120,29 +135,68 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     if predecessors.is_empty() {
         predecessors.push(graph.origin()?);
     }
+    let continued = continuations(graph, id)?;
     if node.investigation {
-        return investigate(reaction, graph, &node, &predecessors);
+        return investigate(reaction, graph, &node, &predecessors, &continued);
     }
 
-    // Each attempt gets a branch that did not exist before, under a name no
-    // existing ref and no trunk branch takes; the one git created is
-    // recorded.
+    // Each attempt gets its own path and a fresh branch, and touches no
+    // other attempt's worktree: a process left behind by an earlier attempt
+    // still has its old path, and the attempt that took the step over may
+    // already be working in its own.
     let context = reaction.context();
+    let workspaces = context.workspaces();
     let trunk = Trunk::new(context.project(), context.declaration().trunk.as_deref());
     let trunk = trunk.branches(graph)?;
-    let mut workspace = match context.workspaces().create(&node, &predecessors, &trunk) {
+    pause(Window::Allocate);
+    // Carried on from what the last attempt left: its commit first, then
+    // the predecessors (already in it, unless they moved since).
+    let resumed = continued
+        .last()
+        .and_then(|c| c.resume_commit.clone())
+        .and_then(|commit| {
+            let mut left = node.clone();
+            left.head_commit = Some(commit);
+            let mut start = vec![left];
+            start.extend(predecessors.iter().cloned());
+            match workspaces.create(&node, token, &start, &trunk) {
+                Ok(workspace) => Some(workspace),
+                Err(WorkspaceError::AttemptExists(_)) => None,
+                Err(_) => {
+                    // A failed join can leave this attempt's path allocated.
+                    // Clear it if clean so the fallback can use the same path.
+                    workspaces.unregister(&workspaces.path_of(id, token)).ok();
+                    None
+                }
+            }
+        });
+    let carried_on = resumed.is_some();
+    let created = match resumed {
+        Some(workspace) => Ok(workspace),
+        None => workspaces.create(&node, token, &predecessors, &trunk),
+    };
+    let mut workspace = match created {
         Ok(workspace) => workspace,
         Err(error) => return fail(graph, token, &node, "", None, error.to_string()),
     };
     let branch = workspace.branch().to_owned();
-    graph.set_branch(id, token, &branch, None)?;
-    let result = carry_out(reaction, graph, &node, &branch, &mut workspace);
-    // Settled either way: the branch holds what there is, and the worktree
-    // goes. Not when the lease was lost or the run interrupted: the step may
-    // be another process's now, working in the same place.
+    let attempt = Attempt {
+        continued: &continued,
+        carried_on,
+    };
+    let result = graph
+        .set_branch(id, token, &branch)
+        .map_err(RoleError::from)
+        .and_then(|()| carry_out(reaction, graph, &node, &attempt, &branch, &mut workspace));
+    // This attempt releases its own worktree, and only that; both are best
+    // effort, and `expl doctor --fix` removes a leftover once the step
+    // settles. Settled: the branch holds what there is, and the worktree
+    // goes. On lease loss or interruption, the worktree goes only if
+    // nothing was left in it, so unsaved work stays to be inspected.
     if matches!(result, Ok(Report::Execution(_))) && !reaction.lease_lost() {
-        // Best effort: `expl doctor --fix` removes a leftover.
-        reaction.context().workspaces().release(workspace).ok();
+        workspaces.release(workspace).ok();
+    } else {
+        workspaces.unregister(workspace.path()).ok();
     }
     result
 }
@@ -153,6 +207,7 @@ fn carry_out(
     reaction: &Reaction<'_>,
     graph: &mut Graph,
     node: &Node,
+    attempt: &Attempt<'_>,
     branch: &str,
     workspace: &mut Workspace,
 ) -> Result<Report, RoleError> {
@@ -184,7 +239,7 @@ fn carry_out(
         }
     }
 
-    let prompt = prompt(reaction, node, &schema);
+    let prompt = prompt(reaction, node, attempt, &schema);
     let (succeeded, summary) = invoke(reaction, graph, id, workspace, &prompt, &schema)?;
     // The lease is the right to write this step. Lost while the agent ran,
     // the step may already be another process's: touch nothing of it.
@@ -206,7 +261,10 @@ fn carry_out(
             );
         }
     };
-    graph.set_branch(id, token, branch, Some(&head))?;
+    // Committed, but nothing of the commit is in the graph yet: the branch,
+    // its tip, the outcome and the events are published together below, and
+    // only while this delivery still holds the step.
+    pause(Window::Publish);
     if !succeeded {
         return fail(graph, token, node, branch, Some(head), summary);
     }
@@ -223,8 +281,16 @@ fn carry_out(
     if reaction.lease_lost() {
         return Err(RoleError::Agent(AgentError::Interrupted));
     }
-    pause(Window::Complete);
-    graph.complete(id, token, &summary)?;
+    graph.publish(
+        id,
+        token,
+        &ChangeResult {
+            branch,
+            head_commit: Some(&head),
+            completed: true,
+            outcome: &summary,
+        },
+    )?;
     Ok(Report::Execution(ExecutionReport {
         node: id,
         status: NodeStatus::Completed,
@@ -240,11 +306,15 @@ fn carry_out(
 /// lease over in between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Window {
+    /// After the claim, before [`Workspaces::create`](crate::workspace::Workspaces::create)
+    /// allocates the attempt's worktree and branch.
+    Allocate,
     /// After the check that follows the agent's run, before
     /// [`Workspace::commit`] and the writes after it.
     Commit,
-    /// After the last check, before [`Graph::complete`].
-    Complete,
+    /// After [`Workspace::commit`], before [`Graph::publish`] records the
+    /// commit with the step's outcome.
+    Publish,
     /// After the investigation's lease check, before recording its finding.
     Finding,
 }
@@ -279,6 +349,7 @@ fn investigate(
     graph: &mut Graph,
     node: &Node,
     predecessors: &[Node],
+    continued: &[Conclusion],
 ) -> Result<Report, RoleError> {
     let id = node.id;
     let token = reaction.token();
@@ -313,7 +384,7 @@ fn investigate(
     };
     let schema = finding_schema();
     let path = graph.ancestors(id)?;
-    let prompt = investigation_prompt(reaction, node, &path, &schema);
+    let prompt = investigation_prompt(reaction, node, &path, continued, &schema);
     // An investigation changes nothing: a run that changed its working
     // directory (or moved HEAD) is no finding about the code it was given.
     let result: Result<Finding, RoleError> =
@@ -376,6 +447,7 @@ fn investigation_prompt(
     reaction: &Reaction<'_>,
     node: &Node,
     path: &[Node],
+    continued: &[Conclusion],
     schema: &serde_json::Value,
 ) -> Prompt {
     let earlier = super::digest::findings(path);
@@ -394,9 +466,10 @@ fn investigation_prompt(
          not, and give the evidence — what you checked and what you found — so that someone \
          else can verify the answer. Report `investigated: false` only when you could not carry \
          out the investigation at all.\n\
-         {earlier}{instructions}{response}",
+         {earlier}{continued}{instructions}{response}",
         title = node.title,
         objective = node.objective,
+        continued = continuation_section(continued, false),
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),
     ))
@@ -450,6 +523,9 @@ pub(crate) fn abandon(
     }
 }
 
+/// Fail the claimed `node`. A change step that has its `branch` publishes
+/// it with `head_commit` (`None` when nothing was committed) and the
+/// failure in one transaction; otherwise only the failure is recorded.
 fn fail(
     graph: &mut Graph,
     token: &LeaseToken,
@@ -458,7 +534,20 @@ fn fail(
     head_commit: Option<String>,
     summary: String,
 ) -> Result<Report, RoleError> {
-    graph.fail(node.id, token, &summary)?;
+    if node.investigation || branch.is_empty() {
+        graph.fail(node.id, token, &summary)?;
+    } else {
+        graph.publish(
+            node.id,
+            token,
+            &ChangeResult {
+                branch,
+                head_commit: head_commit.as_deref(),
+                completed: false,
+                outcome: &summary,
+            },
+        )?;
+    }
     Ok(Report::Execution(ExecutionReport {
         node: node.id,
         status: NodeStatus::Failed,
@@ -495,15 +584,82 @@ fn resolution_prompt(
 
 /// The prompt: the step's own title and objective — nothing about the
 /// graph, the goals, or other steps.
-fn prompt(reaction: &Reaction<'_>, node: &Node, schema: &serde_json::Value) -> Prompt {
+/// The conclusions that put this step back to run again, oldest first,
+/// while it is being carried on: since the last one, nothing concluded it
+/// done or abandoned (a continue not put back — another evaluation agent's,
+/// say — does not end it). Empty for a step not being continued.
+fn continuations(graph: &Graph, id: NodeId) -> Result<Vec<Conclusion>, RoleError> {
+    let concluded = graph.conclusions_of(id)?;
+    let reopened = |c: &Conclusion| c.decision == Decision::Continue && c.reopened;
+    let Some(last) = concluded.iter().rposition(reopened) else {
+        return Ok(Vec::new());
+    };
+    if concluded[last..]
+        .iter()
+        .any(|c| c.decision != Decision::Continue)
+    {
+        return Ok(Vec::new());
+    }
+    Ok(concluded.into_iter().filter(reopened).collect())
+}
+
+/// What earlier attempts of a continued step got done and what evaluation
+/// said remains; empty for a first attempt.
+fn continuation_section(continued: &[Conclusion], change: bool) -> String {
+    if continued.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n## Earlier attempts\n\n\
+         This step was attempted before and stopped short. Evaluation checked each attempt and \
+         decided to carry on (oldest first):\n\n",
+    );
+    for (n, conclusion) in continued.iter().enumerate() {
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "{n}. How far it got: {finding}\n   What remains: {remains}\n",
+                n = n + 1,
+                finding = conclusion.finding.trim(),
+                remains = conclusion.consequence.trim(),
+            ),
+        );
+    }
+    if change {
+        out.push_str(
+            "\nThe working directory already holds what the last attempt left, committed: carry \
+             on from it rather than starting over, and finish what remains.\n",
+        );
+    } else {
+        out.push_str("\nTake what remains into account in this attempt.\n");
+    }
+    out
+}
+
+/// What a change step's attempt carries on from.
+struct Attempt<'a> {
+    /// The conclusions that put it back to run ([`continuations`]).
+    continued: &'a [Conclusion],
+    /// Whether its worktree starts from what the last attempt left.
+    carried_on: bool,
+}
+
+fn prompt(
+    reaction: &Reaction<'_>,
+    node: &Node,
+    attempt: &Attempt<'_>,
+    schema: &serde_json::Value,
+) -> Prompt {
     Prompt::from(format!(
         "## Task\n\n{title}\n\n{objective}\n\n\
          Do the work in the working directory: edit files, run builds and tests, and verify the \
          objective. Leave your changes uncommitted, and do not switch branches.\n\
-         {instructions}\nReport `succeeded: false` honestly if the objective is not achieved.\n\
+         {continued}{instructions}\nReport `succeeded: false` honestly if the objective is not \
+         achieved.\n\
          {response}",
         title = node.title,
         objective = node.objective.trim(),
+        continued = continuation_section(attempt.continued, attempt.carried_on),
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),
     ))
@@ -512,7 +668,9 @@ fn prompt(reaction: &Reaction<'_>, node: &Node, schema: &serde_json::Value) -> P
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::io::Write;
     use std::path::PathBuf;
+    use std::process::{Command, Stdio};
     use std::rc::Rc;
 
     use super::*;
@@ -523,6 +681,7 @@ mod tests {
     use crate::project::Project;
     use crate::role::{Context, Role};
     use crate::store::{self, EPOCH};
+    use crate::workspace::Workspaces;
 
     /// A step leased by its first holder, ready to be carried out.
     struct Held {
@@ -687,8 +846,9 @@ mod tests {
                 .expect("expire first holder's delivery");
             assert!(graph.claim(step, &delivery.token).expect("reclaim"));
             // At Commit, leave the old checkout in place so its commit
-            // reaches the fenced `set_branch` call.
-            let workspace = if at == Window::Complete {
+            // reaches the fenced `set_branch` call. Otherwise the new holder
+            // works in a worktree of its own, with a file not yet committed.
+            let workspace = if matches!(at, Window::Allocate | Window::Publish) {
                 let node = graph.node(step).expect("step");
                 let predecessors = vec![graph.origin().expect("origin")];
                 let trunk = Trunk::new(context.project(), context.declaration().trunk.as_deref())
@@ -696,11 +856,13 @@ mod tests {
                     .expect("trunk");
                 let workspace = context
                     .workspaces()
-                    .create(&node, &predecessors, &trunk)
+                    .create(&node, &delivery.token, &predecessors, &trunk)
                     .expect("the new holder's workspace");
                 graph
-                    .set_branch(step, &delivery.token, workspace.branch(), None)
+                    .set_branch(step, &delivery.token, workspace.branch())
                     .expect("branch");
+                std::fs::write(workspace.path().join("replacement.txt"), "replacement\n")
+                    .expect("the new holder's work");
                 Some(workspace)
             } else {
                 None
@@ -784,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn an_execution_left_alone_passes_both_windows_and_completes() {
+    fn an_execution_left_alone_passes_every_window_and_completes() {
         let mut held = held_step(false);
         let reached = Rc::new(RefCell::new(Vec::new()));
         let seen = Rc::clone(&reached);
@@ -805,10 +967,212 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(*reached.borrow(), vec![Window::Commit, Window::Complete]);
+        assert_eq!(
+            *reached.borrow(),
+            vec![Window::Allocate, Window::Commit, Window::Publish]
+        );
         assert_eq!(
             held.graph.node(held.step).expect("step").status,
             NodeStatus::Completed
+        );
+    }
+
+    #[test]
+    fn a_stale_process_cannot_write_into_the_reclaiming_attempts_commit() {
+        let mut held = held_step(false);
+        let retry = Processes::open(&held.db, &held.context.project().logs_dir())
+            .expect("processes")
+            .create("executor", None, false)
+            .expect("retry process")
+            .id;
+        assert!(
+            held.graph
+                .claim(held.step, &held.delivery.token)
+                .expect("claim")
+        );
+        let step = held.graph.node(held.step).expect("step");
+        let origin = held.graph.origin().expect("origin");
+        let workspaces = held.context.workspaces();
+        let first = workspaces
+            .create(&step, &held.delivery.token, &[origin], &[])
+            .expect("first worktree");
+        let old_path = first.path().to_owned();
+        held.graph
+            .set_branch(held.step, &held.delivery.token, first.branch())
+            .expect("record first branch");
+        let mut stale = Some(
+            Command::new("sh")
+                .args([
+                    "-ec",
+                    r#"read -r signal; mkdir -p "$1"; echo stale > "$1/stale.txt""#,
+                    "agent",
+                ])
+                .arg(&old_path)
+                .current_dir(&old_path)
+                .stdin(Stdio::piped())
+                .spawn()
+                .expect("start a process in the first worktree"),
+        );
+        store::open(&held.db)
+            .expect("db")
+            .execute(
+                &format!("UPDATE deliveries SET leased_until = {EPOCH} - 1"),
+                [],
+            )
+            .expect("expire");
+        let delivery = Inbox::open(&held.db, "executor")
+            .expect("inbox")
+            .lease(Role::Execution.reactions(), retry, false, MAX_ATTEMPTS)
+            .expect("lease")
+            .expect("redelivery");
+        assert_eq!(delivery.attempts, 2);
+        let _hook = Hooked::install(move |window| {
+            if window == Window::Commit {
+                let mut stale = stale.take().expect("stale process");
+                stale
+                    .stdin
+                    .take()
+                    .expect("stale process input")
+                    .write_all(b"write now\n")
+                    .expect("signal the stale process");
+                assert!(stale.wait().expect("stale process exit").success());
+            }
+        });
+        let agent = held.context.agent("executor").expect("agent");
+        let reaction = Reaction::new(&held.context, &agent, retry, &delivery, &held.interrupt);
+        let report = react(&reaction, &mut held.graph).expect("reclaim and execute");
+        let Report::Execution(report) = report else {
+            panic!("expected execution, got {report:?}");
+        };
+        assert_eq!(report.status, NodeStatus::Completed);
+        let commit = report.head_commit.expect("commit");
+        let files = Git::new(held.context.project().root())
+            .run(&["ls-tree", "--name-only", &commit])
+            .expect("list committed files");
+        assert_eq!(
+            files, "old.txt",
+            "only the reclaiming agent's file is committed"
+        );
+        assert!(
+            old_path.join("stale.txt").is_file(),
+            "the stale write succeeded"
+        );
+        // The reclaiming attempt released its own worktree and left the
+        // stale one's alone.
+        let registered = workspaces.registered().expect("registrations");
+        assert_eq!(registered.len(), 1, "{registered:?}");
+        assert_eq!(registered[0].0, held.step);
+        assert_eq!(registered[0].1.file_name(), old_path.file_name());
+        workspaces.discard(held.step).expect("discard leftovers");
+        assert!(!old_path.exists());
+    }
+
+    #[test]
+    fn execution_commits_without_resolving_a_dangling_symbolic_trunk() {
+        let mut held = held_step(false);
+        let mut declaration = held.context.declaration().clone();
+        declaration.trunk = Some("trunk".to_owned());
+        held.context = Context::new(held.context.project().clone(), declaration);
+        let git = Git::new(held.context.project().root());
+        let trunk = "refs/heads/trunk";
+        let target = format!("refs/heads/{}", Workspaces::branch_name(held.step));
+        git.run(&["symbolic-ref", trunk, &target])
+            .expect("trunk ref");
+        assert!(git.resolve_commit(trunk).is_err());
+
+        let agent = held.context.agent("executor").expect("agent");
+        let reaction = Reaction::new(
+            &held.context,
+            &agent,
+            held.holder,
+            &held.delivery,
+            &held.interrupt,
+        );
+        let Report::Execution(report) = react(&reaction, &mut held.graph).expect("reaction") else {
+            panic!("expected an execution report");
+        };
+
+        assert_eq!(report.status, NodeStatus::Completed, "{}", report.summary);
+        let commit = report.head_commit.expect("committed step");
+        assert_eq!(
+            git.run(&["show", &format!("{commit}:old.txt")])
+                .expect("committed file"),
+            "old"
+        );
+        assert_eq!(
+            git.run(&["symbolic-ref", trunk]).expect("trunk target"),
+            target
+        );
+        assert!(
+            git.resolve_commit(trunk).is_err(),
+            "trunk is still dangling"
+        );
+        assert_eq!(report.branch, Workspaces::branch_candidate(held.step, 2));
+        assert_eq!(
+            git.resolve_commit(&format!("refs/heads/{}", report.branch))
+                .expect("step branch tip"),
+            commit
+        );
+    }
+
+    #[test]
+    fn a_takeover_before_allocation_leaves_the_step_to_the_new_holder() {
+        assert_takeover_at(Window::Allocate);
+    }
+
+    #[test]
+    fn a_stale_executor_resumed_before_allocation_leaves_the_replacement_worktree_intact() {
+        let mut held = held_step(false);
+        let (_hook, takeover) = take_over_at(&held, Window::Allocate);
+        let agent = held.context.agent("executor").expect("agent");
+        let reaction = Reaction::new(
+            &held.context,
+            &agent,
+            held.holder,
+            &held.delivery,
+            &held.interrupt,
+        );
+        assert!(matches!(
+            react(&reaction, &mut held.graph),
+            Err(RoleError::Graph(GraphError::LeaseLost(id))) if id == held.step
+        ));
+        let takeover = takeover.borrow();
+        let replacement = takeover
+            .as_ref()
+            .expect("the step was taken over")
+            .workspace
+            .as_ref()
+            .expect("the replacement's worktree");
+        let workspaces = held.context.workspaces();
+
+        let registered = workspaces.registered().expect("registrations");
+        assert_eq!(
+            registered
+                .iter()
+                .map(|(node, path)| (*node, path.file_name().map(ToOwned::to_owned)))
+                .collect::<Vec<_>>(),
+            vec![(
+                held.step,
+                replacement.path().file_name().map(ToOwned::to_owned)
+            )],
+            "only the replacement's registration is left"
+        );
+        replacement
+            .check_branch()
+            .expect("the replacement's checkout is on its branch");
+        assert_eq!(
+            std::fs::read_to_string(replacement.path().join("replacement.txt"))
+                .expect("the replacement's file"),
+            "replacement\n"
+        );
+        assert_eq!(
+            held.graph.node(held.step).expect("step").branch.as_deref(),
+            Some(replacement.branch())
+        );
+        let stale = workspaces.path_of(held.step, &held.delivery.token);
+        assert!(
+            !stale.exists(),
+            "the stale attempt released its own, clean worktree"
         );
     }
 
@@ -818,13 +1182,185 @@ mod tests {
     }
 
     #[test]
-    fn a_takeover_before_completion_leaves_the_step_to_the_new_holder() {
-        assert_takeover_at(Window::Complete);
+    fn a_takeover_before_publication_leaves_the_step_to_the_new_holder() {
+        assert_takeover_at(Window::Publish);
     }
 
     #[test]
     fn a_takeover_before_the_finding_leaves_the_step_to_the_new_holder() {
         assert_takeover_at(Window::Finding);
+    }
+
+    #[test]
+    fn a_lease_lost_after_the_commit_publishes_nothing_of_the_attempt() {
+        let mut held = held_step(false);
+        let (_hook, takeover) = take_over_at(&held, Window::Publish);
+        let agent = held.context.agent("executor").expect("agent");
+        let reaction = Reaction::new(
+            &held.context,
+            &agent,
+            held.holder,
+            &held.delivery,
+            &held.interrupt,
+        );
+        assert!(matches!(
+            react(&reaction, &mut held.graph),
+            Err(RoleError::Graph(GraphError::LeaseLost(id))) if id == held.step
+        ));
+        let takeover = takeover.borrow();
+        let replacement = takeover
+            .as_ref()
+            .expect("the step was taken over")
+            .workspace
+            .as_ref()
+            .expect("the replacement's worktree");
+
+        // The old holder did commit, on a branch of its own.
+        let git = Git::new(held.context.project().root());
+        let stale_branch = Workspaces::branch_name(held.step);
+        assert_ne!(stale_branch, replacement.branch());
+        let stale_tip = git
+            .resolve_commit(&format!("refs/heads/{stale_branch}"))
+            .expect("the old holder's branch");
+        assert_ne!(stale_tip, git.resolve_commit("main").expect("base"));
+        assert_eq!(
+            git.run(&["show", &format!("{stale_tip}:old.txt")])
+                .expect("the old holder's committed file"),
+            "old"
+        );
+
+        // None of it reached the step: it is the replacement's branch, with
+        // no tip until the replacement commits, and still running.
+        let step = held.graph.node(held.step).expect("step");
+        assert_eq!(step.status, NodeStatus::Running);
+        assert_eq!(step.branch.as_deref(), Some(replacement.branch()));
+        assert_eq!(step.head_commit, None, "no tip of the old holder's");
+        assert_eq!(step.outcome, None);
+        let events = held.graph.events(None, 100).expect("events");
+        assert!(
+            !events.iter().any(|e| e.node == Some(held.step)
+                && matches!(e.kind, EventKind::NodeCompleted | EventKind::NodeFailed)),
+            "the old holder settled nothing"
+        );
+    }
+
+    #[test]
+    fn a_retry_that_fails_before_committing_shows_no_earlier_tip() {
+        let mut held = held_step(false);
+        let agent = held.context.agent("executor").expect("agent");
+        let workspaces = held.context.workspaces();
+        let git = Git::new(held.context.project().root());
+
+        // The first attempt completes with its own branch and tip, and
+        // evaluation decides to carry on from it.
+        let reaction = Reaction::new(
+            &held.context,
+            &agent,
+            held.holder,
+            &held.delivery,
+            &held.interrupt,
+        );
+        let Report::Execution(first) = react(&reaction, &mut held.graph).expect("first attempt")
+        else {
+            panic!("expected an execution report");
+        };
+        assert_eq!(first.status, NodeStatus::Completed, "{}", first.summary);
+        let first_tip = first.head_commit.clone().expect("first tip");
+        Inbox::open(&held.db, "executor")
+            .expect("inbox")
+            .ack(&held.delivery, None)
+            .expect("ack");
+        let completed = held.graph.last_event().expect("last").expect("completed");
+        let reopened = held
+            .graph
+            .conclude(
+                held.step,
+                completed,
+                &crate::graph::NewConclusion {
+                    agent: "evaluator".to_owned(),
+                    decision: Decision::Continue,
+                    hypothesis: "s works".to_owned(),
+                    finding: "half done".to_owned(),
+                    consequence: "finish it".to_owned(),
+                },
+                &[],
+            )
+            .expect("conclude");
+        assert_eq!(reopened, Some(true));
+        let before = held.graph.node(held.step).expect("step");
+        assert_eq!(before.status, NodeStatus::Planned);
+        assert_eq!(before.branch.as_deref(), Some(first.branch.as_str()));
+        assert_eq!(before.head_commit.as_deref(), Some(first_tip.as_str()));
+
+        // The retry cannot commit: a hook refuses every commit.
+        let hook = held.context.project().root().join(".git/hooks/pre-commit");
+        std::fs::create_dir_all(hook.parent().expect("hooks")).expect("hooks directory");
+        std::fs::write(&hook, "#!/bin/sh\necho 'refused by hook' >&2\nexit 1\n").expect("hook");
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("executable hook");
+        let retry = Processes::open(&held.db, &held.context.project().logs_dir())
+            .expect("processes")
+            .create("executor", None, false)
+            .expect("retry process")
+            .id;
+        let delivery = Inbox::open(&held.db, "executor")
+            .expect("inbox")
+            .lease(Role::Execution.reactions(), retry, false, MAX_ATTEMPTS)
+            .expect("lease")
+            .expect("the reopened step's node.ready");
+        assert_eq!(delivery.event.node, Some(held.step));
+
+        // Before the commit, the step already shows the retry's branch, and
+        // no tip: not the first attempt's.
+        let seen = Rc::new(RefCell::new(None));
+        let record = Rc::clone(&seen);
+        let (db, step, path) = (
+            held.db.clone(),
+            held.step,
+            workspaces.path_of(held.step, &delivery.token),
+        );
+        let _hook = Hooked::install(move |window| {
+            if window == Window::Commit {
+                // Something to commit: the agent rewrote what the first
+                // attempt left unchanged.
+                std::fs::write(path.join("retry.txt"), "retry\n").expect("retry's work");
+                let node = Graph::open(&db).expect("graph").node(step).expect("step");
+                *record.borrow_mut() = Some((node.branch, node.head_commit));
+            }
+        });
+        let reaction = Reaction::new(&held.context, &agent, retry, &delivery, &held.interrupt);
+        let Report::Execution(report) = react(&reaction, &mut held.graph).expect("retry") else {
+            panic!("expected an execution report");
+        };
+
+        assert_eq!(report.status, NodeStatus::Failed, "{}", report.summary);
+        assert_eq!(report.head_commit, None, "the retry committed nothing");
+        assert_ne!(report.branch, first.branch, "the retry has its own branch");
+        assert!(
+            report.summary.contains("refused by hook"),
+            "{}",
+            report.summary
+        );
+        let (mid_branch, mid_tip) = seen.borrow_mut().take().expect("reached the commit");
+        assert_eq!(mid_branch.as_deref(), Some(report.branch.as_str()));
+        assert_eq!(mid_tip, None, "mid-attempt, no tip of the first attempt's");
+        let after = held.graph.node(held.step).expect("step");
+        assert_eq!(after.status, NodeStatus::Failed);
+        assert_eq!(after.branch.as_deref(), Some(report.branch.as_str()));
+        assert_eq!(after.head_commit, None, "no tip of the first attempt's");
+        assert_eq!(after.outcome.as_deref(), Some(report.summary.as_str()));
+        let last = held.graph.events(None, 100).expect("events");
+        let last = last.last().expect("an event");
+        assert_eq!(
+            (last.kind, last.node),
+            (EventKind::NodeFailed, Some(held.step))
+        );
+        // The first attempt's branch still holds its own tip.
+        assert_eq!(
+            git.resolve_commit(&format!("refs/heads/{}", first.branch))
+                .expect("first branch"),
+            first_tip
+        );
     }
 
     #[test]
