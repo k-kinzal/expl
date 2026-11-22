@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 /// its worktree, writes `stray.txt` there while `@DIR@/eval-writes` exists
 /// and commits `sneaky.txt` while `@DIR@/eval-commits` exists. An
 /// investigation answers `no` (whether `hello.txt` exists), and its findings
-/// are judged to settle the goal. Every prompt is kept in `@DIR@/prompts/`
+/// are judged to settle the goal; while `@DIR@/investigation-writes` exists
+/// it first creates `hello.txt` itself. Every prompt is kept in `@DIR@/prompts/`
 /// for inspection.
 const AGENT: &str = r#"#!/bin/sh
 mkdir -p "@DIR@/prompts"
@@ -48,6 +49,7 @@ planning)
 execution)
   while [ -f "@DIR@/slow" ]; do sleep 0.2; done
   if grep -q '^## Question' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
+    if [ -f "@DIR@/investigation-writes" ]; then echo made > hello.txt; fi
     if [ -f hello.txt ]; then answer=yes; else answer=no; fi
     echo "{\"investigated\":true,\"answer\":\"$answer\",\"evidence\":\"looked for hello.txt\"}"
     exit 0
@@ -333,6 +335,39 @@ fn events_flow_through_every_role() {
     assert_eq!(
         git(repo, &["log", "-1", "--format=%s", "expl/node-3"]),
         "Write hello"
+    );
+}
+
+#[test]
+fn an_investigation_that_changes_the_code_fails_instead_of_answering() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    ok(repo, &["goal", "add", "Is hello written yet?"]);
+    let question = ok(
+        repo,
+        &[
+            "node",
+            "add",
+            "Look for hello.txt",
+            "--objective",
+            "Does hello.txt exist?",
+            "--investigation",
+            "--before",
+            "2",
+            "--priority",
+            "1",
+        ],
+    );
+    // The agent writes hello.txt and then reports finding it.
+    sandbox.marker("investigation-writes", true);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    let step = node(repo, &question)["node"].clone();
+    assert_eq!(step["status"], "failed", "{step}");
+    assert!(step["answer"].is_null(), "{step}");
+    let outcome = step["outcome"].as_str().unwrap_or_default();
+    assert!(
+        outcome.contains("changed the code") && outcome.contains("hello.txt"),
+        "{outcome}"
     );
 }
 

@@ -51,7 +51,9 @@ use serde_json::json;
 
 use crate::declaration::Scope;
 use crate::event::EventKind;
-use crate::graph::{Evaluation, Graph, Lineage, Node, NodeFilter, NodeId, NodeKind, NodeStatus};
+use crate::graph::{
+    Evaluation, Graph, Lineage, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Snapshot,
+};
 use crate::prompt::Prompt;
 use crate::role::{Direction, Reaction, Report, RoleError, digest};
 
@@ -124,6 +126,15 @@ struct SurveyedNode {
     kind: StepKind,
     after: Vec<i64>,
     before: Vec<i64>,
+    #[serde(default)]
+    derived_from: Option<i64>,
+}
+
+/// The failed step a surveyed proposal names as the failure it is a new
+/// hypothesis grown from; anything else named is dropped.
+fn derived_from(snapshot: &Snapshot, named: Option<i64>) -> Option<NodeId> {
+    let node = snapshot.node(NodeId(named?))?;
+    (node.kind == NodeKind::Step && node.status == NodeStatus::Failed).then_some(node.id)
 }
 
 fn survey_schema() -> serde_json::Value {
@@ -137,9 +148,10 @@ fn survey_schema() -> serde_json::Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["title", "objective", "kind", "after", "before"],
+                    "required": ["title", "objective", "kind", "after", "before", "derived_from"],
                     "properties": {
                         "kind": kind_property(),
+                        "derived_from": {"type": ["integer", "null"], "description": "Id of the failed step this is a new hypothesis grown from (an alternative avoiding its cause, a smaller step, an investigation into why), or null."},
                         "title": {"type": "string", "description": "Short imperative name of the step."},
                         "objective": {"type": "string", "description": "What the step must achieve, concretely enough to be done in one session and checked afterwards."},
                         "after": {"type": "array", "items": {"type": "integer"}, "description": "Ids of the nodes it builds on: the origin, or completed steps. Several ids join their work; empty means the origin."},
@@ -485,30 +497,34 @@ fn realised_base(lineage: &Lineage, origin: &Node, nodes: &[&Node]) -> Vec<NodeI
     base
 }
 
-/// Add one proposal to the graph, noting it in `report`. A proposal of an
-/// exploration past a failure records the failed step it was grown from.
+/// One proposal as the agent stated it, and the failed step it was grown
+/// from, if any.
+struct Draft<'a> {
+    title: &'a str,
+    objective: &'a str,
+    kind: StepKind,
+    derived_from: Option<NodeId>,
+}
+
+/// Add one proposal to the graph, noting it in `report`.
 fn record(
     graph: &mut Graph,
     report: &mut ExplorationReport,
-    title: &str,
-    objective: &str,
-    kind: StepKind,
+    draft: &Draft<'_>,
     after: &[NodeId],
     before: &[NodeId],
 ) {
-    let investigation = kind == StepKind::Investigation;
-    let derived_from = (report.direction == Direction::Failure).then_some(report.from);
     match graph.propose(
-        investigation,
-        title.trim(),
-        objective.trim(),
+        draft.kind == StepKind::Investigation,
+        draft.title.trim(),
+        draft.objective.trim(),
         after,
         before,
-        derived_from,
+        draft.derived_from,
     ) {
         Ok(id) => report.proposed.push(id),
         Err(error) => report.rejected.push(Rejection {
-            title: title.to_owned(),
+            title: draft.title.to_owned(),
             reason: error.to_string(),
         }),
     }
@@ -585,9 +601,12 @@ fn explore(
         record(
             graph,
             &mut report,
-            &proposal.title,
-            &proposal.objective,
-            proposal.kind,
+            &Draft {
+                title: &proposal.title,
+                objective: &proposal.objective,
+                kind: proposal.kind,
+                derived_from: None,
+            },
             &after,
             &before,
         );
@@ -726,9 +745,12 @@ fn explore_failure(
         record(
             graph,
             &mut report,
-            &proposal.title,
-            &proposal.objective,
-            proposal.kind,
+            &Draft {
+                title: &proposal.title,
+                objective: &proposal.objective,
+                kind: proposal.kind,
+                derived_from: Some(failed.id),
+            },
             &base,
             &aim.resolve(&proposal.before),
         );
@@ -816,9 +838,12 @@ fn explore_ahead(
         record(
             graph,
             &mut report,
-            &proposal.title,
-            &proposal.objective,
-            proposal.kind,
+            &Draft {
+                title: &proposal.title,
+                objective: &proposal.objective,
+                kind: proposal.kind,
+                derived_from: None,
+            },
             &[start.id],
             &aim.resolve(&proposal.before),
         );
@@ -856,8 +881,12 @@ fn survey_on(
             "the whole graph was surveyed at {last}, after this event"
         )));
     }
+    let failed = (event.kind == EventKind::NodeFailed
+        && subject.kind == NodeKind::Step
+        && subject.status == NodeStatus::Failed)
+        .then_some(subject);
     Ok(Report::Exploration {
-        explorations: vec![survey(reaction, graph, &aim)?],
+        explorations: vec![survey(reaction, graph, &aim, failed)?],
     })
 }
 
@@ -867,6 +896,7 @@ fn survey(
     reaction: &Reaction<'_>,
     graph: &mut Graph,
     aim: &Aim,
+    failed: Option<&Node>,
 ) -> Result<ExplorationReport, RoleError> {
     let origin = graph.origin()?;
     let lineage = graph.lineage()?;
@@ -887,10 +917,16 @@ fn survey(
          Propose up to {breadth} new steps. For each, give the ids of the nodes it builds on \
          (`after`: the origin {origin} or completed steps — several ids join their work) and of \
          the goals it heads toward (`before`). The working directory holds the repository at \
-         the origin; read it to ground your proposals. Do not modify files.\n\n\
+         the origin; read it to ground your proposals. Do not modify files. When a proposal is \
+         a new hypothesis grown from a failed step, name that step in `derived_from`.{prompted}\n\n\
          ## Goals\n\n{goals}\n\
          ## Map\n\n{map}",
         origin = origin.id.0,
+        prompted = failed.map_or_else(String::new, |failed| format!(
+            "\n\nThis survey was prompted by the failure of {}: look at it together with every \
+             other failure on the map.",
+            failed.id
+        )),
         goals = aim.describe(graph)?,
         map = digest::graph(&snapshot),
     );
@@ -918,9 +954,12 @@ fn survey(
         record(
             graph,
             &mut report,
-            &proposal.title,
-            &proposal.objective,
-            proposal.kind,
+            &Draft {
+                title: &proposal.title,
+                objective: &proposal.objective,
+                kind: proposal.kind,
+                derived_from: derived_from(&snapshot, proposal.derived_from),
+            },
             &after,
             &before,
         );
@@ -966,4 +1005,35 @@ fn prompt(
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_survey_names_only_failed_steps_as_what_a_proposal_grew_from() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut graph = Graph::open(&dir.path().join("expl.db")).expect("graph");
+        let origin = graph
+            .create_origin("o", Some("main"), "abc")
+            .expect("origin");
+        let goal = graph.add_goal("g", "g", false, &[]).expect("goal");
+        let failed = graph
+            .propose_step("failed", "x", &[origin], &[goal])
+            .expect("failed");
+        let open = graph
+            .propose_step("open", "y", &[origin], &[goal])
+            .expect("open");
+        graph.plan_step(failed, 1).expect("plan");
+        assert!(graph.claim(failed, false).expect("claim"));
+        graph.fail(failed, "did not compile").expect("fail");
+        let snapshot = graph.snapshot().expect("snapshot");
+
+        assert_eq!(derived_from(&snapshot, Some(failed.0)), Some(failed));
+        for other in [open, goal, origin, NodeId(999)] {
+            assert_eq!(derived_from(&snapshot, Some(other.0)), None, "{other}");
+        }
+        assert_eq!(derived_from(&snapshot, None), None);
+    }
 }

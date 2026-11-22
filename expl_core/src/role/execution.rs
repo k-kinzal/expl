@@ -248,8 +248,10 @@ fn investigate(
     let schema = finding_schema();
     let path = graph.ancestors(id)?;
     let prompt = investigation_prompt(reaction, node, &path, &schema);
+    // An investigation changes nothing: a run that changed its working
+    // directory (or moved HEAD) is no finding about the code it was given.
     let result: Result<Finding, RoleError> =
-        reaction.invoke(graph, Some(id), scratch.path(), &prompt, &schema);
+        reaction.invoke_read_only(graph, Some(id), &scratch, &prompt, &schema);
     drop(scratch);
     // Whatever the agent answered, a lease another process took over means
     // the step is no longer ours to record.
@@ -269,6 +271,15 @@ fn investigate(
                 "",
                 None,
                 format!("investigation agent failed: {error}"),
+            );
+        }
+        Err(error @ RoleError::ScratchModified { .. }) => {
+            return fail(
+                graph,
+                node,
+                "",
+                None,
+                format!("the investigation changed the code it was to investigate: {error}"),
             );
         }
         Err(error) => {
