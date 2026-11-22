@@ -1354,6 +1354,105 @@ fn a_step_takes_a_fresh_branch_and_leaves_the_trunk_and_other_branches_alone() {
 }
 
 #[test]
+fn a_symbolic_trunk_and_its_target_are_left_alone_when_a_step_takes_that_name() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let tip = |branch: &str| git(repo, &["rev-parse", &format!("refs/heads/{branch}")]);
+    ok(repo, &["goal", "add", "Say hello"]);
+    let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
+
+    // The declared trunk is a symbolic ref to a branch named like A's
+    // first branch name; neither name is the other, so only the ref
+    // itself shows that the step's name is the trunk's.
+    let target = format!("expl/node-{a}");
+    let target_ref = format!("refs/heads/{target}");
+    git(repo, &["checkout", "-q", "-b", &target]);
+    std::fs::write(repo.join("trunk.txt"), "trunk\n").expect("write");
+    git(repo, &["add", "trunk.txt"]);
+    git(repo, &["commit", "-q", "-m", "Trunk work"]);
+    git(repo, &["checkout", "-q", "main"]);
+    git(repo, &["symbolic-ref", "refs/heads/trunk", &target_ref]);
+    let trunk_tip = tip("trunk");
+    assert_eq!(tip(&target), trunk_tip);
+    let path = repo.join("expl.toml");
+    let declaration = std::fs::read_to_string(&path).expect("declaration");
+    assert!(declaration.contains("trunk = \"main\""), "{declaration}");
+    let declaration = declaration.replacen("trunk = \"main\"", "trunk = \"trunk\"", 1);
+    std::fs::write(&path, declaration).expect("declaration");
+
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    let step = node(repo, &a);
+    assert_eq!(step["node"]["status"], "completed", "{step}");
+    let branch = format!("expl/node-{a}-2");
+    assert_eq!(step["node"]["branch"], branch.as_str(), "{step}");
+    assert_eq!(step["node"]["head_commit"], tip(&branch).as_str(), "{step}");
+    assert_eq!(
+        git(repo, &["show", &format!("{branch}:node-{a}.txt")]),
+        format!("node {a}")
+    );
+
+    // The trunk still points at its target, which still holds its commit.
+    assert_eq!(
+        git(repo, &["symbolic-ref", "refs/heads/trunk"]),
+        target_ref,
+        "the trunk keeps its symref target"
+    );
+    assert_eq!(tip("trunk"), trunk_tip, "the trunk is never written to");
+    assert_eq!(tip(&target), trunk_tip, "the trunk's target is kept");
+    assert_eq!(git(repo, &["show", "trunk:trunk.txt"]), "trunk");
+}
+
+#[test]
+fn a_reinitialised_graph_reusing_an_id_keeps_the_unadopted_branch() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let tip = |branch: &str| git(repo, &["rev-parse", &format!("refs/heads/{branch}")]);
+    let is_ancestor = |ancestor: &str, of: &str| {
+        Command::new("git")
+            .args(["merge-base", "--is-ancestor", ancestor, of])
+            .current_dir(repo)
+            .status()
+            .expect("git")
+            .success()
+    };
+
+    // A step of the first graph completes on `expl/node-2` and is never
+    // adopted.
+    let old = ok(repo, &["node", "add", "Old work", "--priority", "1"]);
+    assert_eq!(old, "2");
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    let step = node(repo, &old);
+    assert_eq!(step["node"]["status"], "completed", "{step}");
+    assert_eq!(step["node"]["branch"], "expl/node-2", "{step}");
+    let old_commit = tip("expl/node-2");
+    assert_eq!(step["node"]["head_commit"], old_commit.as_str(), "{step}");
+    assert!(!is_ancestor(&old_commit, "main"), "not adopted");
+
+    // The graph is thrown away and started again: ids count from the
+    // start, so the new graph's first step is node 2 again.
+    std::fs::remove_dir_all(repo.join(".expl")).expect("remove .expl");
+    assert_eq!(ok(repo, &["init"]), "1");
+    let new = ok(repo, &["node", "add", "New work", "--priority", "1"]);
+    assert_eq!(new, "2");
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    let step = node(repo, &new);
+    assert_eq!(step["node"]["status"], "completed", "{step}");
+    assert_eq!(step["node"]["branch"], "expl/node-2-2", "{step}");
+    let new_commit = tip("expl/node-2-2");
+    assert_eq!(step["node"]["head_commit"], new_commit.as_str(), "{step}");
+    assert_ne!(new_commit, old_commit);
+
+    // The old work is still on its branch.
+    assert_eq!(tip("expl/node-2"), old_commit, "the old branch is kept");
+    assert!(is_ancestor(&old_commit, "expl/node-2"));
+    assert!(!is_ancestor(&old_commit, "expl/node-2-2"));
+    assert_eq!(
+        git(repo, &["log", "-1", "--format=%s", "expl/node-2"]),
+        "Old work"
+    );
+}
+
+#[test]
 fn idle_exploration_revisits_random_starting_points() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;

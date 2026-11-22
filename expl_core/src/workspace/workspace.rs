@@ -810,6 +810,26 @@ mod tests {
     }
 
     #[test]
+    fn create_leaves_a_symbolic_trunk_and_its_target_alone() {
+        let fx = Fixture::new();
+        let target = Workspaces::branch_name(fx.step);
+        let target_ref = format!("refs/heads/{target}");
+        let commit = fx.occupy(&target);
+        git(&fx.root, &["symbolic-ref", "refs/heads/trunk", &target_ref]);
+
+        // Only the symref's name is declared: the target is passed over
+        // because it exists, not because it is listed.
+        let workspace = fx.create(&["trunk".to_owned()]).expect("create");
+        assert_eq!(workspace.branch(), Workspaces::branch_candidate(fx.step, 2));
+        assert_eq!(
+            git(&fx.root, &["symbolic-ref", "refs/heads/trunk"]),
+            target_ref
+        );
+        assert_eq!(fx.tip("trunk"), commit);
+        assert_eq!(fx.tip(&target), commit);
+    }
+
+    #[test]
     fn create_gives_up_when_no_name_is_free() {
         let fx = Fixture::new();
         let trunk: Vec<String> = (1..=BRANCH_ATTEMPTS)
