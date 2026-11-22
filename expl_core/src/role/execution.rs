@@ -149,11 +149,14 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     let trunk = Trunk::new(context.project(), context.declaration().trunk.as_deref());
     let trunk = trunk.branches(graph)?;
     pause(Window::Allocate);
-    // Carried on from what the last attempt left: its commit first, then
-    // the predecessors (already in it, unless they moved since).
+    // Carried on from the newest work an earlier attempt left — an attempt
+    // that failed before committing left none, and its conclusion no
+    // commit: its commit first, then the predecessors (already in it,
+    // unless they moved since).
     let resumed = continued
-        .last()
-        .and_then(|c| c.resume_commit.clone())
+        .iter()
+        .rev()
+        .find_map(|c| c.resume_commit.clone())
         .and_then(|commit| {
             let mut left = node.clone();
             left.head_commit = Some(commit);
