@@ -389,12 +389,23 @@ impl Workspace {
             Err(error @ GitError::Spawn(_)) => return Err(error.into()),
         };
         if merge_head.as_deref() == Some(expected.as_str()) {
-            git.run(&["add", "-A"])?;
+            // The merge commit holds what git merged plus the resolved
+            // files, nothing else the resolving agent left behind.
+            let mut add = vec!["add", "-A", "--"];
+            add.extend(self.conflicts.iter().map(String::as_str));
+            git.run(&add)?;
+            let unmerged = git.unmerged_paths()?;
+            if !unmerged.is_empty() {
+                return Err(WorkspaceError::UnresolvedConflicts(unmerged));
+            }
             let identity = identity_args(&git)?;
             let mut args: Vec<&str> = identity.iter().map(String::as_str).collect();
             args.extend(["commit", "--no-edit"]);
             let _guard = lock(&self.lock)?;
             git.run(&args)?;
+            // Anything else is discarded: the step's own work starts after
+            // the join, from the merged code.
+            git.restore("HEAD")?;
         } else if !git.is_ancestor(&expected, "HEAD")? {
             return Err(WorkspaceError::MergeAbandoned(commit));
         }

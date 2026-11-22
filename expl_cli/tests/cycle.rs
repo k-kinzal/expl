@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 /// (and `shared.txt` too while `@DIR@/shared` exists, so joined steps
 /// conflict) and sleeps while `@DIR@/slow` exists. Facing merge conflicts,
 /// execution resolves them, or claims to while `@DIR@/unresolvable`
-/// exists. Planning sleeps while `@DIR@/slow-planning` exists and answers
+/// exists, leaving a stray `litter-*.txt` behind while `@DIR@/litter` does. Planning sleeps while `@DIR@/slow-planning` exists and answers
 /// with `@DIR@/plan.json` when present; evaluation answers with
 /// `@DIR@/evaluation.sh` when present. Evaluation, which must not touch
 /// its worktree, writes `stray.txt` there while `@DIR@/eval-writes` exists
@@ -57,6 +57,7 @@ execution)
     if [ ! -f "@DIR@/unresolvable" ]; then
       for f in $conflicted; do echo resolved > "$f"; done
     fi
+    if [ -f "@DIR@/litter" ]; then echo junk > "litter-$$.txt"; fi
     echo '{"succeeded":true,"summary":"resolved conflicts"}'
     exit 0
   fi
@@ -463,6 +464,7 @@ fn conflicting_joins_merge_every_predecessor() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
     let (parents, join) = sandbox.conflicting_join(3);
+    sandbox.marker("litter", true);
     ok(repo, &["run", "executor", "--exit-when-idle"]);
 
     // The first merge conflicts, and so does the next; each is resolved
@@ -480,6 +482,8 @@ fn conflicting_joins_merge_every_predecessor() {
         git(repo, &["merge-base", "--is-ancestor", &commit, tip]);
     }
     let files = git(repo, &["ls-tree", "--name-only", &branch]);
+    // What the resolving agent left besides the conflicts is not kept.
+    assert!(!files.contains("litter-"), "{files}");
     for id in parents.iter().chain([&join]) {
         let expected = format!("node-{id}.txt");
         assert!(
