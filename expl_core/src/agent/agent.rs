@@ -37,6 +37,12 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(5);
 /// before they are killed.
 const LEFTOVER_GRACE: Duration = Duration::from_secs(2);
 
+/// How long a process group gets to vanish after SIGKILL. A member that
+/// outlives it is stuck where it cannot even be killed; past this bound the
+/// attempt fails with [`AgentError::Lingering`] instead of handing the
+/// working directory on.
+const KILL_GRACE: Duration = Duration::from_secs(5);
+
 /// How long the output is still read once the CLI and its process group are
 /// gone. A process that escaped the group can hold the pipes open forever;
 /// past this bound, whatever was read so far is the output.
@@ -187,8 +193,9 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// [`AgentError::Interrupted`] as soon as an attempt is interrupted;
-    /// otherwise the error of the only CLI (such as
+    /// [`AgentError::Interrupted`] as soon as an attempt is interrupted,
+    /// and [`AgentError::Lingering`] as soon as an attempt leaves processes
+    /// behind that cannot be stopped; otherwise the error of the only CLI (such as
     /// [`AgentError::TimedOut`] or [`AgentError::Mismatch`]), or
     /// [`AgentError::Failed`] naming every CLI's failure when each of
     /// several failed.
@@ -216,6 +223,8 @@ impl Agent {
             {
                 Ok(run) => return Ok(run),
                 Err(AgentError::Interrupted) => return Err(AgentError::Interrupted),
+                // The directory is still in use: no other CLI may start on it.
+                Err(error @ AgentError::Lingering { .. }) => return Err(error),
                 Err(error) if count == 1 => return Err(error),
                 Err(error) => {
                     writeln!(log, "=== {} failed: {error} ===", cli.driver.kind().label())?;
@@ -301,7 +310,11 @@ impl Agent {
             .map(|pipe| tee(pipe, Arc::clone(&log), "[stderr] "));
 
         let end = wait(&mut child, invocation.interrupt, deadline.map(|(at, _)| at))?;
-        let reaped = matches!(end, End::Exited(_)) && reap_group(child.id());
+        // However the leader ended (by itself, or stopped on a timeout or an
+        // interrupt), members of its group may outlive it: stop them and see
+        // them gone before the working directory goes to the next CLI or to
+        // whichever process takes the work over.
+        let reaped = reap_group(child.id());
         let drained_by = Instant::now() + DRAIN_GRACE;
         let join = |tee: Option<Tee>| {
             tee.map(|tee| tee.finish(drained_by))
@@ -323,17 +336,25 @@ impl Agent {
             let mut log = log
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if reaped {
-                writeln!(
+            match reaped {
+                Reaped::Empty => {}
+                Reaped::Stopped => writeln!(
                     log,
-                    "=== note: the CLI exited leaving processes behind; its process group was killed ==="
-                )?;
+                    "=== note: the CLI left processes behind; its process group was killed ==="
+                )?,
+                Reaped::Lingering => writeln!(
+                    log,
+                    "=== note: the CLI left processes behind that survived SIGKILL ==="
+                )?,
             }
             match end {
                 End::Exited(status) => writeln!(log, "=== exit: {status} ===")?,
                 End::Interrupted => writeln!(log, "=== interrupted ===")?,
                 End::TimedOut => writeln!(log, "=== timed out ===")?,
             }
+        }
+        if reaped == Reaped::Lingering {
+            return Err(AgentError::Lingering { group: child.id() });
         }
         match (end, deadline) {
             (End::Exited(_), _) => cli.driver.interpret(&output, &request),
@@ -356,7 +377,8 @@ enum End {
 
 /// Wait for the child until it exits; on interrupt, or once `deadline`
 /// passes, stop its whole process group (TERM, then KILL after a grace
-/// period).
+/// period) until the leader is gone. Members that outlive the leader are
+/// [`reap_group`]'s to stop.
 fn wait(
     child: &mut Child,
     interrupt: &Interrupt,
@@ -378,8 +400,6 @@ fn wait(
         let grace = Instant::now() + TERMINATION_GRACE;
         while Instant::now() < grace {
             if child.try_wait()?.is_some() {
-                // The leader went, but members ignoring TERM may not have.
-                signal_group(child.id(), "-KILL");
                 return Ok(end);
             }
             thread::sleep(Duration::from_millis(100));
@@ -404,22 +424,50 @@ fn signal_group(pid: u32, signal: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// What [`reap_group`] found of a process group whose leader is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reaped {
+    /// Nothing was left of it.
+    Empty,
+    /// Members were left; they are gone now.
+    Stopped,
+    /// Members were left, and some survived SIGKILL for [`KILL_GRACE`].
+    Lingering,
+}
+
 /// Stop whatever is left of the process group led by the exited CLI `pid`
-/// (TERM, then KILL after a grace period), so background children cannot
-/// hold its pipes open. `true` when there was something to stop.
-fn reap_group(pid: u32) -> bool {
+/// (TERM, then KILL after a grace period), and wait until no member is left,
+/// so background children can neither hold its pipes open nor keep working
+/// in its directory once the attempt is over.
+fn reap_group(pid: u32) -> Reaped {
     if !signal_group(pid, "-TERM") {
-        return false;
+        return Reaped::Empty;
     }
-    let grace = Instant::now() + LEFTOVER_GRACE;
-    while Instant::now() < grace {
+    if vanishes(pid, LEFTOVER_GRACE) {
+        return Reaped::Stopped;
+    }
+    signal_group(pid, "-KILL");
+    if vanishes(pid, KILL_GRACE) {
+        Reaped::Stopped
+    } else {
+        Reaped::Lingering
+    }
+}
+
+/// Whether the process group led by `pid` has no member left by `grace`
+/// from now. A killed member stays a member until its parent reaps it,
+/// so this also waits for that.
+fn vanishes(pid: u32, grace: Duration) -> bool {
+    let by = Instant::now() + grace;
+    loop {
         if !signal_group(pid, "-0") {
             return true;
         }
+        if Instant::now() >= by {
+            return false;
+        }
         thread::sleep(Duration::from_millis(50));
     }
-    signal_group(pid, "-KILL");
-    true
 }
 
 /// Join `handle` if its thread finishes by `deadline`; otherwise leave it
@@ -803,6 +851,157 @@ replicas = 1
             thread::sleep(Duration::from_millis(50));
         }
         assert!(!alive(), "background child {} survived", sleeper.trim());
+    }
+
+    /// Write a CLI script into `dir` whose background child ignores TERM
+    /// and holds the CLI's stdout open, while the CLI itself waits in the
+    /// foreground until it is stopped. `member` receives the child's pid and,
+    /// on the next line, the CLI's own: the process group they share.
+    fn stubborn_cli(dir: &Path, member: &Path) -> std::path::PathBuf {
+        let script = dir.join("stubborn.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "(trap '' TERM; exec sleep 60) &\n\
+                 printf '%s\\n%s\\n' $! $$ > {m}.tmp\n\
+                 mv {m}.tmp {m}\n\
+                 sleep 30\n",
+                m = member.display()
+            ),
+        )
+        .expect("script");
+        script
+    }
+
+    /// Whether `target` exists: a pid, or `-pid` for any member of that
+    /// process group (a zombie not reaped yet included).
+    fn exists(target: &str) -> bool {
+        Command::new("kill")
+            .args(["-0", "--", target])
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill")
+            .success()
+    }
+
+    #[test]
+    fn a_timed_out_cli_is_reaped_before_the_next_cli_starts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("run.log");
+        let member = dir.path().join("member");
+        let stubborn = stubborn_cli(dir.path(), &member);
+        // The next CLI reports, as it starts, whether anything of the
+        // timed-out CLI's process group (the member it left behind, even
+        // as a zombie) is still there.
+        let probe = dir.path().join("probe.sh");
+        std::fs::write(
+            &probe,
+            format!(
+                "if [ -f {m} ]; then\n\
+                 \x20 group=$(sed -n 2p {m}); rm {m}\n\
+                 \x20 if kill -0 -- \"-$group\" 2>/dev/null; then a=true; else a=false; fi\n\
+                 \x20 echo \"{{\\\"alive\\\":$a}}\"\n\
+                 else\n\
+                 \x20 echo '{{\"alive\":null}}'\n\
+                 fi\n",
+                m = member.display()
+            ),
+        )
+        .expect("probe");
+        let routed = agent(&format!(
+            r#"
+[agent.a]
+role = "planning"
+driver = "generic"
+command = ["sh", "{}"]
+replicas = 1
+timeout = 1
+
+[[agent.a.alternative]]
+driver = "generic"
+command = ["sh", "{}"]
+"#,
+            stubborn.display(),
+            probe.display()
+        ));
+        let mut fell_over = 0;
+        // Routing alternates the first CLI, so one of two starts at it.
+        for _ in 0..2 {
+            let run = invoke(&routed, &log).expect("run");
+            if let Some(alive) = run.response["alive"].as_bool() {
+                assert!(!alive, "the next CLI started beside the timed-out group");
+                let text = std::fs::read_to_string(&log).expect("log");
+                assert!(text.contains("generic failed: agent timed out"), "{text}");
+                assert!(text.contains("its process group was killed"), "{text}");
+                fell_over += 1;
+            }
+        }
+        assert_eq!(fell_over, 1, "no invocation fell over from the timeout");
+    }
+
+    #[test]
+    fn an_interrupted_cli_is_reaped_before_the_invocation_returns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("run.log");
+        let member = dir.path().join("member");
+        let stubborn = stubborn_cli(dir.path(), &member);
+        let agent = agent(&format!(
+            r#"
+[agent.a]
+role = "planning"
+driver = "generic"
+command = ["sh", "{}"]
+replicas = 1
+"#,
+            stubborn.display()
+        ));
+        let interrupt = Interrupt::default();
+        let raiser = {
+            let interrupt = interrupt.clone();
+            let member = member.clone();
+            thread::spawn(move || {
+                let by = Instant::now() + Duration::from_secs(10);
+                while !member.exists() && Instant::now() < by {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                interrupt.raise();
+            })
+        };
+        let prompt = Prompt::from("p");
+        let schema = serde_json::json!({});
+        let started = Instant::now();
+        let error = agent
+            .invoke::<serde_json::Value>(&Invocation {
+                directory: dir.path(),
+                prompt: &prompt,
+                response_schema: &schema,
+                facts: &[],
+                log: &log,
+                interrupt: &interrupt,
+                restore: None,
+            })
+            .expect_err("interrupted");
+        raiser.join().expect("raiser");
+        assert!(matches!(error, AgentError::Interrupted), "{error:?}");
+        // Gone by the time the invocation returns, not some time after:
+        // whoever takes the work over may start on the directory at once.
+        let pids = std::fs::read_to_string(&member).expect("pids");
+        let (pid, group) = pids.trim().split_once('\n').expect("two pids");
+        assert!(!exists(pid), "member {pid} outlived the invocation");
+        assert!(
+            !exists(&format!("-{group}")),
+            "process group {group} outlived the invocation"
+        );
+        // The member held stdout, yet the output was not waited on for
+        // the drain grace.
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "{:?}",
+            started.elapsed()
+        );
+        let text = std::fs::read_to_string(&log).expect("log");
+        assert!(text.contains("=== interrupted ==="), "{text}");
+        assert!(text.contains("its process group was killed"), "{text}");
     }
 
     fn agent_text_all_failing() -> String {
