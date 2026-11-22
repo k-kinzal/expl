@@ -248,17 +248,27 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     } else {
         prompt(reaction, Some(&step), &goals, &tree, &schema)
     };
-    let requested_goals: &[Node] = if failed { &[] } else { &goals };
+    // A failed step is judged by its conclusion alone: verdicts it was not
+    // asked for are set aside rather than a reason to ask again.
     let response = reaction.invoke_read_only_validated(
         graph,
         Some(id),
         &scratch,
         &prompt,
         &schema,
-        |response: &Response| response.validate(requested_goals.iter().map(|goal| goal.id)),
+        |response: &Response| {
+            if failed {
+                Ok(())
+            } else {
+                response.validate(goals.iter().map(|goal| goal.id))
+            }
+        },
     )?;
     drop(scratch);
     let mut evaluations = response.evaluations;
+    if failed {
+        evaluations.clear();
+    }
     let Some(conclusion) = response.conclusion else {
         // No conclusion given: the verdicts alone, as before conclusions.
         graph.record_evaluations(id, &evaluations)?;
