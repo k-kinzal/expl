@@ -18,7 +18,7 @@ pub(crate) fn init(start: &Path, args: &InitArgs) -> Result<(), CliError> {
             project.root().display()
         )));
     }
-    let git = Git::new(project.root());
+    let git = Git::in_worktree(project.root());
     let base = git.resolve_commit(&args.base).map_err(|_| {
         CliError::Usage(format!(
             "`{}` does not name a commit (expl needs at least one commit to start from)",
