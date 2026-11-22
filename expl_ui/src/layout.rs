@@ -5,7 +5,15 @@
 //!   deepest step: they are where everything heads.
 //! - Within a column nodes are ordered by the mean row of their
 //!   predecessors (one barycentre sweep), which keeps most edges short and
-//!   uncrossed without a full crossing-minimisation pass.
+//!   uncrossed without a full crossing-minimisation pass. Nodes that tie —
+//!   typically many steps built on the same node — are ordered by
+//!   importance from the middle outwards: running, completed and failed
+//!   work, then planned steps by priority, then proposals, and pruned steps
+//!   at the edges.
+//! - **Tall columns fold.** A column with more than [`FOLD_ROWS`] nodes is
+//!   laid out in several lanes side by side, filled row by row so the
+//!   vertical order is kept, which turns a long line of siblings into a
+//!   roughly square block. Columns further right move over to make room.
 //! - Columns are centred vertically on row `0`, so rows are fractional.
 //! - **The trunk is a straight line.** Every origin sits on row `0`; since
 //!   each origin builds on the previous one and on what it adopted, origins
@@ -16,15 +24,25 @@
 //! The layout is pure and deterministic: the same graph always draws the
 //! same way, so nodes only move when the graph changes.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 
-use expl_core::{Edge, Node, NodeId, NodeKind};
+use expl_core::{Edge, Node, NodeId, NodeKind, NodeStatus};
+
+/// Most rows a column takes before it folds into lanes.
+pub(crate) const FOLD_ROWS: usize = 16;
+
+/// Horizontal distance between the lanes of a folded column, in columns.
+pub(crate) const LANE: f32 = 0.35;
 
 /// A node's place in the drawing: column and (centred) row.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Slot {
-    /// Column, from the left.
+    /// Column (layer), from the left.
     pub(crate) column: usize,
+    /// Horizontal position, in columns from the left edge: the column's
+    /// start plus its lane in a folded column.
+    pub(crate) x: f32,
     /// Row; columns are centred on `0`.
     pub(crate) row: f32,
 }
@@ -36,7 +54,9 @@ pub(crate) struct Layout {
     pub(crate) slots: HashMap<NodeId, Slot>,
     /// Number of columns.
     pub(crate) columns: usize,
-    /// Rows in the tallest column.
+    /// Horizontal extent: the largest `x` of any slot.
+    pub(crate) width: f32,
+    /// Rows in the tallest column (after folding).
     pub(crate) rows: usize,
 }
 
@@ -44,6 +64,7 @@ impl Layout {
     /// Lay out `nodes` connected by `edges`.
     #[must_use]
     pub(crate) fn of(nodes: &[Node], edges: &[Edge]) -> Self {
+        let by_id: HashMap<NodeId, &Node> = nodes.iter().map(|n| (n.id, n)).collect();
         let kinds: HashMap<NodeId, NodeKind> = nodes.iter().map(|n| (n.id, n.kind)).collect();
         let mut preds: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
         for edge in edges {
@@ -80,11 +101,24 @@ impl Layout {
 
         let mut slots: HashMap<NodeId, Slot> = HashMap::new();
         let mut rows = 0;
+        let mut x = 0.0_f32;
+        let mut previous: Option<usize> = None;
+        let mut width = 0.0_f32;
         for (&column, ids) in &mut columns {
+            // Empty layers in between (none today) still take their room.
+            if let Some(previous) = previous {
+                x += index_as_f32(column - previous - 1);
+            }
+            previous = Some(column);
+            let bary: HashMap<NodeId, f32> = ids
+                .iter()
+                .map(|id| (*id, barycentre(*id, &preds, &slots)))
+                .collect();
             ids.sort_by(|a, b| {
-                let ka = barycentre(*a, &preds, &slots);
-                let kb = barycentre(*b, &preds, &slots);
-                ka.total_cmp(&kb).then(a.cmp(b))
+                bary[a]
+                    .total_cmp(&bary[b])
+                    .then_with(|| importance(by_id[a]).cmp(&importance(by_id[b])))
+                    .then(a.cmp(b))
             });
             let origin = ids
                 .iter()
@@ -92,42 +126,132 @@ impl Layout {
             let mut others: Vec<NodeId> = ids.clone();
             if let Some(index) = origin {
                 let id = others.remove(index);
-                slots.insert(id, Slot { column, row: 0.0 });
+                slots.insert(
+                    id,
+                    Slot {
+                        column,
+                        x,
+                        row: 0.0,
+                    },
+                );
             }
+            let others = centre_out_ties(&others, &bary);
+            let lanes = lanes_for(others.len());
             let keep_clear = origin.is_some() || trunk_end.is_some_and(|end| column < end);
-            if keep_clear {
-                // Half above the trunk line, half below, in barycentre order.
-                let above = others.len() / 2;
-                for (index, id) in others.iter().enumerate() {
-                    let row = if index < above {
-                        index_as_f32(index) - index_as_f32(above)
-                    } else {
-                        index_as_f32(index - above + 1)
-                    };
-                    slots.insert(*id, Slot { column, row });
-                }
-                rows = rows.max(2 * (others.len() - above) + 1);
+            let placed = if keep_clear {
+                split(others.len(), lanes)
             } else {
-                let centre = centre_of(others.len());
-                for (index, id) in others.iter().enumerate() {
-                    slots.insert(
-                        *id,
-                        Slot {
-                            column,
-                            row: index_as_f32(index) - centre,
-                        },
-                    );
-                }
-                rows = rows.max(others.len());
+                centred(others.len(), lanes)
+            };
+            for (id, (lane, row)) in others.iter().zip(placed) {
+                let at = x + index_as_f32(lane) * LANE;
+                width = width.max(at);
+                slots.insert(*id, Slot { column, x: at, row });
             }
+            let tallest = if keep_clear {
+                let below = others.len() - others.len() / 2;
+                2 * below.div_ceil(lanes) + 1
+            } else {
+                others.len().div_ceil(lanes)
+            };
+            rows = rows.max(tallest);
+            x += index_as_f32(lanes - 1) * LANE + 1.0;
         }
 
         Self {
             columns: columns.keys().next_back().map_or(0, |c| c + 1),
+            width,
             slots,
             rows,
         }
     }
+}
+
+/// How prominently a node is placed among nodes that tie on barycentre:
+/// smaller sits nearer the middle.
+fn importance(node: &Node) -> (u8, Reverse<i64>) {
+    let class = match node.status {
+        NodeStatus::Running => 0,
+        NodeStatus::Completed => 1,
+        NodeStatus::Failed => 2,
+        NodeStatus::Planned => 3,
+        NodeStatus::Proposed => 4,
+        NodeStatus::Pruned => 6,
+        NodeStatus::Active | NodeStatus::Superseded => 5,
+    };
+    (class, Reverse(node.priority))
+}
+
+/// Reorder every run of nodes with the same barycentre (already sorted by
+/// importance) so the most important sits in the run's middle and the
+/// rest alternate outwards.
+fn centre_out_ties(ids: &[NodeId], bary: &HashMap<NodeId, f32>) -> Vec<NodeId> {
+    let mut out = Vec::with_capacity(ids.len());
+    let mut start = 0;
+    while start < ids.len() {
+        let key = bary[&ids[start]];
+        let end = ids[start..]
+            .iter()
+            .position(|id| bary[id].total_cmp(&key).is_ne())
+            .map_or(ids.len(), |n| start + n);
+        let run = &ids[start..end];
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        for (rank, id) in run.iter().enumerate() {
+            if rank % 2 == 0 {
+                right.push(*id);
+            } else {
+                left.push(*id);
+            }
+        }
+        out.extend(left.into_iter().rev());
+        out.extend(right);
+        start = end;
+    }
+    out
+}
+
+/// Lanes for a column of `len` nodes: one up to [`FOLD_ROWS`], else enough
+/// for a roughly square block of at least [`FOLD_ROWS`] rows.
+fn lanes_for(len: usize) -> usize {
+    if len <= FOLD_ROWS {
+        return 1;
+    }
+    let mut rows = FOLD_ROWS;
+    // Rows ≈ √(1.5 · len): lanes are narrower than columns, so a block of
+    // as many rows as lanes would look tall.
+    while rows * rows * 2 < len * 3 {
+        rows += 1;
+    }
+    len.div_ceil(rows)
+}
+
+/// `(lane, row)` of `len` nodes in `lanes`, filled row by row and centred
+/// on row `0`.
+fn centred(len: usize, lanes: usize) -> Vec<(usize, f32)> {
+    let centre = centre_of(len.div_ceil(lanes));
+    (0..len)
+        .map(|i| (i % lanes, index_as_f32(i / lanes) - centre))
+        .collect()
+}
+
+/// `(lane, row)` of `len` nodes in `lanes`, half above the trunk line and
+/// half below, row `0` left free. Rows fill outwards from the line, so a
+/// partly filled row is the outermost one.
+fn split(len: usize, lanes: usize) -> Vec<(usize, f32)> {
+    let above = len / 2;
+    let mut placed = Vec::with_capacity(len);
+    for i in 0..above {
+        // Distance from the line, in the order the nodes come.
+        let from_line = above - 1 - i;
+        placed.push((
+            lanes - 1 - from_line % lanes,
+            -index_as_f32(from_line / lanes + 1),
+        ));
+    }
+    for i in 0..len - above {
+        placed.push((i % lanes, index_as_f32(i / lanes + 1)));
+    }
+    placed
 }
 
 fn depth_of(
@@ -248,17 +372,18 @@ mod tests {
         ];
         let edges = [edge(1, 2), edge(1, 3), edge(1, 4)];
         let layout = Layout::of(&nodes, &edges);
-        let rows: Vec<f32> = [2, 3, 4]
+        let mut rows: Vec<f32> = [2, 3, 4]
             .iter()
             .map(|id| layout.slots[&NodeId(*id)].row)
             .collect();
+        rows.sort_by(f32::total_cmp);
         assert_eq!(rows, vec![-1.0, 0.0, 1.0]);
         assert!(layout.slots[&NodeId(1)].row.abs() < f32::EPSILON);
     }
 
     #[test]
     fn children_follow_their_parents_order() {
-        // origin → 2, 3; 3 → 4; 2 → 5. Column 2 should list 5 before 4.
+        // origin → 2, 3; 3 → 4; 2 → 5. Column 2 keeps column 1's order.
         let nodes = [
             node(1, NodeKind::Origin),
             node(2, NodeKind::Step),
@@ -268,7 +393,8 @@ mod tests {
         ];
         let edges = [edge(1, 2), edge(1, 3), edge(3, 4), edge(2, 5)];
         let layout = Layout::of(&nodes, &edges);
-        assert!(layout.slots[&NodeId(5)].row < layout.slots[&NodeId(4)].row);
+        let row = |id| layout.slots[&NodeId(id)].row;
+        assert_eq!(row(5) < row(4), row(2) < row(3));
     }
 
     #[test]
@@ -306,6 +432,62 @@ mod tests {
         // Past the current origin, its children are centred on it.
         assert!((slot(7).row + slot(8).row).abs() < f32::EPSILON);
         assert_eq!(slot(2).column, 5);
+    }
+
+    #[test]
+    fn a_tall_column_folds_into_a_block_keeping_the_layers_apart() {
+        // 40 steps on the origin, and one more step after the first of them.
+        let mut nodes = vec![node(1, NodeKind::Origin)];
+        let mut edges = Vec::new();
+        for id in 2..42 {
+            nodes.push(node(id, NodeKind::Step));
+            edges.push(edge(1, id));
+        }
+        nodes.push(node(42, NodeKind::Step));
+        edges.push(edge(2, 42));
+        let layout = Layout::of(&nodes, &edges);
+        let slot = |id| layout.slots[&NodeId(id)];
+        let xs: std::collections::BTreeSet<u32> = (2..42)
+            .map(|id| (slot(id).x * 100.0).round() as u32)
+            .collect();
+        assert!(xs.len() > 1, "the column folds into lanes: {xs:?}");
+        assert!(layout.rows <= FOLD_ROWS, "{} rows", layout.rows);
+        let block_end = (2..42).map(|id| slot(id).x).fold(0.0_f32, f32::max);
+        assert!(
+            slot(42).x >= block_end + 1.0 - f32::EPSILON,
+            "the next layer starts after the block"
+        );
+        assert!((layout.width - slot(42).x).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn siblings_are_ordered_by_importance_from_the_middle_out() {
+        // Five steps on one origin: the running one in the middle, the
+        // pruned one at an edge, higher priority nearer the middle.
+        let mut nodes = vec![node(1, NodeKind::Origin)];
+        let statuses = [
+            (2, NodeStatus::Pruned, 0),
+            (3, NodeStatus::Planned, 5),
+            (4, NodeStatus::Running, 0),
+            (5, NodeStatus::Planned, 50),
+            (6, NodeStatus::Proposed, 0),
+        ];
+        for (id, status, priority) in statuses {
+            let mut step = node(id, NodeKind::Step);
+            step.status = status;
+            step.priority = priority;
+            nodes.push(step);
+        }
+        let edges: Vec<Edge> = (2..7).map(|id| edge(1, id)).collect();
+        let layout = Layout::of(&nodes, &edges);
+        let distance = |id| layout.slots[&NodeId(id)].row.abs();
+        assert!(distance(4) < f32::EPSILON, "running in the middle");
+        assert!(distance(5) <= distance(3), "priority 50 nearer than 5");
+        assert!(distance(3) <= distance(6), "planned nearer than proposed");
+        assert!(
+            (2..7).all(|id| distance(2) >= distance(id)),
+            "pruned at an edge"
+        );
     }
 
     #[test]

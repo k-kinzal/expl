@@ -213,7 +213,7 @@ impl ExplView {
     /// before panning: centred while the graph fits, else right-aligned so
     /// the present and the goals stay in view.
     fn anchor(&self, zoom: f32, viewport: Size<Pixels>) -> Point<Pixels> {
-        let span = small_f32(self.layout.columns.saturating_sub(1)) * COLUMN_STRIDE * zoom;
+        let span = self.layout.width * COLUMN_STRIDE * zoom;
         let width = f32::from(viewport.width);
         let left = if span + 2.0 * MARGIN <= width {
             (width - span) / 2.0
@@ -227,7 +227,7 @@ impl ExplView {
     fn centre(&self, id: NodeId, viewport: Size<Pixels>) -> Option<Point<Pixels>> {
         let slot = self.layout.slots.get(&id)?;
         let offset = point(
-            px(small_f32(slot.column) * COLUMN_STRIDE * self.zoom),
+            px(slot.x * COLUMN_STRIDE * self.zoom),
             px(slot.row * ROW_STRIDE * self.zoom),
         );
         Some(self.anchor(self.zoom, viewport) + offset + self.pan)
@@ -246,7 +246,7 @@ impl ExplView {
     fn fit(&mut self, viewport: Size<Pixels>) {
         let rows = self.layout.slots.values().map(|slot| slot.row);
         let (top, bottom) = rows.fold((0.0_f32, 0.0_f32), |(lo, hi), r| (lo.min(r), hi.max(r)));
-        let span_x = small_f32(self.layout.columns.saturating_sub(1)) * COLUMN_STRIDE;
+        let span_x = self.layout.width * COLUMN_STRIDE;
         let span_y = (bottom - top) * ROW_STRIDE;
         let room_x = (f32::from(viewport.width) - 2.0 * FIT_INSET_X).max(1.0);
         let room_y = (f32::from(viewport.height) - 2.0 * FIT_INSET_Y).max(1.0);
