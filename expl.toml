@@ -55,8 +55,10 @@ instructions = """
 AGENTS.md describes the vision and architecture. Enumerate the directions that look most
 promising for moving expl toward the goal: different mechanisms, different parts of the
 system, different trade-offs.
-Every step must change Rust code, tests, or configuration. Markdown files (*.md) are
-frozen: never propose a step whose purpose is to add, edit, or delete a .md file.
+Every step must be a change to Rust code, tests, or configuration, or an investigation that
+answers a question about the code or its behaviour (does a premise hold, why did a step fail,
+what would a change affect). Markdown files (*.md) are frozen: never propose a step whose
+purpose is to add, edit, or delete a .md file.
 """
 
 [[agent.explorer.alternative]]
@@ -82,7 +84,9 @@ purpose — what a mainstream search toward the goal would never propose:
 - counterexamples: changes that look plausible but would work against the goal. Say in the
   objective which part of the goal they would harm and how evaluating them would show it.
 Start each title with "Fringe:" or "Counterexample:". Every step must still be a concrete,
-verifiable change to Rust code, tests, or configuration. Markdown files (*.md) are frozen:
+verifiable change to Rust code, tests, or configuration, or an investigation that answers a
+question about the code (for example, whether a design assumption actually holds). Markdown
+files (*.md) are frozen:
 never propose a step whose purpose is to add, edit, or delete a .md file.
 """
 
@@ -151,8 +155,9 @@ This repository is expl itself (Rust workspace: expl_core, expl_cli, expl_ui). F
 keep its nouns and responsibilities, document public items, keep errors typed (thiserror).
 Markdown files (*.md) are frozen: do not add, modify, or delete any .md file, even if the task
 seems to ask for it.
-Before finishing, `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` must pass;
-report succeeded=false if they do not.
+For a change: before finishing, `cargo fmt`, `cargo clippy --all-targets`, and `cargo test`
+must pass; report succeeded=false if they do not. For an investigation (a question to answer):
+change nothing, and back the answer with evidence from the code, builds, or tests you ran.
 """
 
 [agent.evaluator]
@@ -165,8 +170,10 @@ args = ["--permission-mode", "bypassPermissions"]
 env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target-evaluator" }
 replicas = 1
 instructions = """
-Run `cargo clippy --all-targets` and `cargo test`. A goal is never satisfied by a branch on
-which either fails. A branch that adds, modifies, or deletes any Markdown (*.md) file satisfies
+For a change: run `cargo clippy --all-targets` and `cargo test`. A goal is never satisfied by a
+branch on which either fails. For an investigation: there is nothing to build; check that the
+evidence holds against the code in the working directory, and judge whether the findings settle
+the goal. A branch that adds, modifies, or deletes any Markdown (*.md) file satisfies
 no goal: check with `git diff --name-only "$(git merge-base HEAD main)" HEAD -- '*.md'`, which
 must print nothing. Judge naming and responsibilities against AGENTS.md as part of quality.
 """
