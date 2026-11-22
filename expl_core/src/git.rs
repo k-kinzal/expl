@@ -201,8 +201,20 @@ impl Git {
     /// [`GitError`] when git cannot start or fails other than by finding
     /// HEAD detached.
     pub fn head_ref(&self) -> Result<Option<String>, GitError> {
-        let args = ["symbolic-ref", "-q", "HEAD"];
-        let output = self.output(&args)?;
+        self.read_symbolic_ref(&["symbolic-ref", "-q", "HEAD"])
+    }
+
+    /// The immediate target of `reference`, even when the target is
+    /// missing. Returns `None` when `reference` is absent or direct.
+    ///
+    /// # Errors
+    /// [`GitError`] when git cannot start or exits with an unexpected code.
+    pub(crate) fn symbolic_ref_target(&self, reference: &str) -> Result<Option<String>, GitError> {
+        self.read_symbolic_ref(&["symbolic-ref", "-q", "--no-recurse", reference])
+    }
+
+    fn read_symbolic_ref(&self, args: &[&str]) -> Result<Option<String>, GitError> {
+        let output = self.output(args)?;
         match output.status.code() {
             Some(0) => Ok(Some(
                 String::from_utf8_lossy(&output.stdout).trim().to_owned(),
