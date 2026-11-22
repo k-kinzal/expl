@@ -770,6 +770,54 @@ mod tests {
     }
 
     #[test]
+    fn execution_commits_without_resolving_a_dangling_symbolic_trunk() {
+        let mut held = held_step();
+        let mut declaration = held.context.declaration().clone();
+        declaration.trunk = Some("trunk".to_owned());
+        held.context = Context::new(held.context.project().clone(), declaration);
+        let git = Git::new(held.context.project().root());
+        let trunk = "refs/heads/trunk";
+        let target = format!("refs/heads/{}", Workspaces::branch_name(held.step));
+        git.run(&["symbolic-ref", trunk, &target])
+            .expect("trunk ref");
+        assert!(git.resolve_commit(trunk).is_err());
+
+        let agent = held.context.agent("executor").expect("agent");
+        let reaction = Reaction::new(
+            &held.context,
+            &agent,
+            held.holder,
+            &held.delivery,
+            &held.interrupt,
+        );
+        let Report::Execution(report) = react(&reaction, &mut held.graph).expect("reaction") else {
+            panic!("expected an execution report");
+        };
+
+        assert_eq!(report.status, NodeStatus::Completed, "{}", report.summary);
+        let commit = report.head_commit.expect("committed step");
+        assert_eq!(
+            git.run(&["show", &format!("{commit}:old.txt")])
+                .expect("committed file"),
+            "old"
+        );
+        assert_eq!(
+            git.run(&["symbolic-ref", trunk]).expect("trunk target"),
+            target
+        );
+        assert!(
+            git.resolve_commit(trunk).is_err(),
+            "trunk is still dangling"
+        );
+        assert_eq!(report.branch, Workspaces::branch_candidate(held.step, 2));
+        assert_eq!(
+            git.resolve_commit(&format!("refs/heads/{}", report.branch))
+                .expect("step branch tip"),
+            commit
+        );
+    }
+
+    #[test]
     #[ignore = "window: a takeover between the lease check after the agent returns and \
                 `workspace.commit` lets the old holder fail the step the new holder is running \
                 (`node.failed` and its outcome, as its worktree path is the new holder's \

@@ -1,6 +1,6 @@
 //! [`Workspaces`], [`Workspace`], and [`ScratchWorkspace`].
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -160,9 +160,10 @@ impl Workspaces {
     /// each created only if no ref is in its way, and one that git reports
     /// taken — by an earlier attempt of the step, an unrelated branch, or
     /// the trunk — is passed over for the next. Names among the `trunk`
-    /// branches ([`Trunk::branches`](crate::trunk::Trunk::branches)) are
-    /// passed over even while they do not exist. No existing ref is ever
-    /// replaced or deleted; the name taken is [`Workspace::branch`].
+    /// branches ([`Trunk::branches`](crate::trunk::Trunk::branches)) and
+    /// their symbolic ref targets are passed over even when missing. No
+    /// existing ref is ever replaced or deleted; the name taken is
+    /// [`Workspace::branch`].
     ///
     /// # Errors
     ///
@@ -379,21 +380,36 @@ impl Workspaces {
     /// name is created only if it does not exist (`git branch` without
     /// `--force`); when git refuses because a ref is in the way, the next
     /// name is tried — unless the ref is at a parent path (`expl`), which
-    /// every name shares. Names among `trunk` are never created.
+    /// every name shares. Names among `trunk` and their symbolic ref
+    /// targets are reserved.
     fn allocate_branch_locked(
         &self,
         node: NodeId,
         base: &str,
         trunk: &[String],
     ) -> Result<String, WorkspaceError> {
+        let mut reserved = HashSet::new();
+        for name in trunk {
+            let mut reference = if name.starts_with("refs/heads/") {
+                name.clone()
+            } else {
+                format!("refs/heads/{name}")
+            };
+            // Even an intermediate symbolic ref can update the final
+            // target when git creates a branch through it.
+            while reserved.insert(reference.clone()) {
+                let Some(target) = self.repository.symbolic_ref_target(&reference)? else {
+                    break;
+                };
+                reference = target;
+            }
+        }
+
         let mut tried = 0;
         for attempt in 1..=BRANCH_ATTEMPTS {
             tried = attempt;
             let branch = Self::branch_candidate(node, attempt);
-            if trunk
-                .iter()
-                .any(|t| t.strip_prefix("refs/heads/").unwrap_or(t) == branch)
-            {
+            if reserved.contains(&format!("refs/heads/{branch}")) {
                 continue;
             }
             match self
@@ -883,8 +899,6 @@ mod tests {
         let commit = fx.occupy(&target);
         git(&fx.root, &["symbolic-ref", "refs/heads/trunk", &target_ref]);
 
-        // Only the symref's name is declared: the target is passed over
-        // because it exists, not because it is listed.
         let workspace = fx.create(&["trunk".to_owned()]).expect("create");
         assert_eq!(workspace.branch(), Workspaces::branch_candidate(fx.step, 2));
         assert_eq!(
@@ -893,6 +907,43 @@ mod tests {
         );
         assert_eq!(fx.tip("trunk"), commit);
         assert_eq!(fx.tip(&target), commit);
+    }
+
+    #[test]
+    fn create_leaves_a_dangling_symbolic_trunk_unresolved() {
+        let fx = Fixture::new();
+        let target = Workspaces::branch_name(fx.step);
+        let target_ref = format!("refs/heads/{target}");
+        let trunk = "refs/heads/trunk";
+        git(&fx.root, &["symbolic-ref", trunk, &target_ref]);
+
+        let workspace = fx.create(&[trunk.to_owned()]).expect("create");
+
+        assert_eq!(workspace.branch(), Workspaces::branch_candidate(fx.step, 2));
+        assert!(!fx.has_branch(&target), "the target is still uncreated");
+        assert_eq!(git(&fx.root, &["symbolic-ref", trunk]), target_ref);
+        assert!(Git::new(&fx.root).resolve_commit(trunk).is_err());
+    }
+
+    #[test]
+    fn create_passes_over_every_ref_in_a_symbolic_trunk_chain() {
+        let fx = Fixture::new();
+        let first = format!("refs/heads/{}", Workspaces::branch_name(fx.step));
+        let second = Workspaces::branch_candidate(fx.step, 2);
+        let target_ref = format!("refs/heads/{second}");
+        let trunk = "refs/heads/trunk";
+        git(&fx.root, &["symbolic-ref", trunk, &first]);
+        git(&fx.root, &["symbolic-ref", &first, &target_ref]);
+
+        let workspace = fx.create(&["trunk".to_owned()]).expect("create");
+
+        assert_eq!(workspace.branch(), Workspaces::branch_candidate(fx.step, 3));
+        assert!(!fx.has_branch(&second), "the target is still uncreated");
+        assert_eq!(
+            git(&fx.root, &["symbolic-ref", "--no-recurse", trunk]),
+            first
+        );
+        assert_eq!(git(&fx.root, &["symbolic-ref", trunk]), target_ref);
     }
 
     #[test]
