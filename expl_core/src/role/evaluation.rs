@@ -367,7 +367,9 @@ impl StepUnderJudgment<'_> {
         let failed = node.status == NodeStatus::Failed;
         let mut out = format!(
             "## The step\n\n{id} — {title}\n\nObjective: {objective}\n\n\
-             It {how}. Its executor reported:\n\n{report}\n\n",
+             It {how}. Its executor reported (before the work was committed, which may be \
+             why the report calls its changes uncommitted; that is expected, not a fault):\n\n\
+             {report}\n\n",
             id = node.id,
             title = node.title,
             objective = node.objective.trim(),
