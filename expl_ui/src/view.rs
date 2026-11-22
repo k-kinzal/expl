@@ -51,9 +51,9 @@ use std::time::{Duration, Instant};
 
 use expl_core::{Epoch, Node, NodeId, NodeKind, NodeStatus, ProcessRecord, ProcessState, Project};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Context, ElementId, FocusHandle, Hsla, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
-    Point, Render, Rgba, ScrollWheelEvent, Size, Task, Window, canvas, div, point, prelude::*, px,
+    AnyElement, Context, FocusHandle, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Render, Rgba, ScrollWheelEvent, Size,
+    Task, Window, canvas, div, point, prelude::*, px,
 };
 
 use crate::layout::{Layout, Streams};
@@ -73,6 +73,8 @@ const DOT_BOX: f32 = 16.0;
 const LABEL_W: f32 = 172.0;
 /// One trip of the comet along an edge into a running step.
 const COMET: Duration = Duration::from_millis(1400);
+/// Time one ripple takes to spread.
+const RIPPLE: Duration = Duration::from_millis(1600);
 /// Time between frames while comets move: smooth enough for a slow comet,
 /// without redrawing every edge at the display's rate.
 const COMET_FRAME: Duration = Duration::from_millis(66);
@@ -91,7 +93,7 @@ const TRUNK_W: f32 = 320.0;
 const TRUNK_ROWS: usize = 6;
 /// Zoom range, the factor of one `+` / `-`, and the zoom below which only
 /// labels that matter are drawn.
-const MIN_ZOOM: f32 = 0.1;
+const MIN_ZOOM: f32 = 0.002;
 const MAX_ZOOM: f32 = 3.0;
 const ZOOM_STEP: f32 = 1.25;
 const QUIET_LABELS_BELOW: f32 = 0.55;
@@ -285,6 +287,11 @@ impl ExplView {
                     .into_any_element()
             })
             .collect()
+    }
+
+    /// How far through one ripple every ripple is now (0 to 1).
+    fn ripple_phase(&self) -> f32 {
+        (self.epoch.elapsed().as_secs_f32() / RIPPLE.as_secs_f32()).fract()
     }
 
     /// Zoom by `factor`, keeping the graph point under `at` where it is.
@@ -689,7 +696,6 @@ impl ExplView {
             }
         };
 
-        let id = node.id.0 as u64;
         div()
             .relative()
             .flex_none()
@@ -698,7 +704,7 @@ impl ExplView {
             .items_center()
             .justify_center()
             .when(node.status == NodeStatus::Running, |el| {
-                el.child(ripple(("ripple", id), DOT_BOX, 8.0, 26.0))
+                el.child(ripple(DOT_BOX, 8.0, 26.0, self.ripple_phase()))
             })
             .when(current, |el| {
                 el.child(ring(size + 8.0, theme::alpha(theme::text(), 0.6)))
@@ -1129,7 +1135,7 @@ impl ExplView {
                     .children(
                         processes
                             .into_iter()
-                            .map(|p| process_dot(p, busy.contains_key(&p.id))),
+                            .map(|p| process_dot(p, busy.contains_key(&p.id), self.ripple_phase())),
                     )
                     .children((0..missing).map(|_| {
                         div()
@@ -1162,8 +1168,16 @@ impl Render for ExplView {
                 shown.then(|| self.node(node, centre, &lens, cx))
             })
             .collect();
-        // Moving comets redraw at their own pace, not the display's.
-        if lines.iter().any(|line| line.comet) && self.ticking.is_none() {
+        // Moving comets and ripples redraw at their own pace, not the
+        // display's.
+        let animated = lines.iter().any(|line| line.comet)
+            || self
+                .snapshot
+                .nodes
+                .iter()
+                .any(|n| n.status == NodeStatus::Running)
+            || !self.snapshot.working_on().is_empty();
+        if animated && self.ticking.is_none() {
             self.ticking = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(COMET_FRAME).await;
                 this.update(cx, |view, cx| {
@@ -1356,32 +1370,30 @@ impl Row {
 
 /// A ring of light expanding from the centre of a `square`-sized box and
 /// fading out: the mark of work in progress, on nodes and agents alike.
-fn ripple(id: impl Into<ElementId>, square: f32, from: f32, to: f32) -> impl IntoElement {
+/// A ring spreading from `from` to `to` across a `square` box, `phase`
+/// (0 to 1) of the way through one ripple. The view redraws on its own
+/// tick while anything ripples ([`COMET_FRAME`]), not at the display's
+/// rate.
+fn ripple(square: f32, from: f32, to: f32, phase: f32) -> impl IntoElement {
+    let size = from + (to - from) * phase;
+    let offset = (square - size) / 2.0;
     div()
         .absolute()
         .rounded_full()
         .bg(theme::bright())
-        .with_animation(
-            id,
-            Animation::new(Duration::from_millis(1600)).repeat(),
-            move |el, delta| {
-                let size = from + (to - from) * delta;
-                let offset = (square - size) / 2.0;
-                el.size(px(size))
-                    .left(px(offset))
-                    .top(px(offset))
-                    .opacity(0.4 * (1.0 - delta))
-            },
-        )
+        .size(px(size))
+        .left(px(offset))
+        .top(px(offset))
+        .opacity(0.4 * (1.0 - phase))
 }
 
-fn process_dot(process: &ProcessRecord, busy: bool) -> AnyElement {
+fn process_dot(process: &ProcessRecord, busy: bool, phase: f32) -> AnyElement {
     let dot = div().size(px(6.0)).rounded_full();
     match process.state {
         ProcessState::Running if busy => div()
             .relative()
             .size(px(6.0))
-            .child(ripple(("process", process.id.0 as u64), 6.0, 6.0, 20.0))
+            .child(ripple(6.0, 6.0, 20.0, phase))
             .child(dot.bg(theme::bright()))
             .into_any_element(),
         ProcessState::Running => dot.bg(theme::quiet()).into_any_element(),
