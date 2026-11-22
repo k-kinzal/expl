@@ -335,7 +335,14 @@ fn investigate(
     if !finding.investigated {
         return fail(graph, node, "", None, finding.evidence);
     }
-    graph.record_finding(id, &code, finding.answer, &finding.evidence)?;
+    graph.record_finding(
+        id,
+        reaction.agent().name(),
+        reaction.delivery(),
+        &code,
+        finding.answer,
+        &finding.evidence,
+    )?;
     Ok(Report::Execution(ExecutionReport {
         node: id,
         status: NodeStatus::Completed,

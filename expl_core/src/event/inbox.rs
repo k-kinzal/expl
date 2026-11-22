@@ -61,10 +61,10 @@ pub enum InboxError {
     Sqlite(#[from] rusqlite::Error),
 }
 
-/// The delivery row of `event_id = ?2` is still leased under token `?3`.
-fn held() -> String {
-    "status = 'leased' AND lease_token = ?3".to_owned()
-}
+/// The delivery row of `event_id = ?2` is still leased under token `?3`. An
+/// expired lease remains valid until its token is replaced by a takeover,
+/// revoked by a conflicting lease, or settled.
+pub(crate) const HELD_LEASE: &str = "status = 'leased' AND lease_token = ?3";
 
 /// The deliveries of one agent. See the [module docs](crate::event).
 pub struct Inbox {
@@ -265,8 +265,7 @@ impl Inbox {
         let changed = self.conn.execute(
             &format!(
                 "UPDATE deliveries SET status = 'done', leased_until = NULL, lease_token = NULL, \
-                 note = ?4, updated_at = {NOW} WHERE agent = ?1 AND event_id = ?2 AND {held}",
-                held = held()
+                 note = ?4, updated_at = {NOW} WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE}"
             ),
             params![self.agent, delivery.event.id.0, delivery.token.0, note],
         )?;
@@ -296,8 +295,7 @@ impl Inbox {
         let holding: bool = tx.query_row(
             &format!(
                 "SELECT EXISTS (SELECT 1 FROM deliveries \
-                 WHERE agent = ?1 AND event_id = ?2 AND {held})",
-                held = held()
+                 WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE})"
             ),
             params![self.agent, delivery.event.id.0, delivery.token.0],
             |r| r.get(0),
@@ -341,8 +339,7 @@ impl Inbox {
             &format!(
                 "UPDATE deliveries SET status = 'pending', leased_until = NULL, \
                  lease_token = NULL, attempts = MAX(attempts - 1, 0), updated_at = {NOW} \
-                 WHERE agent = ?1 AND event_id = ?2 AND {held}",
-                held = held()
+                 WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE}"
             ),
             params![self.agent, delivery.event.id.0, delivery.token.0],
         )?;
@@ -369,8 +366,7 @@ impl Inbox {
                     "UPDATE deliveries SET \
                      status = CASE WHEN attempts < ?5 THEN 'pending' ELSE 'failed' END, \
                      leased_until = NULL, lease_token = NULL, note = ?4, updated_at = {NOW} \
-                     WHERE agent = ?1 AND event_id = ?2 AND {held} RETURNING status",
-                    held = held()
+                     WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE} RETURNING status"
                 ),
                 params![
                     self.agent,
@@ -400,8 +396,7 @@ impl Inbox {
             &format!(
                 "UPDATE deliveries SET status = 'failed', leased_until = NULL, \
                  lease_token = NULL, note = ?4, updated_at = {NOW} \
-                 WHERE agent = ?1 AND event_id = ?2 AND {held}",
-                held = held()
+                 WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE}"
             ),
             params![self.agent, delivery.event.id.0, delivery.token.0, error],
         )?;
@@ -488,8 +483,7 @@ impl Inbox {
         let changed = self.conn.execute(
             &format!(
                 "UPDATE deliveries SET leased_until = {EPOCH} + {LEASE_SECONDS} \
-                 WHERE agent = ?1 AND event_id = ?2 AND {held}",
-                held = held()
+                 WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE}"
             ),
             params![self.agent, delivery.event.id.0, delivery.token.0],
         )?;
