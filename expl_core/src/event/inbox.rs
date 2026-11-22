@@ -411,7 +411,10 @@ impl Inbox {
             return Ok(Vec::new());
         }
         let mut statement = self.conn.prepare(&format!(
-            "SELECT e.id, e.kind, e.node_id, e.created_at, d.attempts, d.lease_token \
+            // A lease taken before leases had tokens (schema 3) has none: it
+            // reads as the empty token, which `give_up_abandoned` matches.
+            "SELECT e.id, e.kind, e.node_id, e.created_at, d.attempts, \
+             COALESCE(d.lease_token, '') \
              FROM deliveries d JOIN events e ON e.id = d.event_id \
              WHERE d.agent = ?1 AND e.kind IN ({kinds}) AND d.status = 'leased' \
              AND d.leased_until < {EPOCH} AND d.attempts >= ?2 ORDER BY e.id",
@@ -453,7 +456,7 @@ impl Inbox {
                      || attempts || ' and the lease expired; giving up', \
                  leased_until = NULL, lease_token = NULL, updated_at = {NOW} \
                  WHERE agent = ?1 AND event_id = ?2 AND status = 'leased' \
-                 AND lease_token = ?3 AND leased_until < {EPOCH}"
+                 AND COALESCE(lease_token, '') = ?3 AND leased_until < {EPOCH}"
             ),
             params![self.agent, delivery.event.id.0, delivery.token.0],
         )?;
@@ -745,6 +748,24 @@ mod tests {
         );
         // A higher limit would still deliver it again.
         assert_eq!(inbox.abandoned(PROPOSED, 4).expect("abandoned"), Vec::new());
+    }
+
+    #[test]
+    fn a_lease_from_before_tokens_is_given_up_too() {
+        let f = fixture();
+        let inbox = Inbox::open(&f.db, "planner").expect("inbox");
+        store::open(&f.db)
+            .expect("db")
+            .execute(
+                "INSERT INTO deliveries (agent, event_id, status, process_id, attempts, \
+                 leased_until, lease_token) VALUES ('planner', 2, 'leased', 7, 3, 0, NULL)",
+                [],
+            )
+            .expect("old lease");
+        let abandoned = inbox.abandoned(PROPOSED, 3).expect("abandoned");
+        assert_eq!(abandoned.len(), 1);
+        assert!(inbox.give_up_abandoned(&abandoned[0]).expect("give up"));
+        assert!(inbox.abandoned(PROPOSED, 3).expect("abandoned").is_empty());
     }
 
     #[test]

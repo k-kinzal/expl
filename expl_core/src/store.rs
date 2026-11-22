@@ -196,10 +196,28 @@ ALTER TABLE nodes ADD COLUMN answer TEXT CHECK (answer IN ('yes', 'no', 'unknown
 pub fn open(path: &Path) -> Result<Connection, StoreError> {
     let mut conn = Connection::open(path)?;
     conn.busy_timeout(Duration::from_secs(30))?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    wal(&conn)?;
     conn.pragma_update(None, "foreign_keys", true)?;
     migrate(&mut conn)?;
     Ok(conn)
+}
+
+/// Switch `conn` to WAL. Switching a new database needs it to itself, and
+/// SQLite reports a busy one at once rather than waiting, so a process
+/// opening it alongside another retries for as long as the busy timeout.
+fn wal(conn: &Connection) -> Result<(), StoreError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => return Ok(result?),
+        }
+    }
 }
 
 /// An in-memory database (tests).
@@ -223,11 +241,58 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
             supported,
         });
     }
-    for (index, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
-        let tx = conn.transaction()?;
+    if current == supported {
+        return Ok(());
+    }
+    // Several processes may open an old database at once: each migration
+    // takes the write lock first and reads the version under it, so only
+    // one of them applies it.
+    loop {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if current > supported {
+            return Err(StoreError::SchemaTooNew {
+                found: current,
+                supported,
+            });
+        }
+        let Some(sql) = MIGRATIONS.get(current as usize) else {
+            return Ok(());
+        };
         tx.execute_batch(sql)?;
-        tx.pragma_update(None, "user_version", index as i64 + 1)?;
+        tx.pragma_update(None, "user_version", current + 1)?;
         tx.commit()?;
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn processes_opening_a_new_database_at_once_migrate_it_once() {
+        for _ in 0..5 {
+            let dir = tempfile::tempdir().expect("dir");
+            let path = dir.path().join("expl.db");
+            let start = std::sync::Barrier::new(4);
+            std::thread::scope(|scope| {
+                let openers: Vec<_> = (0..4)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            start.wait();
+                            open(&path).map(|_| ())
+                        })
+                    })
+                    .collect();
+                for opener in openers {
+                    opener.join().expect("thread").expect("open");
+                }
+            });
+            let version: i64 = open(&path)
+                .expect("open")
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("version");
+            assert_eq!(version, MIGRATIONS.len() as i64);
+        }
+    }
 }
