@@ -56,6 +56,11 @@ impl<'a> Reaction<'a> {
         self.agent
     }
 
+    /// The delivery holding the reaction's lease.
+    pub(crate) fn delivery(&self) -> &'a Delivery {
+        self.delivery
+    }
+
     /// The event reacted to.
     #[must_use]
     pub fn event(&self) -> &'a Event {

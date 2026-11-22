@@ -7,7 +7,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::event::{Event, EventId, EventKind};
+use crate::event::{Delivery, Event, EventId, EventKind, HELD_LEASE};
 use crate::graph::{
     AgentRunId, AgentRunRecord, AgentRunStatus, Answer, Edge, Evaluation, GoalTree, GraphError,
     Lineage, NewEvaluation, NewOrigin, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Plan,
@@ -896,20 +896,46 @@ impl Graph {
 
     /// A running investigation found its answer: it completes at `code` —
     /// the commit it was about, which its successors build on — with no
-    /// branch, and `evidence` as its outcome. Records `node.completed` and
-    /// `node.ready` for every successor that can run now.
+    /// branch, and `evidence` as its outcome. Validates the agent's lease on
+    /// the step's `node.ready` delivery and records `node.completed` and any
+    /// successors' `node.ready` events in the same transaction.
     ///
     /// # Errors
     ///
-    /// [`GraphError::NotInStatus`] when `id` is not a running investigation.
+    /// [`GraphError::LeaseLost`] when the delivery does not hold the lease
+    /// for this step, or [`GraphError::NotInStatus`] when it is not a running
+    /// investigation. SQLite failures are returned as [`GraphError::Sqlite`].
     pub fn record_finding(
         &mut self,
         id: NodeId,
+        agent: &str,
+        delivery: &Delivery,
         code: &str,
         answer: Answer,
         evidence: &str,
     ) -> Result<(), GraphError> {
         let tx = self.write()?;
+        let held: bool = tx.query_row(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM deliveries JOIN events e ON e.id = event_id \
+                 WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE} \
+                 AND e.kind = ?4 AND e.node_id = ?5)"
+            ),
+            params![
+                agent,
+                delivery.event.id.0,
+                delivery.token.as_str(),
+                EventKind::NodeReady.as_str(),
+                id.0
+            ],
+            |row| row.get(0),
+        )?;
+        if !held {
+            return Err(GraphError::LeaseLost {
+                agent: agent.to_owned(),
+                event: delivery.event.id,
+            });
+        }
         let changed = tx.execute(
             &format!(
                 "UPDATE nodes SET status = 'completed', answer = ?2, outcome = ?3, \
@@ -1510,14 +1536,30 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Inbox;
+    use crate::process::ProcessId;
+
+    const EXECUTOR: &str = "executor";
 
     fn seeded() -> (Graph, NodeId, NodeId) {
-        let mut graph = Graph::in_memory().expect("graph");
+        seed(Graph::in_memory().expect("graph"))
+    }
+
+    fn seed(mut graph: Graph) -> (Graph, NodeId, NodeId) {
         let origin = graph
             .create_origin("origin", Some("main"), "abc")
             .expect("origin");
         let goal = graph.add_goal("goal", "do it", false, &[]).expect("goal");
         (graph, origin, goal)
+    }
+
+    fn lease_ready(inbox: &mut Inbox, process: i64, node: NodeId) -> Delivery {
+        let delivery = inbox
+            .lease(&[EventKind::NodeReady], ProcessId(process), false, 3)
+            .expect("lease")
+            .expect("ready");
+        assert_eq!(delivery.event.node, Some(node));
+        delivery
     }
 
     fn kinds(graph: &Graph) -> Vec<(EventKind, Option<i64>)> {
@@ -1530,8 +1572,11 @@ mod tests {
     }
 
     #[test]
-    fn an_investigation_completes_with_a_finding_and_no_branch() {
-        let (mut graph, origin, goal) = seeded();
+    fn only_the_current_executor_can_record_a_finding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("expl.db");
+        let (mut graph, origin, goal) = seed(Graph::open(&db).expect("graph"));
+        let mut inbox = Inbox::open(&db, EXECUTOR).expect("inbox");
         let question = graph
             .propose_investigation("ask", "is it so?", &[origin], &[goal])
             .expect("investigation");
@@ -1540,37 +1585,98 @@ mod tests {
             .expect("step");
         assert!(graph.node(question).expect("node").investigation);
         assert!(!graph.node(next).expect("node").investigation);
-        // Only a running investigation records a finding.
-        let code = "abc".to_owned();
-        assert!(matches!(
-            graph.record_finding(question, &code, Answer::Yes, "seen"),
-            Err(GraphError::NotInStatus { .. })
-        ));
         graph.plan_step(question, 1).expect("plan");
         graph.plan_step(next, 1).expect("plan");
+        let first = lease_ready(&mut inbox, 1, question);
+        let code = "abc";
+        assert!(matches!(
+            graph.record_finding(question, EXECUTOR, &first, code, Answer::Yes, "seen"),
+            Err(GraphError::NotInStatus { .. })
+        ));
         assert!(graph.claim(question, false).expect("claim"));
-        graph
-            .record_finding(question, &code, Answer::Yes, "seen it")
+
+        // The first replica stops renewing and the second takes its delivery.
+        let expired = graph
+            .conn
+            .execute(
+                "UPDATE deliveries SET leased_until = 0 WHERE agent = ?1 AND event_id = ?2",
+                params![EXECUTOR, first.event.id.0],
+            )
+            .expect("expire");
+        assert_eq!(expired, 1);
+        let mut replacement_inbox = Inbox::open(&db, EXECUTOR).expect("inbox");
+        let replacement = lease_ready(&mut replacement_inbox, 2, question);
+        assert_eq!(replacement.event.id, first.event.id);
+        assert_eq!(replacement.attempts, 2);
+        let mut replacement_graph = Graph::open(&db).expect("replacement graph");
+        assert!(replacement_graph.claim(question, true).expect("reclaim"));
+        let running = graph.node(question).expect("running investigation");
+        let before = graph.last_event().expect("last event");
+
+        assert!(matches!(
+            graph.record_finding(question, EXECUTOR, &first, code, Answer::No, "stale"),
+            Err(GraphError::LeaseLost { event, .. }) if event == first.event.id
+        ));
+        assert_eq!(graph.node(question).expect("node"), running);
+        assert_eq!(graph.last_event().expect("last event"), before);
+
+        replacement_graph
+            .record_finding(
+                question,
+                EXECUTOR,
+                &replacement,
+                code,
+                Answer::Yes,
+                "seen it",
+            )
             .expect("finding");
+        assert!(matches!(
+            replacement_graph.record_finding(
+                question,
+                EXECUTOR,
+                &replacement,
+                code,
+                Answer::No,
+                "duplicate"
+            ),
+            Err(GraphError::NotInStatus { .. })
+        ));
         let answered = graph.node(question).expect("node");
         assert_eq!(answered.status, NodeStatus::Completed);
         assert_eq!(answered.answer, Some(Answer::Yes));
         assert_eq!(answered.outcome.as_deref(), Some("seen it"));
-        assert_eq!(answered.head_commit.as_deref(), Some(code.as_str()));
+        assert_eq!(answered.head_commit.as_deref(), Some(code));
         assert_eq!(answered.branch, None);
-        // What comes after it can run now, from the code it was about.
-        assert!(kinds(&graph).contains(&(EventKind::NodeReady, Some(next.0))));
+        let events: Vec<_> = graph
+            .events(before, 100)
+            .expect("events")
+            .into_iter()
+            .map(|event| (event.kind, event.node))
+            .collect();
+        assert_eq!(
+            events,
+            [
+                (EventKind::NodeCompleted, Some(question)),
+                (EventKind::NodeReady, Some(next)),
+            ]
+        );
+        replacement_inbox.ack(&replacement, None).expect("ack");
+
         // A change step cannot record a finding.
+        let delivery = lease_ready(&mut replacement_inbox, 2, next);
         assert!(graph.claim(next, false).expect("claim"));
         assert!(matches!(
-            graph.record_finding(next, &code, Answer::No, "x"),
+            graph.record_finding(next, EXECUTOR, &delivery, code, Answer::No, "x"),
             Err(GraphError::NotInStatus { .. })
         ));
     }
 
     #[test]
     fn rebasing_after_an_investigation_of_older_code_adds_the_active_origin() {
-        let (mut graph, first, goal) = seeded();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("expl.db");
+        let (mut graph, first, goal) = seed(Graph::open(&db).expect("graph"));
+        let mut inbox = Inbox::open(&db, EXECUTOR).expect("inbox");
         let change = graph.propose_step("c", "c", &[first], &[goal]).expect("c");
         let question = graph
             .propose_investigation("q", "q?", &[first], &[goal])
@@ -1587,13 +1693,17 @@ mod tests {
         for step in [change, question, on_change, after, after_change] {
             graph.plan_step(step, 1).expect("plan");
         }
+        let delivery = lease_ready(&mut inbox, 1, change);
         assert!(graph.claim(change, false).expect("claim"));
         graph.complete(change, "done").expect("complete");
+        inbox.ack(&delivery, None).expect("ack");
         for step in [question, on_change] {
+            let delivery = lease_ready(&mut inbox, 1, step);
             assert!(graph.claim(step, false).expect("claim"));
             graph
-                .record_finding(step, "abc", Answer::No, "seen")
+                .record_finding(step, EXECUTOR, &delivery, "abc", Answer::No, "seen")
                 .expect("finding");
+            inbox.ack(&delivery, None).expect("ack");
         }
         // Nothing to move while the investigation read the code as it is.
         assert!(!graph.rebase(after).expect("rebase"));

@@ -17,9 +17,8 @@
 //! A delivery is a lease: it is acknowledged only after the reaction
 //! succeeds. If the process dies, the lease expires and the event is
 //! delivered again. Every lease has its own [`LeaseToken`], and renewing,
-//! acknowledging, failing, releasing, or coalescing requires the current,
-//! unexpired one — so a process that lost its lease cannot disturb the
-//! process that took the event over ([`InboxError::LeaseLost`]).
+//! acknowledging, failing, releasing, coalescing, or recording a finding
+//! requires the current token. A takeover replaces it.
 //!
 //! Agents that share a role by weight each still receive every event of
 //! it, but only one of them reacts. Before reacting or acknowledging an
@@ -32,4 +31,5 @@ mod event;
 mod inbox;
 
 pub use event::{Event, EventId, EventKind};
+pub(crate) use inbox::HELD_LEASE;
 pub use inbox::{Delivery, Inbox, InboxError, LEASE_SECONDS, LeaseToken};
