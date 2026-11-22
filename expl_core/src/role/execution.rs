@@ -19,6 +19,12 @@
 //! no or unknown, with evidence — and no branch or commit of its own. Its
 //! `head_commit` is that code, so steps after it start from the same place.
 //!
+//! A step evaluation decided to **continue** ([`Decision::Continue`]) runs
+//! again with what evaluation found — how far the last attempt got, why it
+//! stopped, what remains — in its prompt; a change step's new branch starts
+//! from the commit the last attempt left, so the work carries on rather
+//! than starting over.
+//!
 //! Each ready step is its own event, so as many steps run at once as there
 //! are execution processes.
 
@@ -27,11 +33,13 @@ use serde_json::json;
 
 use crate::agent::AgentError;
 use crate::event::{Delivery, LeaseToken};
-use crate::graph::{Answer, Graph, GraphError, Node, NodeId, NodeKind, NodeStatus};
+use crate::graph::{
+    Answer, Conclusion, Decision, Graph, GraphError, Node, NodeId, NodeKind, NodeStatus,
+};
 use crate::prompt::Prompt;
 use crate::role::{Reaction, Report, RoleError};
 use crate::trunk::Trunk;
-use crate::workspace::Workspace;
+use crate::workspace::{Workspace, WorkspaceError};
 
 /// What one execution did.
 #[derive(Debug, Clone, Serialize)]
@@ -120,8 +128,9 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     if predecessors.is_empty() {
         predecessors.push(graph.origin()?);
     }
+    let continued = continuations(graph, id)?;
     if node.investigation {
-        return investigate(reaction, graph, &node, &predecessors);
+        return investigate(reaction, graph, &node, &predecessors, &continued);
     }
 
     // Each attempt gets its own path and a fresh branch, and touches no
@@ -133,15 +142,45 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     let trunk = Trunk::new(context.project(), context.declaration().trunk.as_deref());
     let trunk = trunk.branches(graph)?;
     pause(Window::Allocate);
-    let mut workspace = match workspaces.create(&node, token, &predecessors, &trunk) {
+    // Carried on from what the last attempt left: its commit first, then
+    // the predecessors (already in it, unless they moved since).
+    let resumed = continued
+        .last()
+        .and_then(|c| c.resume_commit.clone())
+        .and_then(|commit| {
+            let mut left = node.clone();
+            left.head_commit = Some(commit);
+            let mut start = vec![left];
+            start.extend(predecessors.iter().cloned());
+            match workspaces.create(&node, token, &start, &trunk) {
+                Ok(workspace) => Some(workspace),
+                Err(WorkspaceError::AttemptExists(_)) => None,
+                Err(_) => {
+                    // A failed join can leave this attempt's path allocated.
+                    // Clear it if clean so the fallback can use the same path.
+                    workspaces.unregister(&workspaces.path_of(id, token)).ok();
+                    None
+                }
+            }
+        });
+    let carried_on = resumed.is_some();
+    let created = match resumed {
+        Some(workspace) => Ok(workspace),
+        None => workspaces.create(&node, token, &predecessors, &trunk),
+    };
+    let mut workspace = match created {
         Ok(workspace) => workspace,
         Err(error) => return fail(graph, token, &node, "", None, error.to_string()),
     };
     let branch = workspace.branch().to_owned();
+    let attempt = Attempt {
+        continued: &continued,
+        carried_on,
+    };
     let result = graph
         .set_branch(id, token, &branch, None)
         .map_err(RoleError::from)
-        .and_then(|()| carry_out(reaction, graph, &node, &branch, &mut workspace));
+        .and_then(|()| carry_out(reaction, graph, &node, &attempt, &branch, &mut workspace));
     // This attempt releases its own worktree, and only that; both are best
     // effort, and `expl doctor --fix` removes a leftover once the step
     // settles. Settled: the branch holds what there is, and the worktree
@@ -161,6 +200,7 @@ fn carry_out(
     reaction: &Reaction<'_>,
     graph: &mut Graph,
     node: &Node,
+    attempt: &Attempt<'_>,
     branch: &str,
     workspace: &mut Workspace,
 ) -> Result<Report, RoleError> {
@@ -192,7 +232,7 @@ fn carry_out(
         }
     }
 
-    let prompt = prompt(reaction, node, &schema);
+    let prompt = prompt(reaction, node, attempt, &schema);
     let (succeeded, summary) = invoke(reaction, graph, id, workspace, &prompt, &schema)?;
     // The lease is the right to write this step. Lost while the agent ran,
     // the step may already be another process's: touch nothing of it.
@@ -290,6 +330,7 @@ fn investigate(
     graph: &mut Graph,
     node: &Node,
     predecessors: &[Node],
+    continued: &[Conclusion],
 ) -> Result<Report, RoleError> {
     let id = node.id;
     let token = reaction.token();
@@ -324,7 +365,7 @@ fn investigate(
     };
     let schema = finding_schema();
     let path = graph.ancestors(id)?;
-    let prompt = investigation_prompt(reaction, node, &path, &schema);
+    let prompt = investigation_prompt(reaction, node, &path, continued, &schema);
     // An investigation changes nothing: a run that changed its working
     // directory (or moved HEAD) is no finding about the code it was given.
     let result: Result<Finding, RoleError> =
@@ -387,6 +428,7 @@ fn investigation_prompt(
     reaction: &Reaction<'_>,
     node: &Node,
     path: &[Node],
+    continued: &[Conclusion],
     schema: &serde_json::Value,
 ) -> Prompt {
     let earlier = super::digest::findings(path);
@@ -405,9 +447,10 @@ fn investigation_prompt(
          not, and give the evidence — what you checked and what you found — so that someone \
          else can verify the answer. Report `investigated: false` only when you could not carry \
          out the investigation at all.\n\
-         {earlier}{instructions}{response}",
+         {earlier}{continued}{instructions}{response}",
         title = node.title,
         objective = node.objective,
+        continued = continuation_section(continued, false),
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),
     ))
@@ -506,15 +549,82 @@ fn resolution_prompt(
 
 /// The prompt: the step's own title and objective — nothing about the
 /// graph, the goals, or other steps.
-fn prompt(reaction: &Reaction<'_>, node: &Node, schema: &serde_json::Value) -> Prompt {
+/// The conclusions that put this step back to run again, oldest first,
+/// while it is being carried on: since the last one, nothing concluded it
+/// done or abandoned (a continue not put back — another evaluation agent's,
+/// say — does not end it). Empty for a step not being continued.
+fn continuations(graph: &Graph, id: NodeId) -> Result<Vec<Conclusion>, RoleError> {
+    let concluded = graph.conclusions_of(id)?;
+    let reopened = |c: &Conclusion| c.decision == Decision::Continue && c.reopened;
+    let Some(last) = concluded.iter().rposition(reopened) else {
+        return Ok(Vec::new());
+    };
+    if concluded[last..]
+        .iter()
+        .any(|c| c.decision != Decision::Continue)
+    {
+        return Ok(Vec::new());
+    }
+    Ok(concluded.into_iter().filter(reopened).collect())
+}
+
+/// What earlier attempts of a continued step got done and what evaluation
+/// said remains; empty for a first attempt.
+fn continuation_section(continued: &[Conclusion], change: bool) -> String {
+    if continued.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n## Earlier attempts\n\n\
+         This step was attempted before and stopped short. Evaluation checked each attempt and \
+         decided to carry on (oldest first):\n\n",
+    );
+    for (n, conclusion) in continued.iter().enumerate() {
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "{n}. How far it got: {finding}\n   What remains: {remains}\n",
+                n = n + 1,
+                finding = conclusion.finding.trim(),
+                remains = conclusion.consequence.trim(),
+            ),
+        );
+    }
+    if change {
+        out.push_str(
+            "\nThe working directory already holds what the last attempt left, committed: carry \
+             on from it rather than starting over, and finish what remains.\n",
+        );
+    } else {
+        out.push_str("\nTake what remains into account in this attempt.\n");
+    }
+    out
+}
+
+/// What a change step's attempt carries on from.
+struct Attempt<'a> {
+    /// The conclusions that put it back to run ([`continuations`]).
+    continued: &'a [Conclusion],
+    /// Whether its worktree starts from what the last attempt left.
+    carried_on: bool,
+}
+
+fn prompt(
+    reaction: &Reaction<'_>,
+    node: &Node,
+    attempt: &Attempt<'_>,
+    schema: &serde_json::Value,
+) -> Prompt {
     Prompt::from(format!(
         "## Task\n\n{title}\n\n{objective}\n\n\
          Do the work in the working directory: edit files, run builds and tests, and verify the \
          objective. Leave your changes uncommitted, and do not switch branches.\n\
-         {instructions}\nReport `succeeded: false` honestly if the objective is not achieved.\n\
+         {continued}{instructions}\nReport `succeeded: false` honestly if the objective is not \
+         achieved.\n\
          {response}",
         title = node.title,
         objective = node.objective.trim(),
+        continued = continuation_section(attempt.continued, attempt.carried_on),
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),
     ))
