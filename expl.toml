@@ -18,7 +18,7 @@
 #
 # Exploration, planning and evaluation are routed across Claude Code and
 # Codex (`[[agent.<name>.alternative]]`): each invocation goes to the next CLI in turn and falls over to the
-# other when one fails. Execution is Cursor Agent on Claude Opus 5.5.
+# other when one fails. Execution is routed the same way.
 #
 # All agents share one cargo target directory so that every worktree does
 # not rebuild the dependencies (gpui above all) from scratch.
@@ -143,13 +143,13 @@ args = ["--dangerously-bypass-approvals-and-sandbox"]
 
 [agent.executor]
 role = "execution"
-driver = "cursor_agent"
-command = ["cursor-agent"]
-args = ["--model", "claude-opus-5-5-high", "--force", "--trust", "--sandbox", "disabled"]
+# Claude Code first, Codex when it fails. (Cursor Agent, used before, hit its
+# monthly Opus usage limit until 2026-12-17.)
+driver = "claude_code"
+command = ["claude"]
+args = ["--permission-mode", "bypassPermissions"]
 env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
-# Stopped on the owner's decision: cursor-agent hit its monthly Opus usage
-# limit (resets 2026-12-17). Set back to 1 to resume execution.
-replicas = 0
+replicas = 1
 instructions = """
 This repository is expl itself (Rust workspace: expl_core, expl_cli, expl_ui). Follow AGENTS.md:
 keep its nouns and responsibilities, document public items, keep errors typed (thiserror).
@@ -159,6 +159,11 @@ For a change: before finishing, `cargo fmt`, `cargo clippy --all-targets`, and `
 must pass; report succeeded=false if they do not. For an investigation (a question to answer):
 change nothing, and back the answer with evidence from the code, builds, or tests you ran.
 """
+
+[[agent.executor.alternative]]
+driver = "codex"
+command = ["codex"]
+args = ["--dangerously-bypass-approvals-and-sandbox"]
 
 [agent.evaluator]
 role = "evaluation"
