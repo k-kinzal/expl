@@ -8,6 +8,7 @@ use serde::de::DeserializeOwned;
 
 use crate::agent::{Agent, AgentError, Invocation};
 use crate::event::{Delivery, Event};
+use crate::git::Git;
 use crate::graph::{AgentRunStatus, Graph, NodeId};
 use crate::process::{Interrupt, ProcessId};
 use crate::prompt::Prompt;
@@ -164,6 +165,17 @@ impl<'a> Reaction<'a> {
         if let Some(node) = node {
             facts.push(("EXPL_NODE".to_owned(), node.0.to_string()));
         }
+        // Every directory an agent works in is a worktree expl made for it,
+        // so a failed attempt's leftovers can be reset before the next CLI.
+        let started_at = Git::new(directory).resolve_commit("HEAD").ok();
+        let restore = || -> std::io::Result<()> {
+            match &started_at {
+                Some(head) => Git::new(directory)
+                    .restore(head)
+                    .map_err(std::io::Error::other),
+                None => Ok(()),
+            }
+        };
         let outcome = self
             .agent
             .invoke::<T>(&Invocation {
@@ -173,6 +185,7 @@ impl<'a> Reaction<'a> {
                 facts: &facts,
                 log: &log,
                 interrupt: self.interrupt,
+                restore: Some(&restore),
             })
             .map(|run| (run.response, run.session_id))
             .map_err(RoleError::from);

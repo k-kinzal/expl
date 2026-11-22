@@ -162,7 +162,9 @@ fn prompt(
     Prompt::from(format!(
         "## Task\n\n\
          Judge the repository in the working directory, as it is, against each goal below. \
-         Inspect the code and run builds and tests as needed. Do not modify files. Return one \
+         Inspect the code and run builds and tests as needed. Do not modify files, and leave the \
+         working directory as you found it: remove anything a build or test writes there outside \
+         ignored paths. Return one \
          evaluation per goal, referring to it by the number in brackets.\n\n\
          ## Goals\n\n{goals}{instructions}{response}",
         goals = digest::numbered_goals(goals, tree),

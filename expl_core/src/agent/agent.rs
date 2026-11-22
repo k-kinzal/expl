@@ -43,7 +43,7 @@ const LEFTOVER_GRACE: Duration = Duration::from_secs(2);
 const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// One request to invoke an agent: what to say, where, and where to log.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct Invocation<'a> {
     /// The directory the agent works in (a worktree).
     pub directory: &'a Path,
@@ -59,6 +59,20 @@ pub struct Invocation<'a> {
     pub log: &'a Path,
     /// Raised when the hosting process must stop.
     pub interrupt: &'a Interrupt,
+    /// Puts `directory` back as the first CLI found it, before the next CLI
+    /// starts on it: whatever a failed attempt left behind is not the next
+    /// attempt's starting point.
+    pub restore: Option<&'a dyn Fn() -> std::io::Result<()>>,
+}
+
+impl std::fmt::Debug for Invocation<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Invocation")
+            .field("directory", &self.directory)
+            .field("log", &self.log)
+            .field("restore", &self.restore.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// A declared agent. See the [module docs](crate::agent).
@@ -190,6 +204,10 @@ impl Agent {
             let cli = &self.clis[(start + offset) % count];
             if offset > 0 {
                 log = OpenOptions::new().append(true).open(invocation.log)?;
+                if let Some(restore) = invocation.restore {
+                    restore()?;
+                    writeln!(log, "=== restored the working directory ===")?;
+                }
                 writeln!(log, "=== falling over to the next CLI ===")?;
             }
             match self
@@ -360,6 +378,8 @@ fn wait(
         let grace = Instant::now() + TERMINATION_GRACE;
         while Instant::now() < grace {
             if child.try_wait()?.is_some() {
+                // The leader went, but members ignoring TERM may not have.
+                signal_group(child.id(), "-KILL");
                 return Ok(end);
             }
             thread::sleep(Duration::from_millis(100));
@@ -507,6 +527,7 @@ mod tests {
             facts: &[],
             log,
             interrupt: &Interrupt::default(),
+            restore: None,
         })
     }
 
@@ -532,6 +553,70 @@ command = ["sh", "-c", "echo '{\"cli\":2}'"]
             .collect();
         seen.sort_by_key(serde_json::Value::as_i64);
         assert_eq!(seen, [1, 1, 2, 2].map(serde_json::Value::from));
+    }
+
+    #[test]
+    fn the_next_cli_starts_from_a_restored_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("run.log");
+        let agent = agent(&ROUTED.replacen("echo '{\\\"cli\\\":1}'", "exit 3", 1));
+        let restored = std::cell::Cell::new(0);
+        let restore = || {
+            restored.set(restored.get() + 1);
+            Ok(())
+        };
+        let prompt = Prompt::from("p");
+        let schema = serde_json::json!({});
+        for _ in 0..2 {
+            let run: AgentRun<serde_json::Value> = agent
+                .invoke(&Invocation {
+                    directory: Path::new("."),
+                    prompt: &prompt,
+                    response_schema: &schema,
+                    facts: &[],
+                    log: &log,
+                    interrupt: &Interrupt::default(),
+                    restore: Some(&restore),
+                })
+                .expect("run");
+            assert_eq!(run.response["cli"], 2);
+        }
+        // Only the invocation that started at the failing CLI fell over.
+        assert_eq!(restored.get(), 1);
+    }
+
+    #[test]
+    fn members_ignoring_term_die_with_a_stopped_cli() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("run.log");
+        let pid_file = dir.path().join("pid");
+        let text = format!(
+            r#"
+[agent.a]
+role = "planning"
+driver = "generic"
+command = ["sh", "-c", "(trap '' TERM; exec sleep 60) & echo $! > {}; sleep 30"]
+replicas = 1
+timeout = 1
+"#,
+            pid_file.display()
+        );
+        let error = invoke(&agent(&text), &log).expect_err("times out");
+        assert!(matches!(error, AgentError::TimedOut { .. }), "{error:?}");
+        let member = std::fs::read_to_string(&pid_file).expect("pid");
+        let alive = || {
+            Command::new("kill")
+                .args(["-0", member.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .expect("kill")
+                .success()
+        };
+        let gone_by = Instant::now() + Duration::from_secs(3);
+        while alive() && Instant::now() < gone_by {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(), "{} ignored TERM and survived", member.trim());
     }
 
     #[test]

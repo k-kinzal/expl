@@ -156,6 +156,18 @@ impl Git {
         Ok(out.lines().map(str::to_owned).collect())
     }
 
+    /// Put the worktree back at `head`: HEAD reset there, tracked files as
+    /// they are in it, untracked files removed. Ignored files stay.
+    ///
+    /// # Errors
+    ///
+    /// [`GitError`] when git fails.
+    pub fn restore(&self, head: &str) -> Result<(), GitError> {
+        self.run(&["reset", "-q", "--hard", head])?;
+        self.run(&["clean", "-q", "-f", "-d"])?;
+        Ok(())
+    }
+
     /// Paths `git status --porcelain` reports in the working tree: staged,
     /// modified, deleted, renamed (both names), conflicted, or untracked.
     /// Ignored files are not reported.
@@ -268,6 +280,59 @@ impl Git {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_undoes_commits_edits_and_new_files_but_keeps_ignored_ones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = Git::new(dir.path());
+        git.run(&["init", "-q"]).expect("init");
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").expect("write");
+        std::fs::write(dir.path().join("kept"), "k").expect("write");
+        git.run(&["add", "."]).expect("add");
+        git.run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "base",
+        ])
+        .expect("commit");
+        let head = git.resolve_commit("HEAD").expect("head");
+
+        std::fs::write(dir.path().join("kept"), "changed").expect("write");
+        std::fs::write(dir.path().join("extra"), "x").expect("write");
+        git.run(&["add", "."]).expect("add");
+        git.run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "moved",
+        ])
+        .expect("commit");
+        std::fs::write(dir.path().join("kept"), "dirty").expect("write");
+        std::fs::create_dir_all(dir.path().join("new/dir")).expect("dir");
+        std::fs::write(dir.path().join("new/dir/file"), "n").expect("write");
+        std::fs::create_dir_all(dir.path().join("target")).expect("dir");
+        std::fs::write(dir.path().join("target/build"), "b").expect("write");
+
+        git.restore(&head).expect("restore");
+        assert_eq!(git.resolve_commit("HEAD").expect("head"), head);
+        assert!(git.status_paths().expect("status").is_empty());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("kept")).expect("kept"),
+            "k"
+        );
+        assert!(!dir.path().join("extra").exists() && !dir.path().join("new").exists());
+        assert!(
+            dir.path().join("target/build").exists(),
+            "ignored files stay"
+        );
+    }
 
     #[test]
     fn status_paths_name_every_kind_of_change() {
