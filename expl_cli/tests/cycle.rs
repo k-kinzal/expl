@@ -1175,7 +1175,7 @@ fn discovery_stops_at_node_worktrees() {
     ok(repo, &["run", "executor", "--exit-when-idle"]);
     // A settled step's worktree is gone; check out its branch where one
     // would be while it runs.
-    let worktree = repo.join(".expl/worktrees").join(format!("node-{a}"));
+    let worktree = repo.join(".expl/worktrees").join(format!("node-{a}-a1"));
     let path = worktree.display().to_string();
     git(
         repo,

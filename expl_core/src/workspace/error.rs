@@ -20,6 +20,9 @@ pub enum WorkspaceError {
     /// The node has no recorded commit to start from.
     #[error("node {0} has no recorded commit")]
     NoCommit(NodeId),
+    /// The attempt already has a worktree path or registration.
+    #[error("the attempt already has a worktree at {}", .0.display())]
+    AttemptExists(std::path::PathBuf),
     /// Merge conflicts remain after the executor ran.
     #[error("unresolved merge conflicts in: {}", .0.join(", "))]
     UnresolvedConflicts(Vec<String>),

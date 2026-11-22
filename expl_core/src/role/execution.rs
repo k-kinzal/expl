@@ -2,7 +2,7 @@
 //!
 //! Reacts to `node.ready`. The step is claimed (`node.started`), its branch
 //! starts from its predecessors (merged when paths join), the agent works
-//! in the step's worktree, and expl commits whatever it left there as the
+//! in the attempt's worktree, and expl commits whatever it left there as the
 //! branch tip: `node.completed` (with `node.ready` for successors that can
 //! now run) or `node.failed`. A failed run still commits its work so it can
 //! be inspected.
@@ -126,22 +126,25 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
         return investigate(reaction, graph, &node, &predecessors);
     }
 
-    // Each attempt gets a branch that did not exist before, under a name no
-    // existing ref and no trunk branch takes; the one git created is
-    // recorded.
+    // Each attempt gets its own path and a fresh branch. A process left
+    // behind by an earlier attempt still has its old path.
     let context = reaction.context();
     let trunk = Trunk::new(context.project(), context.declaration().trunk.as_deref());
     let trunk = trunk.branches(graph)?;
-    let mut workspace = match context.workspaces().create(&node, &predecessors, &trunk) {
-        Ok(workspace) => workspace,
-        Err(error) => return fail(graph, &node, "", None, error.to_string()),
-    };
+    let mut workspace =
+        match context
+            .workspaces()
+            .create(&node, &reaction.delivery().token, &predecessors, &trunk)
+        {
+            Ok(workspace) => workspace,
+            Err(error) => return fail(graph, &node, "", None, error.to_string()),
+        };
     let branch = workspace.branch().to_owned();
     graph.set_branch(id, &branch, None)?;
     let result = carry_out(reaction, graph, &node, &branch, &mut workspace);
     // Settled either way: the branch holds what there is, and the worktree
-    // goes. Not when the lease was lost or the run interrupted: the step may
-    // be another process's now, working in the same place.
+    // goes. On lease loss or interruption, leave cleanup to the next
+    // attempt or doctor.
     if matches!(result, Ok(Report::Execution(_))) && !reaction.lease_lost() {
         // Best effort: `expl doctor --fix` removes a leftover.
         reaction.context().workspaces().release(workspace).ok();
@@ -499,7 +502,9 @@ fn prompt(reaction: &Reaction<'_>, node: &Node, schema: &serde_json::Value) -> P
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::io::Write;
     use std::path::PathBuf;
+    use std::process::{Command, Stdio};
     use std::rc::Rc;
 
     use super::*;
@@ -661,7 +666,7 @@ mod tests {
                 .expect("trunk");
             let workspace = context
                 .workspaces()
-                .create(&node, &predecessors, &trunk)
+                .create(&node, &delivery.token, &predecessors, &trunk)
                 .expect("the new holder's workspace");
             graph
                 .set_branch(step, workspace.branch(), None)
@@ -770,10 +775,91 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_process_cannot_write_into_the_reclaiming_attempts_commit() {
+        let mut held = held_step();
+        assert!(held.graph.claim(held.step, false).expect("claim"));
+        let step = held.graph.node(held.step).expect("step");
+        let origin = held.graph.origin().expect("origin");
+        let workspaces = held.context.workspaces();
+        let first = workspaces
+            .create(&step, &held.delivery.token, &[origin], &[])
+            .expect("first worktree");
+        let old_path = first.path().to_owned();
+        held.graph
+            .set_branch(held.step, first.branch(), None)
+            .expect("record first branch");
+        let mut stale = Some(
+            Command::new("sh")
+                .args([
+                    "-ec",
+                    r#"read -r signal; mkdir -p "$1"; echo stale > "$1/stale.txt""#,
+                    "agent",
+                ])
+                .arg(&old_path)
+                .current_dir(&old_path)
+                .stdin(Stdio::piped())
+                .spawn()
+                .expect("start a process in the first worktree"),
+        );
+        store::open(&held.db)
+            .expect("db")
+            .execute(
+                &format!("UPDATE deliveries SET leased_until = {EPOCH} - 1"),
+                [],
+            )
+            .expect("expire");
+        let delivery = Inbox::open(&held.db, "executor")
+            .expect("inbox")
+            .lease(Role::Execution.reactions(), held.taker, false, MAX_ATTEMPTS)
+            .expect("lease")
+            .expect("redelivery");
+        assert_eq!(delivery.attempts, 2);
+        let _hook = Hooked::install(move |window| {
+            if window == Window::BeforeCommit {
+                let mut stale = stale.take().expect("stale process");
+                stale
+                    .stdin
+                    .take()
+                    .expect("stale process input")
+                    .write_all(b"write now\n")
+                    .expect("signal the stale process");
+                assert!(stale.wait().expect("stale process exit").success());
+            }
+        });
+        let agent = held.context.agent("executor").expect("agent");
+        let reaction = Reaction::new(
+            &held.context,
+            &agent,
+            held.taker,
+            &delivery,
+            &held.interrupt,
+        );
+        let report = react(&reaction, &mut held.graph).expect("reclaim and execute");
+        let Report::Execution(report) = report else {
+            panic!("expected execution, got {report:?}");
+        };
+        assert_eq!(report.status, NodeStatus::Completed);
+        let commit = report.head_commit.expect("commit");
+        let files = Git::new(held.context.project().root())
+            .run(&["ls-tree", "--name-only", &commit])
+            .expect("list committed files");
+        assert_eq!(
+            files, "old.txt",
+            "only the reclaiming agent's file is committed"
+        );
+        assert!(
+            old_path.join("stale.txt").is_file(),
+            "the stale write succeeded"
+        );
+        assert!(workspaces.registered().expect("registrations").is_empty());
+        workspaces.discard(held.step).expect("discard leftovers");
+        assert!(!old_path.exists());
+    }
+
+    #[test]
     #[ignore = "window: a takeover between the lease check after the agent returns and \
                 `workspace.commit` lets the old holder fail the step the new holder is running \
-                (`node.failed` and its outcome, as its worktree path is the new holder's \
-                now) and remove the new holder's worktree (#549/#108)"]
+                (`node.failed` and its outcome) (#549/#108)"]
     fn a_takeover_before_the_commit_leaves_the_step_to_the_new_holder() {
         let landed = writes_landing_after_takeover_at(Window::BeforeCommit);
         assert!(
@@ -785,7 +871,7 @@ mod tests {
     #[test]
     #[ignore = "window: a takeover between the last lease check and `Graph::complete` lets the \
                 old holder complete the step the new holder is running (status, outcome, \
-                `node.completed`) and remove the new holder's worktree (#549/#108)"]
+                `node.completed`) (#549/#108)"]
     fn a_takeover_before_completion_leaves_the_step_to_the_new_holder() {
         let landed = writes_landing_after_takeover_at(Window::BeforeComplete);
         assert!(
