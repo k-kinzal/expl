@@ -58,6 +58,26 @@ pub(crate) fn findings(nodes: &[Node]) -> String {
     out
 }
 
+/// One completed investigation's finding with its evidence complete: every
+/// line as recorded, nothing cut, so a decisive file reference or command
+/// result is shown in its original form however long the evidence runs.
+/// Each line is indented under the headline; an empty line stays empty.
+pub(crate) fn finding_in_full(node: &Node) -> String {
+    let answer = node.answer.map_or("unknown", |a| a.as_str());
+    let mut out = format!("- {} — {}: {answer}\n", node.id, node.title);
+    if let Some(evidence) = &node.outcome {
+        out.push_str("  evidence (complete, as recorded):\n");
+        for line in evidence.trim_end().lines() {
+            if line.trim().is_empty() {
+                out.push('\n');
+            } else {
+                let _ = writeln!(out, "    {line}");
+            }
+        }
+    }
+    out
+}
+
 /// One line identifying a node.
 pub(crate) fn headline(node: &Node) -> String {
     let mut line = format!("{} {} [{}", node.id, kind(node), node.status);
