@@ -274,7 +274,7 @@ mod tests {
     use crate::event::{EventKind, Inbox};
     use crate::git::Git;
     use crate::graph::{Graph, NewEvaluation, NewOrigin};
-    use crate::process::{Interrupt, Processes};
+    use crate::process::{Interrupt, ProcessId, Processes};
     use crate::project::Project;
     use crate::role::{Context, Reaction, Role};
 
@@ -403,7 +403,9 @@ mod tests {
 
     #[test]
     fn graph_excerpts_step_objectives_outcomes_and_reasons() {
-        let mut graph = Graph::in_memory().expect("graph");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("expl.db");
+        let mut graph = Graph::open(&db).expect("graph");
         let origin = graph.create_origin("Start", None, "abc").expect("origin");
         let goal = graph
             .add_goal("Goal", "Objective", false, &[])
@@ -414,7 +416,16 @@ mod tests {
         let step = graph
             .propose_step("Step", &objective, &[origin], &[goal])
             .expect("step");
-        graph.complete(step, &outcome).expect("complete");
+        graph.plan_step(step, 1).expect("plan");
+        let delivery = Inbox::open(&db, "executor")
+            .expect("inbox")
+            .lease(&[EventKind::NodeReady], ProcessId(1), false, 3)
+            .expect("lease")
+            .expect("node.ready");
+        assert!(graph.claim(step, &delivery.token).expect("claim"));
+        graph
+            .complete(step, &delivery.token, &outcome)
+            .expect("complete");
         graph
             .record_evaluations(
                 step,

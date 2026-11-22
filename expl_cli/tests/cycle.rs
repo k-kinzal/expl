@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
+use expl_core::testing::scaled;
+
 /// One script plays every role. Exploration proposes a step only for a new
 /// goal or a failed step, so the graph settles (a survey answers with
 /// `@DIR@/survey.json`); execution fails while `@DIR@/fail` exists, else
@@ -123,7 +125,7 @@ struct Sandbox {
 impl Drop for Sandbox {
     fn drop(&mut self) {
         // Never leave detached processes behind, even when a test fails.
-        expl(&self.repo, &["down", "--time", "5"]);
+        expl(&self.repo, &["down", "--time", &down_time()]);
     }
 }
 
@@ -205,16 +207,10 @@ fn node(repo: &Path, id: &str) -> serde_json::Value {
     json(&ok(repo, &["node", "inspect", id]))
 }
 
-/// Poll `condition` for up to 120 seconds, scaled by a positive
-/// `EXPL_TEST_TIMEOUT_SCALE` (default 1).
+/// Poll `condition` for up to 120 seconds, [`scaled`] by
+/// `EXPL_TEST_TIMEOUT_SCALE`.
 fn wait_until(repo: &Path, what: &str, mut condition: impl FnMut() -> bool) {
-    const BASE_TIMEOUT: Duration = Duration::from_secs(120);
-    let timeout = std::env::var("EXPL_TEST_TIMEOUT_SCALE")
-        .ok()
-        .and_then(|scale| scale.parse::<f64>().ok())
-        .and_then(|scale| Duration::try_from_secs_f64(BASE_TIMEOUT.as_secs_f64() * scale).ok())
-        .filter(|timeout| !timeout.is_zero())
-        .unwrap_or(BASE_TIMEOUT);
+    let timeout = scaled(Duration::from_secs(120));
     let start = Instant::now();
     while !condition() {
         let elapsed = start.elapsed();
@@ -228,6 +224,20 @@ fn wait_until(repo: &Path, what: &str, mut condition: impl FnMut() -> bool) {
         }
         std::thread::sleep(Duration::from_millis(200).min(timeout.saturating_sub(elapsed)));
     }
+}
+
+/// How long SQLite waits for a lock the running processes hold, [`scaled`].
+fn busy_timeout() -> Duration {
+    scaled(Duration::from_secs(30))
+}
+
+/// The `--time` for `expl down`: 5 seconds for processes to stop before
+/// they are killed, [`scaled`] and rounded up to whole seconds.
+fn down_time() -> String {
+    scaled(Duration::from_secs(5))
+        .as_secs_f64()
+        .ceil()
+        .to_string()
 }
 
 fn sandbox() -> Sandbox {
@@ -990,7 +1000,7 @@ fn an_abandoned_start_gives_its_replica_slot_back() {
     // Past its deadline it is dead, and `up` abandons it and starts a
     // replacement in its place.
     let db = rusqlite::Connection::open(project.database_path()).expect("db");
-    db.busy_timeout(Duration::from_secs(30)).expect("timeout");
+    db.busy_timeout(busy_timeout()).expect("timeout");
     let aged = db
         .execute(
             "UPDATE processes SET start_by = CAST(strftime('%s','now') AS INTEGER) - 1 \
@@ -1117,14 +1127,14 @@ fn losing_the_lease_interrupts_the_reaction() {
     let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
     sandbox.slow(true);
     let name = ok(repo, &["run", "executor", "-d"]);
-    wait_until(repo, "the step to start", || {
-        node(repo, &a)["node"]["status"] == "running"
+    wait_until(repo, "the agent run to start", || {
+        node(repo, &a)["agent_runs"][0]["status"] == "running"
     });
 
     // Its lease runs out and another executor takes the event over, in one
     // step so the process cannot reclaim the event itself first.
     let db = rusqlite::Connection::open(repo.join(".expl/expl.db")).expect("db");
-    db.busy_timeout(Duration::from_secs(30)).expect("timeout");
+    db.busy_timeout(busy_timeout()).expect("timeout");
     let taken = db
         .execute(
             "UPDATE deliveries SET lease_token = 'replacement', process_id = 999, \
@@ -1180,7 +1190,7 @@ fn discovery_stops_at_node_worktrees() {
     ok(repo, &["run", "executor", "--exit-when-idle"]);
     // A settled step's worktree is gone; check out its branch where one
     // would be while it runs.
-    let worktree = repo.join(".expl/worktrees").join(format!("node-{a}"));
+    let worktree = repo.join(".expl/worktrees").join(format!("node-{a}-a1"));
     let path = worktree.display().to_string();
     git(
         repo,
@@ -1639,7 +1649,7 @@ fn idle_exploration_revisits_random_starting_points() {
     wait_until(repo, "four node.revisited events", || {
         revisits(repo).len() >= 4
     });
-    ok(repo, &["down", "--time", "5"]);
+    ok(repo, &["down", "--time", &down_time()]);
     let nodes: std::collections::BTreeSet<i64> = revisits(repo)
         .iter()
         .filter_map(|e| e["node"].as_i64())
@@ -1784,7 +1794,7 @@ fn weighted_assignments_hold_across_declarations_and_restarts() {
     wait_until(repo, "both agents to settle every goal", || {
         settled("explorer", 4) && settled("contrarian", 4)
     });
-    ok(repo, &["down", "--time", "5"]);
+    ok(repo, &["down", "--time", &down_time()]);
 
     // After a restart, each agent loads weights that route nearly every
     // event to itself again, but the first to route an event decides.
@@ -2188,7 +2198,7 @@ fn speculative_exploration_grows_past_steps_not_carried_out() {
     wait_until(repo, "an exploration ahead of the open step", || {
         ahead().is_some()
     });
-    ok(repo, &["down", "--time", "5"]);
+    ok(repo, &["down", "--time", &down_time()]);
     // It heads for the goal (and may have been explored ahead of in turn).
     let after = ahead().expect("ahead");
     assert!(

@@ -60,7 +60,7 @@ use std::fmt::Write;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::Agent;
-use crate::event::{Event, EventKind};
+use crate::event::{Delivery, EventKind};
 use crate::graph::{Graph, GraphError, NodeId};
 
 /// One of the four responsibilities.
@@ -178,10 +178,10 @@ impl Role {
         }
     }
 
-    /// Clean up after the reaction to `event` ended for good without
+    /// Clean up after the reaction to `delivery` ended for good without
     /// succeeding (its attempts were used up, or the process gave up on
     /// it), so no work is left hanging. Execution fails a step still
-    /// `running` (records `node.failed` with `why`), so planning can
+    /// held by the delivery (records `node.failed` with `why`), so planning can
     /// replan or prune it; other roles leave nothing behind. Returns the
     /// step failed, if any.
     ///
@@ -190,12 +190,12 @@ impl Role {
     /// [`GraphError`] on graph failure.
     pub fn abandon(
         self,
-        event: &Event,
+        delivery: &Delivery,
         graph: &mut Graph,
         why: &str,
     ) -> Result<Option<NodeId>, GraphError> {
         match self {
-            Self::Execution => execution::abandon(event, graph, why),
+            Self::Execution => execution::abandon(delivery, graph, why),
             Self::Exploration | Self::Planning | Self::Evaluation => Ok(None),
         }
     }

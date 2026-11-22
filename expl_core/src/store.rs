@@ -206,7 +206,11 @@ UPDATE nodes SET proposed_by = (
     ORDER BY r.finished_at DESC LIMIT 1
 ) WHERE kind = 'step';
 ",
-    r"
+    CONCLUSIONS_MIGRATION,
+    EXECUTION_CLAIMS_MIGRATION,
+];
+
+const CONCLUSIONS_MIGRATION: &str = r"
 -- What evaluation concluded about a step it judged, before (and apart
 -- from) the goals: whether it is done, abandoned, or to be continued, the
 -- hypothesis it stood for, what was found, and what that changes. A step
@@ -226,8 +230,14 @@ CREATE TABLE conclusions (
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE INDEX conclusions_node ON conclusions (node_id);
-",
-];
+";
+
+const EXECUTION_CLAIMS_MIGRATION: &str = r"
+-- Execution claims span agent inboxes. Existing running steps have no
+-- recorded holder and can be claimed on their next delivery.
+ALTER TABLE nodes ADD COLUMN holder_token TEXT;
+CREATE UNIQUE INDEX deliveries_token ON deliveries (lease_token) WHERE lease_token IS NOT NULL;
+";
 
 /// Open the database at `path`, creating and migrating it as needed.
 ///
@@ -300,6 +310,19 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         let Some(sql) = MIGRATIONS.get(current as usize) else {
             return Ok(());
         };
+        // Version 9 on trunk added conclusions. On the execution branch it
+        // added the holder token, so apply the other migration to catch up.
+        let sql = if *sql == EXECUTION_CLAIMS_MIGRATION
+            && tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info('nodes') WHERE name = 'holder_token')",
+                [],
+                |row| row.get(0),
+            )?
+        {
+            CONCLUSIONS_MIGRATION
+        } else {
+            sql
+        };
         tx.execute_batch(sql)?;
         tx.pragma_update(None, "user_version", current + 1)?;
         tx.commit()?;
@@ -309,6 +332,30 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn either_version_nine_schema_migrates_to_both_features() {
+        for migration in [CONCLUSIONS_MIGRATION, EXECUTION_CLAIMS_MIGRATION] {
+            let mut conn = Connection::open_in_memory().expect("database");
+            for sql in &MIGRATIONS[..8] {
+                conn.execute_batch(sql).expect("common migration");
+            }
+            conn.execute_batch(migration).expect("branch migration");
+            conn.pragma_update(None, "user_version", 9)
+                .expect("version");
+
+            migrate(&mut conn).expect("reconcile migrations");
+
+            conn.prepare("SELECT holder_token FROM nodes")
+                .expect("holder token");
+            conn.prepare("SELECT resume_commit FROM conclusions")
+                .expect("conclusions");
+            let index_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name IN ('conclusions_node', 'deliveries_token')", [], |row| row.get(0))
+                .expect("indexes");
+            assert_eq!(index_count, 2);
+        }
+    }
 
     #[test]
     fn processes_opening_a_new_database_at_once_migrate_it_once() {

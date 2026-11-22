@@ -23,6 +23,8 @@
 //! - [`doctor`] — checking the graph against git, and the safe repairs.
 //! - [`project`], [`declaration`], [`store`] — where it all lives, what the
 //!   operator wrote, and the database file.
+//! - [`testing`] — wall-clock bounds for expl's own tests, stretched on a
+//!   loaded machine.
 //!
 //! Exploration never finishes by itself; choosing among the steps that
 //! satisfy a goal is the human's responsibility.
@@ -40,6 +42,7 @@ pub mod project;
 pub mod prompt;
 pub mod role;
 pub mod store;
+pub mod testing;
 pub mod trunk;
 pub mod workspace;
 

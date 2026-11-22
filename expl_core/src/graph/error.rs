@@ -2,7 +2,6 @@
 
 use thiserror::Error;
 
-use crate::event::EventId;
 use crate::graph::{NodeId, NodeKind};
 
 /// A graph operation failed.
@@ -25,14 +24,12 @@ pub enum GraphError {
         /// What it must be.
         expected: &'static str,
     },
-    /// The delivery does not hold the lease required for the graph operation.
-    #[error("agent `{agent}` has no matching lease on event {event} for this graph operation")]
-    LeaseLost {
-        /// The agent whose inbox it is.
-        agent: String,
-        /// The event the agent is reacting to.
-        event: EventId,
-    },
+    /// The delivery cannot claim or write this step under its lease.
+    #[error("the delivery no longer holds the lease required for step {0}")]
+    LeaseLost(NodeId),
+    /// A change step cannot complete without a tip commit.
+    #[error("change step {0} cannot complete without a commit")]
+    Uncommitted(NodeId),
     /// The graph has no origin (not initialised).
     #[error("the graph has no origin node")]
     NoOrigin,

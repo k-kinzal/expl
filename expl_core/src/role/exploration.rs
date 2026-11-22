@@ -1113,11 +1113,14 @@ impl Map {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Inbox;
+    use crate::process::ProcessId;
 
     #[test]
     fn a_survey_names_only_failed_steps_as_what_a_proposal_grew_from() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut graph = Graph::open(&dir.path().join("expl.db")).expect("graph");
+        let db = dir.path().join("expl.db");
+        let mut graph = Graph::open(&db).expect("graph");
         let origin = graph
             .create_origin("o", Some("main"), "abc")
             .expect("origin");
@@ -1129,8 +1132,15 @@ mod tests {
             .propose_step("open", "y", &[origin], &[goal])
             .expect("open");
         graph.plan_step(failed, 1).expect("plan");
-        assert!(graph.claim(failed, false).expect("claim"));
-        graph.fail(failed, "did not compile").expect("fail");
+        let delivery = Inbox::open(&db, "executor")
+            .expect("inbox")
+            .lease(&[EventKind::NodeReady], ProcessId(1), false, 3)
+            .expect("lease")
+            .expect("node.ready");
+        assert!(graph.claim(failed, &delivery.token).expect("claim"));
+        graph
+            .fail(failed, &delivery.token, "did not compile")
+            .expect("fail");
         let snapshot = graph.snapshot().expect("snapshot");
 
         assert_eq!(derived_from(&snapshot, Some(failed.0)), Some(failed));
