@@ -31,6 +31,14 @@ pub enum AgentError {
         /// The `timeout` it outran.
         after: Duration,
     },
+    /// Processes the CLI left behind in its process group survived SIGKILL,
+    /// so they may still be using the working directory: the invocation
+    /// fails without falling over to another CLI.
+    #[error("agent processes in group {group} survived SIGKILL")]
+    Lingering {
+        /// The process group, led by the CLI's process id.
+        group: u32,
+    },
     /// The agent finished but its response is not the requested shape.
     #[error("agent response is unusable: {0}")]
     InvalidResponse(String),

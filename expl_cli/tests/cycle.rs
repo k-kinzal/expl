@@ -23,6 +23,10 @@ use std::time::{Duration, Instant};
 /// `@DIR@/finding.json` when present. Prompts are kept in `@DIR@/prompts/`
 /// for inspection. While `@DIR@/fast-revisits` exists, the fake explorer
 /// records the first revisit prompt and immediately returns no proposals.
+/// While `@DIR@/switch` exists, execution first takes its worktree off the
+/// step's branch — to the branch named in it, or a detached HEAD when it
+/// says `detached` — and edits `README.md` there; with `@DIR@/switch-fails`
+/// too, it then exits 1 instead of reporting.
 const AGENT: &str = r#"#!/bin/sh
 if [ "$EXPL_ROLE" = exploration ] && [ "$EXPL_EVENT" = node.revisited ] && [ -f "@DIR@/fast-revisits" ]; then
   prompt="@DIR@/prompts/exploration-revisit.txt"
@@ -75,6 +79,16 @@ execution)
   if [ -f "@DIR@/fail" ]; then
     echo '{"succeeded":false,"summary":"could not compile hello.rs"}'
     exit 0
+  fi
+  if [ -f "@DIR@/switch" ]; then
+    target=$(cat "@DIR@/switch")
+    if [ "$target" = detached ]; then
+      git switch -q --detach
+    else
+      git switch -q --ignore-other-worktrees "$target"
+    fi
+    echo "edited by $EXPL_NODE" > README.md
+    if [ -f "@DIR@/switch-fails" ]; then exit 1; fi
   fi
   echo "node $EXPL_NODE" > "node-$EXPL_NODE.txt"
   if [ -f "@DIR@/shared" ]; then echo "node $EXPL_NODE" > shared.txt; fi
@@ -1273,40 +1287,232 @@ fn the_origin_follows_the_trunk() {
 }
 
 #[test]
-fn a_step_whose_branch_is_the_trunk_fails_and_leaves_the_trunk_alone() {
+fn a_step_takes_a_fresh_branch_and_leaves_the_trunk_and_other_branches_alone() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
+    let tip = |branch: &str| git(repo, &["rev-parse", &format!("refs/heads/{branch}")]);
     ok(repo, &["goal", "add", "Say hello"]);
     let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
+    let b = ok(repo, &["node", "add", "B", "--priority", "1"]);
 
-    // The trunk is a branch that is not checked out and is named like the
-    // step's own branch.
+    // The trunk is a branch that is not checked out and is named like A's
+    // first branch name.
     let trunk = format!("expl/node-{a}");
     git(repo, &["checkout", "-q", "-b", &trunk]);
     std::fs::write(repo.join("trunk.txt"), "trunk\n").expect("write");
     git(repo, &["add", "trunk.txt"]);
     git(repo, &["commit", "-q", "-m", "Trunk work"]);
+    // An unrelated branch, never the trunk, takes B's first name.
+    let unrelated = format!("expl/node-{b}");
+    git(repo, &["checkout", "-q", "-b", &unrelated, "main"]);
+    std::fs::write(repo.join("unrelated.txt"), "unrelated\n").expect("write");
+    git(repo, &["add", "unrelated.txt"]);
+    git(repo, &["commit", "-q", "-m", "Unrelated work"]);
     git(repo, &["checkout", "-q", "main"]);
-    let tip = git(repo, &["rev-parse", &format!("refs/heads/{trunk}")]);
+    let trunk_tip = tip(&trunk);
+    let unrelated_tip = tip(&unrelated);
     let path = repo.join("expl.toml");
     let declaration = std::fs::read_to_string(&path).expect("declaration");
     assert!(declaration.contains("trunk = \"main\""), "{declaration}");
     let declaration = declaration.replacen("trunk = \"main\"", &format!("trunk = \"{trunk}\""), 1);
     std::fs::write(&path, declaration).expect("declaration");
 
+    // A first attempt that fails stays on a branch of its own.
+    sandbox.marker("fail", true);
     ok(repo, &["run", "executor", "--exit-when-idle"]);
-    let step = node(repo, &a);
-    assert_eq!(step["node"]["status"], "failed", "{step}");
-    let outcome = step["node"]["outcome"].as_str().unwrap_or_default();
-    assert!(
-        outcome.contains(&format!("branch `{trunk}` is the trunk")),
-        "{step}"
+    let mut failed = Vec::new();
+    for id in [&a, &b] {
+        let step = node(repo, id);
+        assert_eq!(step["node"]["status"], "failed", "{step}");
+        let branch = format!("expl/node-{id}-2");
+        assert_eq!(step["node"]["branch"], branch.as_str(), "{step}");
+        failed.push((branch.clone(), tip(&branch)));
+    }
+    assert_eq!(tip(&trunk), trunk_tip, "the trunk is never written to");
+    assert_eq!(
+        tip(&unrelated),
+        unrelated_tip,
+        "an unrelated branch is kept"
+    );
+
+    // A retry takes yet another fresh name; nothing earlier is replaced.
+    sandbox.marker("fail", false);
+    ok(repo, &["node", "retry", &a]);
+    ok(repo, &["node", "retry", &b]);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    for id in [&a, &b] {
+        let step = node(repo, id);
+        assert_eq!(step["node"]["status"], "completed", "{step}");
+        let branch = format!("expl/node-{id}-3");
+        assert_eq!(step["node"]["branch"], branch.as_str(), "{step}");
+        assert_eq!(step["node"]["head_commit"], tip(&branch).as_str(), "{step}");
+        assert_eq!(
+            git(repo, &["show", &format!("{branch}:node-{id}.txt")]),
+            format!("node {id}")
+        );
+    }
+    assert_eq!(tip(&trunk), trunk_tip, "the trunk is never written to");
+    assert_eq!(git(repo, &["show", &format!("{trunk}:trunk.txt")]), "trunk");
+    assert_eq!(
+        tip(&unrelated),
+        unrelated_tip,
+        "an unrelated branch is kept"
     );
     assert_eq!(
-        git(repo, &["rev-parse", &format!("refs/heads/{trunk}")]),
-        tip
+        git(repo, &["show", &format!("{unrelated}:unrelated.txt")]),
+        "unrelated"
     );
-    assert!(!repo.join(format!(".expl/worktrees/node-{a}")).exists());
+    for (branch, commit) in &failed {
+        assert_eq!(&tip(branch), commit, "an earlier attempt's branch is kept");
+    }
+}
+
+#[test]
+fn a_symbolic_trunk_and_its_target_are_left_alone_when_a_step_takes_that_name() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let tip = |branch: &str| git(repo, &["rev-parse", &format!("refs/heads/{branch}")]);
+    ok(repo, &["goal", "add", "Say hello"]);
+    let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
+
+    // The declared trunk is a symbolic ref to a branch named like A's
+    // first branch name; neither name is the other, so only the ref
+    // itself shows that the step's name is the trunk's.
+    let target = format!("expl/node-{a}");
+    let target_ref = format!("refs/heads/{target}");
+    git(repo, &["checkout", "-q", "-b", &target]);
+    std::fs::write(repo.join("trunk.txt"), "trunk\n").expect("write");
+    git(repo, &["add", "trunk.txt"]);
+    git(repo, &["commit", "-q", "-m", "Trunk work"]);
+    git(repo, &["checkout", "-q", "main"]);
+    git(repo, &["symbolic-ref", "refs/heads/trunk", &target_ref]);
+    let trunk_tip = tip("trunk");
+    assert_eq!(tip(&target), trunk_tip);
+    let path = repo.join("expl.toml");
+    let declaration = std::fs::read_to_string(&path).expect("declaration");
+    assert!(declaration.contains("trunk = \"main\""), "{declaration}");
+    let declaration = declaration.replacen("trunk = \"main\"", "trunk = \"trunk\"", 1);
+    std::fs::write(&path, declaration).expect("declaration");
+
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    let step = node(repo, &a);
+    assert_eq!(step["node"]["status"], "completed", "{step}");
+    let branch = format!("expl/node-{a}-2");
+    assert_eq!(step["node"]["branch"], branch.as_str(), "{step}");
+    assert_eq!(step["node"]["head_commit"], tip(&branch).as_str(), "{step}");
+    assert_eq!(
+        git(repo, &["show", &format!("{branch}:node-{a}.txt")]),
+        format!("node {a}")
+    );
+
+    // The trunk still points at its target, which still holds its commit.
+    assert_eq!(
+        git(repo, &["symbolic-ref", "refs/heads/trunk"]),
+        target_ref,
+        "the trunk keeps its symref target"
+    );
+    assert_eq!(tip("trunk"), trunk_tip, "the trunk is never written to");
+    assert_eq!(tip(&target), trunk_tip, "the trunk's target is kept");
+    assert_eq!(git(repo, &["show", "trunk:trunk.txt"]), "trunk");
+}
+
+#[test]
+fn a_reinitialised_graph_reusing_an_id_keeps_the_unadopted_branch() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let tip = |branch: &str| git(repo, &["rev-parse", &format!("refs/heads/{branch}")]);
+    let is_ancestor = |ancestor: &str, of: &str| {
+        Command::new("git")
+            .args(["merge-base", "--is-ancestor", ancestor, of])
+            .current_dir(repo)
+            .status()
+            .expect("git")
+            .success()
+    };
+
+    // A step of the first graph completes on `expl/node-2` and is never
+    // adopted.
+    let old = ok(repo, &["node", "add", "Old work", "--priority", "1"]);
+    assert_eq!(old, "2");
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    let step = node(repo, &old);
+    assert_eq!(step["node"]["status"], "completed", "{step}");
+    assert_eq!(step["node"]["branch"], "expl/node-2", "{step}");
+    let old_commit = tip("expl/node-2");
+    assert_eq!(step["node"]["head_commit"], old_commit.as_str(), "{step}");
+    assert!(!is_ancestor(&old_commit, "main"), "not adopted");
+
+    // The graph is thrown away and started again: ids count from the
+    // start, so the new graph's first step is node 2 again.
+    std::fs::remove_dir_all(repo.join(".expl")).expect("remove .expl");
+    assert_eq!(ok(repo, &["init"]), "1");
+    let new = ok(repo, &["node", "add", "New work", "--priority", "1"]);
+    assert_eq!(new, "2");
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    let step = node(repo, &new);
+    assert_eq!(step["node"]["status"], "completed", "{step}");
+    assert_eq!(step["node"]["branch"], "expl/node-2-2", "{step}");
+    let new_commit = tip("expl/node-2-2");
+    assert_eq!(step["node"]["head_commit"], new_commit.as_str(), "{step}");
+    assert_ne!(new_commit, old_commit);
+
+    // The old work is still on its branch.
+    assert_eq!(tip("expl/node-2"), old_commit, "the old branch is kept");
+    assert!(is_ancestor(&old_commit, "expl/node-2"));
+    assert!(!is_ancestor(&old_commit, "expl/node-2-2"));
+    assert_eq!(
+        git(repo, &["log", "-1", "--format=%s", "expl/node-2"]),
+        "Old work"
+    );
+}
+
+/// Every ref in `repo`, with what it points at.
+fn refs(repo: &Path) -> String {
+    git(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
+}
+
+/// A step whose agent takes its worktree to `target` (a branch, or
+/// `detached`) fails naming `head`, and moves no ref but the step's own
+/// branch's creation; with `fallback`, the agent fails there and a second
+/// CLI waits, so the restore before it is what must refuse.
+fn a_step_that_leaves_its_branch(target: &str, head: &str, fallback: bool) {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let dir = sandbox.dir.path();
+    git(repo, &["switch", "-q", "-c", "other"]);
+    std::fs::write(repo.join("other.txt"), "other\n").expect("write");
+    git(repo, &["add", "other.txt"]);
+    git(repo, &["commit", "-q", "-m", "Other work"]);
+    git(repo, &["switch", "-q", "main"]);
+    if fallback {
+        let declaration = std::fs::read_to_string(repo.join("expl.toml")).expect("read");
+        std::fs::write(
+            repo.join("expl.toml"),
+            format!(
+                "{declaration}\n[[agent.executor.alternative]]\ndriver = \"generic\"\ncommand = [\"{}\"]\n",
+                dir.join("agent.sh").display()
+            ),
+        )
+        .expect("declaration");
+        sandbox.marker("switch-fails", true);
+    }
+    ok(repo, &["goal", "add", "Say hello"]);
+    let step = ok(repo, &["node", "add", "A", "--priority", "1"]);
+    std::fs::write(dir.join("switch"), target).expect("switch marker");
+
+    let trunk = git(repo, &["rev-parse", "refs/heads/main"]);
+    let refs_before = refs(repo);
+    let status_before = git(repo, &["status", "--porcelain", "--untracked-files=all"]);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+
+    let inspected = node(repo, &step);
+    assert_eq!(inspected["node"]["status"], "failed", "{inspected}");
+    let outcome = inspected["node"]["outcome"].as_str().unwrap_or_default();
+    assert!(
+        outcome.contains(&format!("worktree left its branch `expl/node-{step}`"))
+            && outcome.contains(head),
+        "{outcome}"
+    );
     let completed = ok(
         repo,
         &[
@@ -1319,30 +1525,72 @@ fn a_step_whose_branch_is_the_trunk_fails_and_leaves_the_trunk_alone() {
         ],
     );
     assert_eq!(completed, "", "{completed}");
-
-    // A normal step still starts over on its own branch when retried.
-    let b = ok(repo, &["node", "add", "B", "--priority", "1"]);
-    sandbox.marker("fail", true);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
-    assert_eq!(node(repo, &b)["node"]["status"], "failed");
-    let branch = format!("expl/node-{b}");
-    assert!(git(repo, &["branch", "--list", &branch]).contains(&branch));
-    sandbox.marker("fail", false);
-    ok(repo, &["node", "retry", &b]);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
-    let step = node(repo, &b);
-    assert_eq!(step["node"]["status"], "completed", "{step}");
-    assert_eq!(step["node"]["branch"], branch.as_str(), "{step}");
+    // Every ref is where it was; the step's branch, made for it, holds
+    // nothing of the agent's.
+    let branch = format!("refs/heads/expl/node-{step}");
+    let refs_after = refs(repo);
+    let refs_after: Vec<&str> = refs_after
+        .lines()
+        .filter(|line| !line.starts_with(&format!("{branch} ")))
+        .collect();
+    assert_eq!(refs_after.join("\n"), refs_before, "{target}");
+    assert_eq!(git(repo, &["rev-parse", &branch]), trunk);
+    // The main checkout is untouched.
+    assert_eq!(git(repo, &["symbolic-ref", "HEAD"]), "refs/heads/main");
     assert_eq!(
-        git(repo, &["show", &format!("{branch}:node-{b}.txt")]),
+        git(repo, &["status", "--porcelain", "--untracked-files=all"]),
+        status_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("README.md")).expect("readme"),
+        "hello\n"
+    );
+    if fallback {
+        let log = std::fs::read_dir(repo.join(".expl/logs"))
+            .expect("logs")
+            .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("log"))
+            .collect::<String>();
+        assert!(!log.contains("restored the working directory"), "{log}");
+        assert!(!log.contains("falling over"), "{log}");
+    }
+
+    // An ordinary step still commits on its own branch.
+    std::fs::remove_file(dir.join("switch")).expect("switch marker");
+    let b = ok(repo, &["node", "add", "B", "--priority", "1"]);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    let inspected = node(repo, &b);
+    assert_eq!(inspected["node"]["status"], "completed", "{inspected}");
+    assert_eq!(
+        git(repo, &["show", &format!("expl/node-{b}:node-{b}.txt")]),
         format!("node {b}")
     );
-    // The trunk never moved; A stays failed.
-    assert_eq!(
-        git(repo, &["rev-parse", &format!("refs/heads/{trunk}")]),
-        tip
-    );
-    assert_eq!(node(repo, &a)["node"]["status"], "failed");
+    assert_eq!(git(repo, &["rev-parse", "refs/heads/main"]), trunk);
+}
+
+#[test]
+fn a_step_that_switches_its_worktree_to_the_trunk_fails_and_moves_no_ref() {
+    a_step_that_leaves_its_branch("main", "`refs/heads/main`", false);
+}
+
+#[test]
+fn a_step_that_switches_its_worktree_to_another_branch_fails_and_moves_no_ref() {
+    a_step_that_leaves_its_branch("other", "`refs/heads/other`", false);
+}
+
+#[test]
+fn a_step_that_detaches_its_worktree_fails_and_moves_no_ref() {
+    a_step_that_leaves_its_branch("detached", "is detached", false);
+}
+
+#[test]
+fn the_restore_before_a_fallback_cli_refuses_a_worktree_off_its_branch() {
+    for (target, head) in [
+        ("main", "`refs/heads/main`"),
+        ("other", "`refs/heads/other`"),
+        ("detached", "is detached"),
+    ] {
+        a_step_that_leaves_its_branch(target, head, true);
+    }
 }
 
 #[test]
