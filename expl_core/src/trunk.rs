@@ -329,6 +329,7 @@ fn ancestry(trunk: &str, commit: &str, source: GitError) -> TrunkError {
 mod tests {
     use super::*;
     use crate::event::{EventKind, Inbox};
+    use crate::graph::ChangeResult;
     use crate::process::ProcessId;
     use crate::role::Role;
     use crate::workspace::Workspaces;
@@ -420,11 +421,17 @@ mod tests {
             assert_eq!(delivery.event.node, Some(id));
             assert!(self.graph.claim(id, &delivery.token).expect("claim"));
             self.graph
-                .set_branch(id, &delivery.token, &branch, Some(&head))
-                .expect("branch");
-            self.graph
-                .complete(id, &delivery.token, "done")
-                .expect("complete");
+                .publish(
+                    id,
+                    &delivery.token,
+                    &ChangeResult {
+                        branch: &branch,
+                        head_commit: Some(&head),
+                        completed: true,
+                        outcome: "done",
+                    },
+                )
+                .expect("publish");
             inbox.ack(&delivery, None).expect("ack");
             id
         }

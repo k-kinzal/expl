@@ -21,6 +21,19 @@ const NODE_COLUMNS: &str = "id, kind, status, title, objective, priority, counte
 const EVALUATION_COLUMNS: &str = "id, node_id, goal_id, satisfied, score, reason, created_at";
 const CONCLUSION_COLUMNS: &str = "id, node_id, decision, hypothesis, finding, consequence, \
                                   resume_commit, reopened, created_at, agent";
+/// What an attempt at a change step left, settled by [`Graph::publish`].
+#[derive(Debug, Clone, Copy)]
+pub struct ChangeResult<'a> {
+    /// The attempt's own branch.
+    pub branch: &'a str,
+    /// The attempt's tip commit; `None` when it failed before committing.
+    pub head_commit: Option<&'a str>,
+    /// Whether the step completed (it failed otherwise).
+    pub completed: bool,
+    /// The agent's summary or the failure.
+    pub outcome: &'a str,
+}
+
 /// A step about to be proposed ([`Graph::propose`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NewStep<'a> {
@@ -936,7 +949,11 @@ impl Graph {
         Ok(changed == 1)
     }
 
-    /// Record the branch (and, when known, the tip commit) of a claimed step.
+    /// Record the branch a claimed change step's attempt works on. The
+    /// attempt has committed nothing yet, so whatever tip the step recorded
+    /// before — an earlier attempt's — is cleared: a branch is never shown
+    /// paired with another attempt's commit. Its tip, outcome and events
+    /// follow at once with [`publish`](Self::publish).
     ///
     /// # Errors
     ///
@@ -947,17 +964,74 @@ impl Graph {
         id: NodeId,
         token: &LeaseToken,
         branch: &str,
-        head_commit: Option<&str>,
     ) -> Result<(), GraphError> {
         let tx = self.write()?;
         ensure_holder(&tx, id, token)?;
         tx.execute(
             &format!(
-                "UPDATE nodes SET branch = ?2, head_commit = COALESCE(?3, head_commit), \
-                 updated_at = {NOW} WHERE id = ?1"
+                "UPDATE nodes SET branch = ?2, head_commit = NULL, updated_at = {NOW} \
+                 WHERE id = ?1"
             ),
-            params![id.0, branch, head_commit],
+            params![id.0, branch],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Settle a running change step with what its attempt left: its branch,
+    /// tip commit, status and outcome, and `node.completed` (with
+    /// `node.ready` for every successor that can run now) or `node.failed`,
+    /// all in one transaction under the delivery's lease. A delivery that
+    /// lost the step publishes nothing, so the step never pairs one
+    /// attempt's branch with another's tip or outcome.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError::LeaseLost`] when the delivery does not hold the step,
+    /// [`GraphError::Uncommitted`] when a completion has no tip commit,
+    /// [`GraphError::NotInStatus`] when the held step is an investigation,
+    /// or [`GraphError::Sqlite`] on SQLite failure.
+    pub fn publish(
+        &mut self,
+        id: NodeId,
+        token: &LeaseToken,
+        result: &ChangeResult<'_>,
+    ) -> Result<(), GraphError> {
+        let status = if result.completed {
+            NodeStatus::Completed
+        } else {
+            NodeStatus::Failed
+        };
+        if result.completed && result.head_commit.is_none() {
+            return Err(GraphError::Uncommitted(id));
+        }
+        let tx = self.write()?;
+        ensure_holder(&tx, id, token)?;
+        let changed = tx.execute(
+            &format!(
+                "UPDATE nodes SET status = ?2, outcome = ?3, branch = ?4, head_commit = ?5, \
+                 holder_token = NULL, updated_at = {NOW} \
+                 WHERE id = ?1 AND kind = 'step' AND investigation = 0 AND status = 'running'"
+            ),
+            params![
+                id.0,
+                status.as_str(),
+                result.outcome,
+                result.branch,
+                result.head_commit
+            ],
+        )?;
+        if changed == 0 {
+            return Err(GraphError::NotInStatus {
+                node: id,
+                expected: "a running change step",
+            });
+        }
+        if result.completed {
+            emit_completion(&tx, id)?;
+        } else {
+            emit(&tx, EventKind::NodeFailed, Some(id))?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1757,6 +1831,77 @@ mod tests {
     }
 
     #[test]
+    fn a_change_step_publishes_its_branch_tip_outcome_and_events_at_once() {
+        let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
+        let step = graph.propose_step("a", "a", &[origin], &[goal]).expect("a");
+        let next = graph.propose_step("b", "b", &[step], &[goal]).expect("b");
+        graph.plan_step(step, 1).expect("plan");
+        graph.plan_step(next, 1).expect("plan");
+        let delivery = lease_ready(&mut inbox, 1, step);
+        assert!(graph.claim(step, &delivery.token).expect("claim"));
+        graph
+            .set_branch(step, &delivery.token, "expl/node-a")
+            .expect("branch");
+        let before = kinds(&graph).len();
+
+        assert!(matches!(
+            graph.publish(
+                step,
+                &delivery.token,
+                &ChangeResult {
+                    branch: "expl/node-a",
+                    head_commit: None,
+                    completed: true,
+                    outcome: "done",
+                },
+            ),
+            Err(GraphError::Uncommitted(id)) if id == step
+        ));
+        assert_eq!(kinds(&graph).len(), before, "nothing was published");
+
+        graph
+            .publish(
+                step,
+                &delivery.token,
+                &ChangeResult {
+                    branch: "expl/node-a",
+                    head_commit: Some("def"),
+                    completed: true,
+                    outcome: "done",
+                },
+            )
+            .expect("publish");
+        let node = graph.node(step).expect("node");
+        assert_eq!(node.status, NodeStatus::Completed);
+        assert_eq!(node.branch.as_deref(), Some("expl/node-a"));
+        assert_eq!(node.head_commit.as_deref(), Some("def"));
+        assert_eq!(node.outcome.as_deref(), Some("done"));
+        assert_eq!(
+            kinds(&graph)[before..],
+            [
+                (EventKind::NodeCompleted, Some(step.0)),
+                (EventKind::NodeReady, Some(next.0))
+            ]
+        );
+
+        // Settled, the step is no longer the delivery's to publish.
+        assert!(matches!(
+            graph.publish(
+                step,
+                &delivery.token,
+                &ChangeResult {
+                    branch: "expl/node-a-2",
+                    head_commit: None,
+                    completed: false,
+                    outcome: "late",
+                },
+            ),
+            Err(GraphError::LeaseLost(id)) if id == step
+        ));
+        assert_eq!(graph.node(step).expect("node"), node);
+    }
+
+    #[test]
     fn only_the_current_executor_can_record_a_finding() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("expl.db");
@@ -1974,11 +2119,17 @@ mod tests {
         let delivery = lease_ready(&mut inbox, 1, a);
         assert!(graph.claim(a, &delivery.token).expect("claim"));
         graph
-            .set_branch(a, &delivery.token, "expl/node-a", Some("def"))
-            .expect("branch");
-        graph
-            .complete(a, &delivery.token, "done")
-            .expect("complete");
+            .publish(
+                a,
+                &delivery.token,
+                &ChangeResult {
+                    branch: "expl/node-a",
+                    head_commit: Some("def"),
+                    completed: true,
+                    outcome: "done",
+                },
+            )
+            .expect("publish");
         inbox.ack(&delivery, None).expect("ack");
         let c = graph.propose_step("c", "c", &[origin], &[goal]).expect("c");
         graph.plan_step(c, 1).expect("plan");
@@ -2417,17 +2568,17 @@ mod tests {
         let delivery = lease_ready(inbox, 1, step);
         assert!(graph.claim(step, &delivery.token).expect("claim"));
         graph
-            .set_branch(step, &delivery.token, "expl/node-3", Some("left"))
-            .expect("branch");
-        if failed {
-            graph
-                .fail(step, &delivery.token, "timed out")
-                .expect("fail");
-        } else {
-            graph
-                .complete(step, &delivery.token, "done, it says")
-                .expect("complete");
-        }
+            .publish(
+                step,
+                &delivery.token,
+                &ChangeResult {
+                    branch: "expl/node-3",
+                    head_commit: Some("left"),
+                    completed: !failed,
+                    outcome: if failed { "timed out" } else { "done, it says" },
+                },
+            )
+            .expect("publish");
         inbox.ack(&delivery, None).expect("ack");
         step
     }

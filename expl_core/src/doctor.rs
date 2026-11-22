@@ -462,7 +462,7 @@ fn owner(graph: &Graph, node: NodeId) -> Result<Owner, GraphError> {
 mod tests {
     use super::*;
     use crate::event::{Delivery, EventKind, Inbox, LeaseToken};
-    use crate::graph::NewOrigin;
+    use crate::graph::{ChangeResult, NewOrigin};
     use crate::process::{ProcessId, Processes};
     use crate::store::{self, EPOCH};
 
@@ -572,17 +572,17 @@ mod tests {
             std::fs::write(workspace.path().join(file), file).expect("write");
             let head = workspace.commit(file).expect("commit");
             self.graph
-                .set_branch(id, &delivery.token, workspace.branch(), Some(&head))
-                .expect("branch");
-            if complete {
-                self.graph
-                    .complete(id, &delivery.token, "done")
-                    .expect("complete");
-            } else {
-                self.graph
-                    .fail(id, &delivery.token, "broken")
-                    .expect("fail");
-            }
+                .publish(
+                    id,
+                    &delivery.token,
+                    &ChangeResult {
+                        branch: workspace.branch(),
+                        head_commit: Some(&head),
+                        completed: complete,
+                        outcome: if complete { "done" } else { "broken" },
+                    },
+                )
+                .expect("publish");
             self.inbox().ack(&delivery, None).expect("ack");
             (id, workspace.path().to_owned())
         }

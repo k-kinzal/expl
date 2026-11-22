@@ -27,6 +27,9 @@ pub enum GraphError {
     /// The delivery cannot claim or write this step under its lease.
     #[error("the delivery no longer holds the lease required for step {0}")]
     LeaseLost(NodeId),
+    /// A change step cannot complete without a tip commit.
+    #[error("change step {0} cannot complete without a commit")]
+    Uncommitted(NodeId),
     /// The graph has no origin (not initialised).
     #[error("the graph has no origin node")]
     NoOrigin,
