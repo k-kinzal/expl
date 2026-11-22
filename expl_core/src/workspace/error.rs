@@ -37,6 +37,32 @@ pub enum WorkspaceError {
         /// The branch, as named in the trunk.
         branch: String,
     },
+    /// The step's worktree no longer has the step's own branch checked
+    /// out: someone switched it to another branch (the trunk, say) or
+    /// detached its HEAD. Nothing is written there, since a write would
+    /// land on whatever HEAD points at now.
+    #[error(
+        "step {node}'s worktree left its branch `{branch}`: HEAD {}; nothing was written there",
+        describe_head(.head.as_deref())
+    )]
+    LeftBranch {
+        /// The step whose worktree it is.
+        node: NodeId,
+        /// The step's own branch, which HEAD should be attached to.
+        branch: String,
+        /// The ref HEAD is attached to instead (such as `refs/heads/main`),
+        /// or `None` when HEAD is detached.
+        head: Option<String>,
+    },
+    /// A scratch worktree, which stays detached, has a branch checked out:
+    /// resetting it would move that branch, so nothing is written there.
+    #[error(
+        "the scratch worktree has `{head}` checked out instead of a detached HEAD; nothing was written there"
+    )]
+    ScratchAttached {
+        /// The ref HEAD is attached to (such as `refs/heads/main`).
+        head: String,
+    },
     /// Predecessor commits are still waiting to be merged.
     #[error("predecessor commits not merged yet: {}", .0.join(", "))]
     JoinIncomplete(Vec<String>),
@@ -48,4 +74,12 @@ pub enum WorkspaceError {
         /// The branch tip that should contain it.
         tip: String,
     },
+}
+
+/// How [`WorkspaceError::LeftBranch`] names where HEAD points.
+fn describe_head(head: Option<&str>) -> String {
+    match head {
+        Some(head) => format!("points at `{head}`"),
+        None => "is detached".to_owned(),
+    }
 }

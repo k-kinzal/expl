@@ -179,6 +179,31 @@ impl Git {
         }
     }
 
+    /// The full ref HEAD is attached to (such as `refs/heads/main`), or
+    /// `None` when HEAD is detached. Unlike
+    /// [`current_branch`](Self::current_branch), a repository git cannot
+    /// read is an error, not a detached HEAD.
+    ///
+    /// # Errors
+    ///
+    /// [`GitError`] when git cannot start or fails other than by finding
+    /// HEAD detached.
+    pub fn head_ref(&self) -> Result<Option<String>, GitError> {
+        let args = ["symbolic-ref", "-q", "HEAD"];
+        let output = self.output(&args)?;
+        match output.status.code() {
+            Some(0) => Ok(Some(
+                String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+            )),
+            Some(1) => Ok(None),
+            _ => Err(GitError::Failed {
+                args: args.join(" "),
+                dir: self.dir.display().to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            }),
+        }
+    }
+
     /// Whether a local branch named `name` exists.
     ///
     /// # Errors

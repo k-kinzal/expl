@@ -13,7 +13,7 @@ use crate::graph::{AgentRunStatus, Graph, NodeId};
 use crate::process::{Interrupt, ProcessId};
 use crate::prompt::Prompt;
 use crate::role::{Context, Report, RoleError};
-use crate::workspace::ScratchWorkspace;
+use crate::workspace::{ScratchWorkspace, Workspace};
 
 /// Everything a role needs to react to one event.
 #[derive(Debug, Clone, Copy)]
@@ -96,7 +96,8 @@ impl<'a> Reaction<'a> {
         }
     }
 
-    /// Invoke the agent once in `directory` and decode its response.
+    /// Invoke the agent once in the step's own `workspace` and decode its
+    /// response.
     ///
     /// The invocation is journaled (`agent_runs`) with its raw log under
     /// `.expl/logs/`, whether it succeeds or not.
@@ -104,11 +105,11 @@ impl<'a> Reaction<'a> {
         &self,
         graph: &mut Graph,
         node: Option<NodeId>,
-        directory: &Path,
+        workspace: &Workspace,
         prompt: &Prompt,
         schema: &serde_json::Value,
     ) -> Result<T, RoleError> {
-        self.run(graph, node, directory, None, prompt, schema)
+        self.run(graph, node, Place::Step(workspace), prompt, schema)
     }
 
     /// Invoke the agent once in the read-only `scratch` worktree, as
@@ -129,18 +130,21 @@ impl<'a> Reaction<'a> {
         prompt: &Prompt,
         schema: &serde_json::Value,
     ) -> Result<T, RoleError> {
-        self.run(graph, node, scratch.path(), Some(scratch), prompt, schema)
+        self.run(graph, node, Place::Scratch(scratch), prompt, schema)
     }
 
     fn run<T: DeserializeOwned>(
         &self,
         graph: &mut Graph,
         node: Option<NodeId>,
-        directory: &Path,
-        scratch: Option<&ScratchWorkspace>,
+        place: Place<'_>,
         prompt: &Prompt,
         schema: &serde_json::Value,
     ) -> Result<T, RoleError> {
+        let (directory, scratch) = match place {
+            Place::Step(workspace) => (workspace.path(), None),
+            Place::Scratch(scratch) => (scratch.path(), Some(scratch)),
+        };
         let role = self.agent.role();
         let run_id = graph.begin_agent_run(
             self.agent.name(),
@@ -168,7 +172,9 @@ impl<'a> Reaction<'a> {
         // Every directory an agent works in is a worktree expl made for it,
         // so a failed attempt's leftovers can be reset before the next CLI.
         // Not while it resolves a merge: resetting would abort the merge
-        // the next CLI is to finish.
+        // the next CLI is to finish. Nor once the worktree left the branch
+        // it holds (or, for a scratch worktree, its detached HEAD): the
+        // reset would move whatever branch HEAD points at now.
         let git = Git::in_worktree(directory);
         let merging = git
             .run(&["rev-parse", "-q", "--verify", "MERGE_HEAD"])
@@ -177,10 +183,12 @@ impl<'a> Reaction<'a> {
             .then(|| git.resolve_commit("HEAD").ok())
             .flatten();
         let restore = || -> std::io::Result<()> {
-            match &started_at {
-                Some(head) => git.restore(head).map_err(std::io::Error::other),
-                None => Ok(()),
-            }
+            let restored = match (&started_at, place) {
+                (None, _) => Ok(()),
+                (Some(head), Place::Step(workspace)) => workspace.restore(head),
+                (Some(_), Place::Scratch(scratch)) => scratch.restore(),
+            };
+            restored.map_err(std::io::Error::other)
         };
         let outcome = self
             .agent
@@ -233,6 +241,15 @@ impl<'a> Reaction<'a> {
             }
         }
     }
+}
+
+/// Where an agent is invoked.
+#[derive(Debug, Clone, Copy)]
+enum Place<'a> {
+    /// A change step's own worktree, on the step's branch.
+    Step(&'a Workspace),
+    /// A read-only scratch worktree, detached.
+    Scratch(&'a ScratchWorkspace),
 }
 
 /// Append a read-only `violation` (and the agent's own `failure`, which it
