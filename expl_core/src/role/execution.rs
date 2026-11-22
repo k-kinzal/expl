@@ -30,6 +30,7 @@ use crate::event::Event;
 use crate::graph::{Answer, Graph, GraphError, Node, NodeId, NodeKind, NodeStatus};
 use crate::prompt::Prompt;
 use crate::role::{Reaction, Report, RoleError};
+use crate::trunk::Trunk;
 use crate::workspace::{Workspace, Workspaces};
 
 /// What one execution did.
@@ -125,7 +126,12 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     }
 
     let branch = Workspaces::branch_name(id);
-    let mut workspace = match reaction.context().workspaces().create(&node, &predecessors) {
+    // The step's branch is discarded and made afresh: never when it is the
+    // trunk.
+    let context = reaction.context();
+    let trunk = Trunk::new(context.project(), context.declaration().trunk.as_deref());
+    let trunk = trunk.branches(graph)?;
+    let mut workspace = match context.workspaces().create(&node, &predecessors, &trunk) {
         Ok(workspace) => workspace,
         Err(error) => return fail(graph, &node, &branch, None, error.to_string()),
     };

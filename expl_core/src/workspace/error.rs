@@ -27,6 +27,16 @@ pub enum WorkspaceError {
     /// other than expl while its conflicts were being resolved.
     #[error("the merge of predecessor commit {0} is no longer in progress")]
     MergeAbandoned(String),
+    /// The branch that would hold the step is the trunk (or was): creating
+    /// the step's worktree would discard it, and expl never writes to the
+    /// trunk.
+    #[error("step {node}'s branch `{branch}` is the trunk, which is never written to")]
+    TrunkBranch {
+        /// The step whose branch it is.
+        node: NodeId,
+        /// The branch, as named in the trunk.
+        branch: String,
+    },
     /// Predecessor commits are still waiting to be merged.
     #[error("predecessor commits not merged yet: {}", .0.join(", "))]
     JoinIncomplete(Vec<String>),

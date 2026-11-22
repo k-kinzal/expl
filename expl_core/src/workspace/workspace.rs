@@ -135,14 +135,32 @@ impl Workspaces {
     /// ([`Workspace::conflicts`]); once it is resolved,
     /// [`Workspace::resume`] merges the remaining predecessors. Any
     /// previous worktree and branch of the node (an earlier attempt) are
-    /// discarded first.
+    /// discarded first — unless that branch is one of the `trunk` branches
+    /// ([`Trunk::branches`](crate::trunk::Trunk::branches)), which is
+    /// refused before anything is touched.
     ///
     /// # Errors
     ///
-    /// [`WorkspaceError::PredecessorNotRealized`] when a predecessor has no
-    /// commit; [`WorkspaceError::Git`] when git fails other than by a merge
-    /// conflict.
-    pub fn create(&self, node: &Node, predecessors: &[Node]) -> Result<Workspace, WorkspaceError> {
+    /// [`WorkspaceError::TrunkBranch`] when the node's branch is a `trunk`
+    /// branch; [`WorkspaceError::PredecessorNotRealized`] when a predecessor
+    /// has no commit; [`WorkspaceError::Git`] when git fails other than by a
+    /// merge conflict.
+    pub fn create(
+        &self,
+        node: &Node,
+        predecessors: &[Node],
+        trunk: &[String],
+    ) -> Result<Workspace, WorkspaceError> {
+        let branch = Self::branch_name(node.id);
+        if let Some(named) = trunk
+            .iter()
+            .find(|t| t.strip_prefix("refs/heads/").unwrap_or(t) == branch)
+        {
+            return Err(WorkspaceError::TrunkBranch {
+                node: node.id,
+                branch: named.clone(),
+            });
+        }
         let mut commits = Vec::new();
         for predecessor in predecessors {
             let commit = predecessor
@@ -158,7 +176,6 @@ impl Workspaces {
         };
 
         let path = self.path_of(node.id);
-        let branch = Self::branch_name(node.id);
         {
             let _guard = lock(&self.lock)?;
             self.discard_locked(node.id)?;
