@@ -338,6 +338,7 @@ fn an_investigation_answers_without_a_commit_and_its_finding_is_judged() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
     ok(repo, &["goal", "add", "Is hello written yet?"]);
+    let change = ok(repo, &["node", "add", "Write a file", "--priority", "1"]);
     let question = ok(
         repo,
         &[
@@ -347,6 +348,8 @@ fn an_investigation_answers_without_a_commit_and_its_finding_is_judged() {
             "--objective",
             "Does hello.txt exist?",
             "--investigation",
+            "--after",
+            &change,
             "--before",
             "2",
             "--priority",
@@ -368,13 +371,13 @@ fn an_investigation_answers_without_a_commit_and_its_finding_is_judged() {
     ok(repo, &["run", "executor", "--exit-when-idle"]);
 
     // Answered, at the code it was about, with no branch or commit of its own.
-    let origin_commit = git(repo, &["rev-parse", "main"]);
+    let code = git(repo, &["rev-parse", &format!("expl/node-{change}")]);
     let finding = node(repo, &question)["node"].clone();
     assert_eq!(finding["status"], "completed", "{finding}");
     assert_eq!(finding["investigation"], true);
     assert_eq!(finding["answer"], "no");
     assert_eq!(finding["branch"], serde_json::Value::Null);
-    assert_eq!(finding["head_commit"].as_str(), Some(origin_commit.trim()));
+    assert_eq!(finding["head_commit"].as_str(), Some(code.trim()));
     let branches = git(repo, &["branch", "--list", "expl/*"]);
     assert!(
         !branches.contains(&format!("expl/node-{question}")),
@@ -383,7 +386,7 @@ fn an_investigation_answers_without_a_commit_and_its_finding_is_judged() {
     // The change after it starts from that same code.
     assert_eq!(node(repo, &then)["node"]["status"], "completed");
     let parent = git(repo, &["rev-parse", &format!("expl/node-{then}^")]);
-    assert_eq!(parent.trim(), origin_commit.trim());
+    assert_eq!(parent.trim(), code.trim());
 
     // Its finding, not a working directory, is what evaluation judges.
     ok(repo, &["run", "evaluator", "--exit-when-idle"]);
@@ -395,15 +398,24 @@ fn an_investigation_answers_without_a_commit_and_its_finding_is_judged() {
     assert!(judged, "no evaluation was shown the finding");
     let candidates = ok(repo, &["candidate", "ls"]);
     assert!(candidates.contains("answer: no"), "{candidates}");
-    // Never mistaken for work the trunk took in.
-    std::fs::write(repo.join("README.md"), "moved\n").expect("write");
-    git(repo, &["commit", "-qam", "move the trunk"]);
-    ok(repo, &["run", "planner", "--exit-when-idle"]);
-    let lineage = json_lines(&ok(repo, &["origin", "ls", "--format", "json"]));
-    assert_eq!(
-        lineage.last().expect("origin")["adopted"],
-        serde_json::json!([])
-    );
+
+    // Adopting the change it read takes in the change, never the
+    // investigation — not even after the change after it is adopted too.
+    for step in [&change, &then] {
+        let branch = format!("expl/node-{step}");
+        git(repo, &["merge", "-q", "--no-ff", "-m", "adopt", &branch]);
+        ok(repo, &["run", "planner", "--exit-when-idle"]);
+        let lineage = json_lines(&ok(repo, &["origin", "ls", "--format", "json"]));
+        let adopted = &lineage.last().expect("origin")["adopted"];
+        let id: i64 = step.parse().expect("id");
+        assert_eq!(adopted, &serde_json::json!([id]), "adopting {step}");
+    }
+    let candidates = json_lines(&ok(repo, &["candidate", "ls", "--format", "json"]));
+    let answer = candidates
+        .iter()
+        .find(|c| c["node"].as_i64() == question.parse().ok())
+        .expect("the finding is still a candidate");
+    assert_eq!(answer["adopted_into"], serde_json::Value::Null, "{answer}");
 }
 
 #[test]

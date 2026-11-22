@@ -542,8 +542,10 @@ impl Graph {
 
     /// Move a step that has not started off the superseded origins it
     /// builds on, onto the active origin: its work will start from the code
-    /// as it is now. `false` when it builds on no superseded origin (nothing
-    /// to move).
+    /// as it is now. A step after an investigation of code the trunk has
+    /// since moved past keeps the investigation (its finding still informs
+    /// it) and also builds on the active origin, so its work starts from the
+    /// code as it is now too. `false` when there is nothing to move.
     ///
     /// # Errors
     ///
@@ -551,6 +553,7 @@ impl Graph {
     /// step; [`GraphError::Cycle`] when work adopted into the active origin
     /// builds on it. Nothing changes then.
     pub fn rebase(&mut self, step: NodeId) -> Result<bool, GraphError> {
+        let behind = self.behind_investigations(step)?;
         let tx = self.write()?;
         let node = node_in(&tx, step)?;
         if node.kind != NodeKind::Step
@@ -570,7 +573,12 @@ impl Graph {
             stmt.query_map(params![step.0, origin.0], |r| r.get(0))?
                 .collect::<Result<_, _>>()?
         };
-        if stale.is_empty() {
+        let on_origin: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM edges WHERE source_id = ?1 AND target_id = ?2)",
+            params![origin.0, step.0],
+            |r| r.get(0),
+        )?;
+        if stale.is_empty() && (behind.is_empty() || on_origin) {
             return Ok(false);
         }
         for source in stale {
@@ -582,6 +590,29 @@ impl Graph {
         connect_in(&tx, origin, step)?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// The completed investigations `step` builds on that read code the
+    /// trunk has since moved past: everything they built on is in the trunk
+    /// (origins and adopted changes), but not the active origin.
+    fn behind_investigations(&self, step: NodeId) -> Result<Vec<NodeId>, GraphError> {
+        let lineage = self.lineage()?;
+        let current = lineage.current;
+        let mut behind = Vec::new();
+        for predecessor in self.predecessors(step)? {
+            if !predecessor.investigation || predecessor.status != NodeStatus::Completed {
+                continue;
+            }
+            let ancestors = self.ancestors(predecessor.id)?;
+            let settled = ancestors.iter().all(|a| match a.kind {
+                NodeKind::Step => a.investigation || lineage.in_trunk(a.id),
+                NodeKind::Origin | NodeKind::Goal => true,
+            });
+            if settled && !ancestors.iter().any(|a| Some(a.id) == current) {
+                behind.push(predecessor.id);
+            }
+        }
+        Ok(behind)
     }
 
     /// Make the open step `target` also build on `sources`: planning's way
@@ -1467,6 +1498,62 @@ mod tests {
             graph.record_finding(next, &code, Answer::No, "x"),
             Err(GraphError::NotInStatus { .. })
         ));
+    }
+
+    #[test]
+    fn rebasing_after_an_investigation_of_older_code_adds_the_active_origin() {
+        let (mut graph, first, goal) = seeded();
+        let change = graph.propose_step("c", "c", &[first], &[goal]).expect("c");
+        let question = graph
+            .propose_investigation("q", "q?", &[first], &[goal])
+            .expect("q");
+        let on_change = graph
+            .propose_investigation("q2", "q2?", &[change], &[goal])
+            .expect("q2");
+        let after = graph
+            .propose_step("a", "a", &[question], &[goal])
+            .expect("a");
+        let after_change = graph
+            .propose_step("b", "b", &[on_change], &[goal])
+            .expect("b");
+        for step in [change, question, on_change, after, after_change] {
+            graph.plan_step(step, 1).expect("plan");
+        }
+        assert!(graph.claim(change, false).expect("claim"));
+        graph.complete(change, "done").expect("complete");
+        for step in [question, on_change] {
+            assert!(graph.claim(step, false).expect("claim"));
+            graph
+                .record_finding(step, "abc", Answer::No, "seen")
+                .expect("finding");
+        }
+        // Nothing to move while the investigation read the code as it is.
+        assert!(!graph.rebase(after).expect("rebase"));
+
+        let second = graph
+            .advance_origin(&new_origin(first, "def", &[]))
+            .expect("advance")
+            .expect("moved");
+        // It read the superseded origin's code: keep the finding, start from
+        // the active origin.
+        assert!(graph.rebase(after).expect("rebase"));
+        let preds: Vec<NodeId> = graph
+            .predecessors(after)
+            .expect("preds")
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        assert!(
+            preds.contains(&question) && preds.contains(&second),
+            "{preds:?}"
+        );
+        assert!(!graph.rebase(after).expect("again"), "already moved");
+        // An investigation of a change the trunk has not taken in reads work
+        // that is not in the active origin: that is planning's join to make.
+        assert!(!graph.rebase(after_change).expect("rebase"));
+        // And the trunk never takes in an investigation.
+        let lineage = graph.lineage().expect("lineage");
+        assert!(!lineage.in_trunk(question) && !lineage.in_trunk(on_change));
     }
 
     #[test]

@@ -231,12 +231,15 @@ fn investigate(
     let result: Result<Finding, RoleError> =
         reaction.invoke(graph, Some(id), scratch.path(), &prompt, &schema);
     drop(scratch);
+    // Whatever the agent answered, a lease another process took over means
+    // the step is no longer ours to record.
+    if reaction.lease_lost() {
+        return Err(RoleError::Agent(AgentError::Interrupted));
+    }
     let finding = match result {
         Ok(finding) => finding,
         Err(error @ RoleError::Agent(AgentError::Interrupted)) => {
-            if !reaction.lease_lost() {
-                graph.unclaim(id)?;
-            }
+            graph.unclaim(id)?;
             return Err(error);
         }
         Err(error @ RoleError::Agent(_)) => {
@@ -253,9 +256,6 @@ fn investigate(
             return Err(error);
         }
     };
-    if reaction.lease_lost() {
-        return Err(RoleError::Agent(AgentError::Interrupted));
-    }
     if !finding.investigated {
         return fail(graph, node, "", None, finding.evidence);
     }

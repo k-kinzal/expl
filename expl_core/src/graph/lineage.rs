@@ -94,7 +94,15 @@ impl Lineage {
             .enumerate()
             .map(|(index, n)| (n.id, index))
             .collect();
-        let is_step = |id: &NodeId| kinds.get(id) == Some(&NodeKind::Step);
+        // Only change steps reach the trunk: an investigation changed
+        // nothing, so the trunk never takes it in, even when a change after
+        // it is adopted.
+        let changes: BTreeSet<NodeId> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Step && !n.investigation)
+            .map(|n| n.id)
+            .collect();
+        let is_step = |id: &NodeId| changes.contains(id);
 
         let mut lineage = Self {
             current: origins

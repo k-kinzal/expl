@@ -300,8 +300,9 @@ fn prompt(reaction: &Reaction<'_>, shown: &Snapshot, schema: &serde_json::Value)
            combined. Join steps whose results complement each other.\n\
          - `prunes`: `proposed`/`planned` steps that are redundant, already covered, or no \
            longer promising given the judgements.\n\
-         - `rebases`: `proposed`/`planned` steps that build on a superseded origin and should \
-           start from the active origin instead. The trunk moving does not move them: move a \
+         - `rebases`: `proposed`/`planned` steps that build on a superseded origin (directly, \
+           or through investigations of its code) and should start from the active origin \
+           instead; a step after an investigation keeps its finding. The trunk moving does not move them: move a \
            step when its idea still holds on the newer code; keep it where it is when it \
            depends on the older code (or is worth trying there as an alternative); prune it \
            when the newer code already covers it.\n\n\
