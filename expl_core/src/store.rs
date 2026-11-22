@@ -206,6 +206,26 @@ UPDATE nodes SET proposed_by = (
     ORDER BY r.finished_at DESC LIMIT 1
 ) WHERE kind = 'step';
 ",
+    r"
+-- What evaluation concluded about a step it judged, before (and apart
+-- from) the goals: whether it is done, abandoned, or to be continued, the
+-- hypothesis it stood for, what was found, and what that changes. A step
+-- continued is put back to run again, starting from `resume_commit` (what
+-- the attempt left, for a change step) with the conclusion as guidance;
+-- `reopened` says whether it was.
+CREATE TABLE conclusions (
+    id            INTEGER PRIMARY KEY,
+    node_id       INTEGER NOT NULL REFERENCES nodes (id),
+    decision      TEXT NOT NULL CHECK (decision IN ('done', 'abandoned', 'continue')),
+    hypothesis    TEXT NOT NULL,
+    finding       TEXT NOT NULL,
+    consequence   TEXT NOT NULL,
+    resume_commit TEXT,
+    reopened      INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX conclusions_node ON conclusions (node_id);
+",
 ];
 
 /// Open the database at `path`, creating and migrating it as needed.

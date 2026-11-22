@@ -46,7 +46,7 @@ exploration)
     echo '{"nodes":[{"title":"Write hello","objective":"Create hello.txt"}]}'
   elif grep -q '^## Assumed done' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
     echo '{"nodes":[{"title":"After the open step","objective":"z","before":[]}]}'
-  elif [ "$EXPL_EVENT" = node.failed ]; then
+  elif grep -q '^## Failed step' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
     echo '{"nodes":[{"title":"Write hello in smaller steps","objective":"Create an empty hello.txt"}]}'
   else
     echo '{"nodes":[]}'
@@ -76,7 +76,10 @@ execution)
     echo '{"succeeded":true,"summary":"resolved conflicts"}'
     exit 0
   fi
-  if [ -f "@DIR@/fail" ]; then
+  if [ -f "@DIR@/fail-partial" ]; then
+    echo "half of node $EXPL_NODE" > "partial-$EXPL_NODE.txt"
+  fi
+  if [ -f "@DIR@/fail" ] || [ -f "@DIR@/fail-partial" ]; then
     echo '{"succeeded":false,"summary":"could not compile hello.rs"}'
     exit 0
   fi
@@ -1838,8 +1841,18 @@ fn a_failed_step_grows_new_hypotheses_in_its_place() {
     ok(repo, &["run", "executor", "--exit-when-idle"]);
     assert_eq!(node(repo, "3")["node"]["status"], "failed");
 
-    // Exploration reacts to the failure: a new hypothesis that builds on
-    // what the failed step built on and heads for its goal.
+    // Exploration reacts to the failure once evaluation concluded about
+    // it: a new hypothesis that builds on what the failed step built on
+    // and heads for its goal.
+    ok(repo, &["run", "explorer", "--exit-when-idle"]);
+    let steps = json_lines(&ok(repo, &["node", "ls", "--format", "json"]));
+    assert!(
+        !steps
+            .iter()
+            .any(|n| n["title"] == "Write hello in smaller steps"),
+        "explored past a failure evaluation has not concluded about: {steps:?}"
+    );
+    ok(repo, &["run", "evaluator", "--exit-when-idle"]);
     ok(repo, &["run", "explorer", "--exit-when-idle"]);
     let steps = json_lines(&ok(repo, &["node", "ls", "--format", "json"]));
     let derived = steps
@@ -1897,6 +1910,7 @@ fn a_failed_step_grows_new_hypotheses_in_its_place() {
     ok(repo, &["run", "executor", "--exit-when-idle"]);
     assert_eq!(node(repo, "3")["node"]["status"], "failed");
     std::fs::remove_dir_all(&prompts).expect("clear prompts");
+    ok(repo, &["run", "evaluator", "--exit-when-idle"]);
     ok(repo, &["run", "explorer", "--exit-when-idle"]);
     let told = std::fs::read_dir(&prompts)
         .expect("prompts")
@@ -1911,6 +1925,136 @@ fn a_failed_step_grows_new_hypotheses_in_its_place() {
         grown.contains("Write hello in smaller steps") && grown.contains("Write hello by hand"),
         "{grown}"
     );
+}
+
+#[test]
+fn evaluation_carries_on_a_step_that_stopped_short_from_where_it_stopped() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    ok(repo, &["goal", "add", "Say hello"]);
+    ok(repo, &["run", "explorer", "--exit-when-idle"]);
+    ok(repo, &["run", "planner", "--exit-when-idle"]);
+    sandbox.marker("fail-partial", true);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    let first = node(repo, "3");
+    assert_eq!(first["node"]["status"], "failed", "{first}");
+    let left = first["node"]["head_commit"]
+        .as_str()
+        .expect("the attempt's commit")
+        .to_owned();
+    sandbox.marker("fail-partial", false);
+
+    // Evaluation finds it stopped short of a reachable objective: the step
+    // goes back to run, with what evaluation found.
+    let script = sandbox.dir.path().join("evaluation.sh");
+    std::fs::write(
+        &script,
+        r#"echo '{"conclusion":{"decision":"continue","hypothesis":"hello can be written","finding":"half written when the compiler stopped","consequence":"finish the other half"},"evaluations":[]}'"#,
+    )
+    .expect("script");
+    ok(repo, &["run", "evaluator", "--exit-when-idle"]);
+    let step = node(repo, "3");
+    assert_eq!(step["node"]["status"], "planned", "{step}");
+    let conclusion = &step["conclusions"][0];
+    assert_eq!(conclusion["decision"], "continue", "{step}");
+    assert_eq!(conclusion["reopened"], true, "{step}");
+    assert_eq!(conclusion["resume_commit"], left.as_str(), "{step}");
+    assert_eq!(step["evaluations"], serde_json::json!([]), "{step}");
+
+    // The next attempt starts from what the first left, and is told.
+    let prompts = sandbox.dir.path().join("prompts");
+    std::fs::remove_dir_all(&prompts).expect("clear prompts");
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    let step = node(repo, "3");
+    assert_eq!(step["node"]["status"], "completed", "{step}");
+    let branch = step["node"]["branch"].as_str().expect("branch").to_owned();
+    assert_ne!(branch, "expl/node-3", "a new attempt gets a new branch");
+    assert_eq!(
+        git(repo, &["show", &format!("{branch}:partial-3.txt")]).trim(),
+        "half of node 3"
+    );
+    git(repo, &["merge-base", "--is-ancestor", &left, &branch]);
+    let told = std::fs::read_dir(&prompts)
+        .expect("prompts")
+        .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("prompt"))
+        .any(|text| {
+            text.contains("## Earlier attempts")
+                && text.contains("half written when the compiler stopped")
+                && text.contains("finish the other half")
+        });
+    assert!(
+        told,
+        "the continued attempt was not told how far the last got"
+    );
+
+    // Done this time: judged against the goal in the same record, and
+    // exploration past it is told what it established.
+    std::fs::write(
+        &script,
+        r#"echo '{"conclusion":{"decision":"done","hypothesis":"hello can be written","finding":"hello is written","consequence":"greeting can build on it"},"evaluations":[{"goal":2,"satisfied":true,"score":90,"reason":"file exists"}]}'"#,
+    )
+    .expect("script");
+    ok(repo, &["run", "evaluator", "--exit-when-idle"]);
+    let step = node(repo, "3");
+    assert_eq!(step["conclusions"][1]["decision"], "done", "{step}");
+    assert_eq!(step["evaluations"][0]["score"], 90, "{step}");
+    std::fs::remove_dir_all(&prompts).expect("clear prompts");
+    ok(repo, &["run", "explorer", "--exit-when-idle"]);
+    let told = std::fs::read_dir(&prompts)
+        .expect("prompts")
+        .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("prompt"))
+        .any(|text| text.contains("Concluded done.") && text.contains("greeting can build on it"));
+    assert!(
+        told,
+        "exploration past the step was not told what it changes"
+    );
+}
+
+#[test]
+fn an_agent_reads_the_graph_freely_but_cannot_change_it() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    ok(repo, &["goal", "add", "Say hello"]);
+    let as_agent = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_expl"))
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("EXPL_ROLE", "exploration")
+            .output()
+            .expect("expl")
+    };
+    for read in [
+        &["node", "inspect", "2"][..],
+        &["node", "ls", "--format", "json"],
+        &["graph", "show", "--format", "json"],
+        &["origin", "ls"],
+        &["path", "ls"],
+        &["candidate", "ls"],
+    ] {
+        let out = as_agent(read);
+        assert!(
+            out.status.success(),
+            "{read:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    for write in [
+        &["node", "add", "Sneak in a step"][..],
+        &["goal", "add", "Another goal"],
+        &["goal", "retire", "2", "--reason", "x"],
+        &["up"],
+    ] {
+        let out = as_agent(write);
+        assert!(!out.status.success(), "{write:?} ran as an agent");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("may only read the graph"),
+            "{write:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let nodes = json_lines(&ok(repo, &["node", "ls", "--format", "json"]));
+    assert!(!nodes.iter().any(|n| n["title"] == "Sneak in a step"));
 }
 
 #[test]

@@ -398,6 +398,16 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
                 )?]
             }
         }
+        // Evaluated: concluded about, and judged unless it failed. A failure
+        // reaches exploration here, with evaluation's account of why.
+        EventKind::NodeEvaluated
+            if subject.kind == NodeKind::Step && subject.status == NodeStatus::Failed =>
+        {
+            if graph.goals()?.is_empty() {
+                return Ok(Reaction::ignore("no active goals"));
+            }
+            vec![explore_failure(reaction, graph, &subject)?]
+        }
         EventKind::NodeEvaluated => {
             if subject.kind != NodeKind::Step || subject.status != NodeStatus::Completed {
                 return Ok(Reaction::ignore(format!(
@@ -629,7 +639,8 @@ fn judgement(graph: &Graph, start: &Node) -> Result<String, RoleError> {
     for evaluation in graph.evaluations_of(start.id)? {
         latest.insert(evaluation.goal, evaluation);
     }
-    if latest.is_empty() {
+    let concluded = graph.conclusions_of(start.id)?;
+    if latest.is_empty() && concluded.is_empty() {
         return Ok(String::new());
     }
     let mut out = format!(
@@ -639,6 +650,17 @@ fn judgement(graph: &Graph, start: &Node) -> Result<String, RoleError> {
     );
     if let Some(outcome) = &start.outcome {
         let _ = writeln!(out, "  Outcome: {}", digest::excerpt(outcome));
+    }
+    if let Some(conclusion) = concluded.last() {
+        let (found, follows) = digest::labels(conclusion.decision);
+        let _ = writeln!(
+            out,
+            "  Concluded {}.\n  Hypothesis: {}\n  {found}: {}\n  {follows}: {}",
+            conclusion.decision,
+            digest::excerpt(&conclusion.hypothesis),
+            digest::excerpt(&conclusion.finding),
+            digest::excerpt(&conclusion.consequence),
+        );
     }
     for evaluation in latest.values() {
         let _ = writeln!(
@@ -653,7 +675,9 @@ fn judgement(graph: &Graph, start: &Node) -> Result<String, RoleError> {
             digest::excerpt(&evaluation.reason)
         );
     }
-    out.push_str("\nAim the next steps at what it still falls short of.\n");
+    out.push_str(
+        "\nAim the next steps at what it still falls short of, and build on what it changes.\n",
+    );
     Ok(out)
 }
 
@@ -702,6 +726,15 @@ fn explore_failure(
             "  Whatever the attempt left is on branch `{branch}` (inspect it read-only, e.g. \
              `git log` / `git diff` against it)."
         );
+    }
+    let concluded = graph.conclusions_of(failed.id)?;
+    if !concluded.is_empty() {
+        attempt.push_str(
+            "\nWhat evaluation concluded about it, after checking the attempt (oldest first):\n\n",
+        );
+        for conclusion in &concluded {
+            attempt.push_str(&digest::conclusion(conclusion));
+        }
     }
     let mut grown = String::new();
     for step in graph.derived_from(failed.id)? {
@@ -887,7 +920,7 @@ fn survey_on(
             "the whole graph was surveyed at {last}, after this event"
         )));
     }
-    let failed = (event.kind == EventKind::NodeFailed
+    let failed = (matches!(event.kind, EventKind::NodeFailed | EventKind::NodeEvaluated)
         && subject.kind == NodeKind::Step
         && subject.status == NodeStatus::Failed)
         .then_some(subject);
@@ -1007,11 +1040,38 @@ fn prompt(
          - Propose investigations, not only changes, wherever a question is worth answering \
            first: whether a premise holds, why something failed, what a change would affect. \
            A goal that asks a question is reached by investigations alone.\n\n\
-         {kinds}{instructions}{response}",
+         {kinds}{further}{instructions}{response}",
         kinds = digest::STEP_KINDS,
+        further = looking_further(reaction),
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),
     ))
+}
+
+/// How an exploration can look at the whole graph beyond what its prompt
+/// shows: the read-only `expl` commands, run against the project.
+fn looking_further(reaction: &Reaction<'_>) -> String {
+    let expl = format!(
+        "expl -C '{}'",
+        reaction.context().project().root().display()
+    );
+    format!(
+        "\n## Looking further\n\n\
+         The prompt shows only part of the graph. To analyse more of it — other paths, what \
+         earlier steps established or why they failed, how goals were judged over time — read \
+         it with these commands (they only read; the graph changes only through your \
+         response):\n\
+         - `{expl} graph show --format json`: every node and edge;\n\
+         - `{expl} node ls --format json`: every node, with its status;\n\
+         - `{expl} node inspect <id>`: one node with its neighbours, what evaluation concluded \
+           about it (`conclusions`: decision, hypothesis, finding, consequence), its \
+           evaluations against goals, and its agent runs;\n\
+         - `{expl} node logs <id>`: the newest agent log about a node;\n\
+         - `{expl} path ls`, `{expl} candidate ls`, `{expl} origin ls`: the latest plan, the \
+           steps judged to satisfy a goal, and the trunk's history with how each origin was \
+           judged.\n\
+         Use `git log`, `git show` and `git diff` on a step's branch to see what it changed.\n\n"
+    )
 }
 
 #[cfg(test)]

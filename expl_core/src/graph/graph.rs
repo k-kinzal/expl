@@ -9,9 +9,9 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::event::{Delivery, Event, EventId, EventKind, HELD_LEASE};
 use crate::graph::{
-    AgentRunId, AgentRunRecord, AgentRunStatus, Answer, Edge, Evaluation, GoalTree, GraphError,
-    Lineage, NewEvaluation, NewOrigin, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Plan,
-    PlanId, PlannedPath, Snapshot,
+    AgentRunId, AgentRunRecord, AgentRunStatus, Answer, Conclusion, Decision, Edge, Evaluation,
+    GoalTree, GraphError, Lineage, NewConclusion, NewEvaluation, NewOrigin, Node, NodeFilter,
+    NodeId, NodeKind, NodeStatus, Plan, PlanId, PlannedPath, Snapshot,
 };
 use crate::store::{self, NOW};
 
@@ -19,6 +19,8 @@ const NODE_COLUMNS: &str = "id, kind, status, title, objective, priority, counte
                             branch, head_commit, outcome, created_at, updated_at, investigation, \
                             answer, derived_from, proposed_by";
 const EVALUATION_COLUMNS: &str = "id, node_id, goal_id, satisfied, score, reason, created_at";
+const CONCLUSION_COLUMNS: &str = "id, node_id, decision, hypothesis, finding, consequence, \
+                                  resume_commit, reopened, created_at";
 /// A step about to be proposed ([`Graph::propose`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NewStep<'a> {
@@ -99,6 +101,23 @@ fn evaluation_from_row(row: &Row<'_>) -> rusqlite::Result<Evaluation> {
     })
 }
 
+fn conclusion_from_row(row: &Row<'_>) -> rusqlite::Result<Conclusion> {
+    let decision: String = row.get(2)?;
+    Ok(Conclusion {
+        id: row.get(0)?,
+        node: NodeId(row.get(1)?),
+        decision: decision.parse().map_err(|e: String| {
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, e.into())
+        })?,
+        hypothesis: row.get(3)?,
+        finding: row.get(4)?,
+        consequence: row.get(5)?,
+        resume_commit: row.get(6)?,
+        reopened: row.get(7)?,
+        created_at: row.get(8)?,
+    })
+}
+
 fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<AgentRunRecord> {
     Ok(AgentRunRecord {
         id: AgentRunId(row.get(0)?),
@@ -151,6 +170,27 @@ fn nodes_where(conn: &Connection, clause: &str, id: NodeId) -> Result<Vec<Node>,
     ))?;
     let rows = stmt.query_map([id.0], node_from_row)?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+fn insert_evaluations(
+    conn: &Connection,
+    node: NodeId,
+    evaluations: &[NewEvaluation],
+) -> Result<(), GraphError> {
+    for evaluation in evaluations {
+        conn.execute(
+            "INSERT INTO evaluations (node_id, goal_id, satisfied, score, reason) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                node.0,
+                evaluation.goal.0,
+                evaluation.satisfied,
+                evaluation.score.clamp(0, 100),
+                evaluation.reason
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn set_status_in(
@@ -1047,25 +1087,115 @@ impl Graph {
         evaluations: &[NewEvaluation],
     ) -> Result<(), GraphError> {
         let tx = self.write()?;
-        for evaluation in evaluations {
-            tx.execute(
-                "INSERT INTO evaluations (node_id, goal_id, satisfied, score, reason) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    node.0,
-                    evaluation.goal.0,
-                    evaluation.satisfied,
-                    evaluation.score.clamp(0, 100),
-                    evaluation.reason
-                ],
-            )?;
-        }
+        insert_evaluations(&tx, node, evaluations)?;
         emit(&tx, EventKind::NodeEvaluated, Some(node))?;
         tx.commit()?;
         Ok(())
     }
 
+    /// Record what evaluation concluded about the step `node`, with its
+    /// verdicts against the goals, in one transaction.
+    ///
+    /// A [`Decision::Continue`] puts the step back to run again (records
+    /// `node.planned`, and `node.ready` when it can run now): its answer is
+    /// cleared, and a change step's next attempt starts from the commit
+    /// this one left. It is not put back when it is no longer completed or
+    /// failed (someone pruned or replanned it meanwhile), or when a step
+    /// built on it is running or completed: their work stands on this
+    /// attempt. Anything else, and a continue not put back, records
+    /// `node.evaluated`, so exploration and planning take it from there.
+    /// Returns whether the step was put back.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError::NotInStatus`] when `node` is not a step;
+    /// [`GraphError`] on SQLite failure.
+    pub fn conclude(
+        &mut self,
+        node: NodeId,
+        conclusion: &NewConclusion,
+        evaluations: &[NewEvaluation],
+    ) -> Result<bool, GraphError> {
+        let tx = self.write()?;
+        let step = node_in(&tx, node)?;
+        if step.kind != NodeKind::Step {
+            return Err(GraphError::NotInStatus {
+                node,
+                expected: "a step",
+            });
+        }
+        insert_evaluations(&tx, node, evaluations)?;
+        let built_on: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM edges e JOIN nodes s ON s.id = e.target_id \
+             WHERE e.source_id = ?1 AND s.kind = 'step' \
+             AND s.status IN ('running', 'completed'))",
+            [node.0],
+            |row| row.get(0),
+        )?;
+        let reopen = conclusion.decision == Decision::Continue
+            && matches!(step.status, NodeStatus::Completed | NodeStatus::Failed)
+            && !built_on;
+        let resume = (conclusion.decision == Decision::Continue && !step.investigation)
+            .then_some(step.head_commit.as_deref())
+            .flatten();
+        tx.execute(
+            "INSERT INTO conclusions \
+             (node_id, decision, hypothesis, finding, consequence, resume_commit, reopened) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                node.0,
+                conclusion.decision.as_str(),
+                conclusion.hypothesis,
+                conclusion.finding,
+                conclusion.consequence,
+                resume,
+                reopen
+            ],
+        )?;
+        if reopen {
+            tx.execute(
+                &format!(
+                    "UPDATE nodes SET status = 'planned', answer = NULL, updated_at = {NOW} \
+                     WHERE id = ?1"
+                ),
+                [node.0],
+            )?;
+            emit(&tx, EventKind::NodePlanned, Some(node))?;
+            emit_if_ready(&tx, node)?;
+        } else {
+            emit(&tx, EventKind::NodeEvaluated, Some(node))?;
+        }
+        tx.commit()?;
+        Ok(reopen)
+    }
+
     // ----------------------------------------------------------------- reads
+
+    /// What evaluation concluded about `node`, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError`] on SQLite failure.
+    pub fn conclusions_of(&self, node: NodeId) -> Result<Vec<Conclusion>, GraphError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CONCLUSION_COLUMNS} FROM conclusions WHERE node_id = ?1 ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([node.0], conclusion_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Every conclusion, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError`] on SQLite failure.
+    pub fn conclusions(&self) -> Result<Vec<Conclusion>, GraphError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CONCLUSION_COLUMNS} FROM conclusions ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], conclusion_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
 
     /// The node with `id`.
     ///
@@ -1432,6 +1562,7 @@ impl Graph {
             nodes: self.nodes(&NodeFilter::default())?,
             edges: self.edges()?,
             evaluations: self.evaluations()?,
+            conclusions: self.conclusions()?,
             through: self.last_event()?,
         };
         tx.commit()?;
@@ -2125,5 +2256,136 @@ mod tests {
             )
             .expect("eval");
         assert!(graph.candidates().expect("candidates").is_empty());
+    }
+
+    fn concluded(decision: Decision) -> NewConclusion {
+        NewConclusion {
+            decision,
+            hypothesis: "writing hello works".to_owned(),
+            finding: "stopped at the compiler".to_owned(),
+            consequence: "finish hello.rs".to_owned(),
+        }
+    }
+
+    /// A step that ran, left `commit`, and `failed` or completed.
+    fn ran(graph: &mut Graph, origin: NodeId, goal: NodeId, failed: bool) -> NodeId {
+        let step = graph
+            .propose_step("hello", "write hello", &[origin], &[goal])
+            .expect("step");
+        graph.plan_step(step, 1).expect("plan");
+        assert!(graph.claim(step, false).expect("claim"));
+        graph
+            .set_branch(step, "expl/node-3", Some("left"))
+            .expect("branch");
+        if failed {
+            graph.fail(step, "timed out").expect("fail");
+        } else {
+            graph.complete(step, "done, it says").expect("complete");
+        }
+        step
+    }
+
+    #[test]
+    fn a_step_continued_runs_again_from_what_it_left() {
+        let (mut graph, origin, goal) = seeded();
+        let step = ran(&mut graph, origin, goal, true);
+
+        let reopened = graph
+            .conclude(step, &concluded(Decision::Continue), &[])
+            .expect("conclude");
+
+        assert!(reopened);
+        assert_eq!(graph.node(step).expect("node").status, NodeStatus::Planned);
+        let tail: Vec<_> = kinds(&graph).into_iter().rev().take(2).collect();
+        assert_eq!(
+            tail,
+            [
+                (EventKind::NodeReady, Some(step.0)),
+                (EventKind::NodePlanned, Some(step.0))
+            ]
+        );
+        let conclusion = &graph.conclusions_of(step).expect("conclusions")[0];
+        assert_eq!(conclusion.decision, Decision::Continue);
+        assert!(conclusion.reopened);
+        assert_eq!(conclusion.resume_commit.as_deref(), Some("left"));
+        assert_eq!(conclusion.finding, "stopped at the compiler");
+    }
+
+    #[test]
+    fn a_step_others_build_on_is_not_continued_but_explored_past() {
+        let (mut graph, origin, goal) = seeded();
+        let step = ran(&mut graph, origin, goal, false);
+        let next = graph
+            .propose_step("next", "after hello", &[step], &[goal])
+            .expect("next");
+        graph.plan_step(next, 1).expect("plan");
+        assert!(graph.claim(next, false).expect("claim"));
+
+        let reopened = graph
+            .conclude(step, &concluded(Decision::Continue), &[])
+            .expect("conclude");
+
+        assert!(!reopened);
+        assert_eq!(
+            graph.node(step).expect("node").status,
+            NodeStatus::Completed
+        );
+        assert_eq!(
+            kinds(&graph).last(),
+            Some(&(EventKind::NodeEvaluated, Some(step.0)))
+        );
+        assert!(!graph.conclusions_of(step).expect("conclusions")[0].reopened);
+    }
+
+    #[test]
+    fn an_abandoned_failure_stays_failed_with_why_and_is_explored_past() {
+        let (mut graph, origin, goal) = seeded();
+        let step = ran(&mut graph, origin, goal, true);
+
+        let reopened = graph
+            .conclude(step, &concluded(Decision::Abandoned), &[])
+            .expect("conclude");
+
+        assert!(!reopened);
+        assert_eq!(graph.node(step).expect("node").status, NodeStatus::Failed);
+        assert_eq!(
+            kinds(&graph).last(),
+            Some(&(EventKind::NodeEvaluated, Some(step.0)))
+        );
+        let conclusion = &graph.conclusions_of(step).expect("conclusions")[0];
+        assert_eq!(conclusion.decision, Decision::Abandoned);
+        assert_eq!(conclusion.resume_commit, None);
+        let snapshot = graph.snapshot().expect("snapshot");
+        assert_eq!(
+            snapshot.conclusion(step).map(|c| c.decision),
+            Some(Decision::Abandoned)
+        );
+    }
+
+    #[test]
+    fn a_step_done_is_judged_against_its_goals_in_the_same_record() {
+        let (mut graph, origin, goal) = seeded();
+        let step = ran(&mut graph, origin, goal, false);
+
+        graph
+            .conclude(
+                step,
+                &concluded(Decision::Done),
+                &[NewEvaluation {
+                    goal,
+                    satisfied: true,
+                    score: 90,
+                    reason: "hello exists".to_owned(),
+                }],
+            )
+            .expect("conclude");
+
+        assert_eq!(graph.evaluations_of(step).expect("evaluations").len(), 1);
+        assert_eq!(graph.candidates().expect("candidates").len(), 1);
+        assert!(
+            graph
+                .conclude(origin, &concluded(Decision::Done), &[])
+                .is_err()
+        );
     }
 }

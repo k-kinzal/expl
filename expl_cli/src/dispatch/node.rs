@@ -106,6 +106,7 @@ fn describe(graph: &Graph, id: expl_core::NodeId) -> Result<serde_json::Value, C
         "grown_from_failure": ids(graph.derived_from(id)?),
         "explored_from": lineage.explored_from(id),
         "adopted_into": lineage.absorbed_by(id),
+        "conclusions": graph.conclusions_of(id)?,
         "evaluations": graph.evaluations_of(id)?,
         "agent_runs": graph.agent_runs(Some(id), 20)?,
     }))

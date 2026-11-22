@@ -31,6 +31,16 @@ pub(crate) fn dispatch(cli: Cli) -> Result<(), CliError> {
         Some(dir) => dir,
         None => std::env::current_dir().map_err(|e| CliError::io("current directory", e))?,
     };
+    // An agent expl invoked (it sets EXPL_ROLE) may look at the graph as
+    // freely as it likes, but changes it only through its response.
+    if let Some(role) = std::env::var_os("EXPL_ROLE").filter(|r| !r.is_empty())
+        && !cli.command.is_read_only()
+    {
+        return Err(CliError::Usage(format!(
+            "an agent ({} role) may only read the graph: this command changes it",
+            role.to_string_lossy()
+        )));
+    }
     match cli.command {
         Command::Init(args) => init::init(&start, &args),
         Command::Doctor(args) => doctor::doctor(&start, &args),
