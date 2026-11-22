@@ -25,8 +25,10 @@ cd "$repo"
 
 "$here/check-candidate.sh" "$node" "$trunk"
 
+# The branch recorded on the node: a retried step's is expl/node-<id>-<n>.
 title="$(expl node inspect "$node" | python3 -c 'import json,sys; print(json.load(sys.stdin)["node"]["title"])')"
-git merge --no-ff "expl/node-${node}" -m "Adopt #${node}: ${title}"
+branch="$(expl node inspect "$node" | python3 -c 'import json,sys; print(json.load(sys.stdin)["node"]["branch"])')"
+git merge --no-ff "$branch" -m "Adopt #${node}: ${title}"
 
 "$here/../../expl-operate/scripts/install.sh"
 if git diff --name-only HEAD^1 HEAD | grep -qE 'expl_core/src/(store|graph/graph|event/inbox|process/)'; then

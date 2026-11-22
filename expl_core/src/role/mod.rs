@@ -101,6 +101,10 @@ impl Role {
     #[must_use]
     pub fn reactions(self) -> &'static [EventKind] {
         match self {
+            // Exploration grows from a failure once evaluation concluded
+            // about it (`node.evaluated`): it may be continued instead, and
+            // otherwise comes with why it cannot work. `node.failed` itself
+            // is explored only where no evaluation agent is declared.
             Self::Exploration => &[
                 EventKind::GoalAdded,
                 EventKind::NodeEvaluated,
@@ -116,7 +120,11 @@ impl Role {
                 EventKind::OriginAdvanced,
             ],
             Self::Execution => &[EventKind::NodeReady],
-            Self::Evaluation => &[EventKind::NodeCompleted, EventKind::OriginAdvanced],
+            Self::Evaluation => &[
+                EventKind::NodeCompleted,
+                EventKind::NodeFailed,
+                EventKind::OriginAdvanced,
+            ],
         }
     }
 

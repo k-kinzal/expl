@@ -95,9 +95,28 @@ impl Trunk {
     #[must_use]
     pub fn new(project: &Project, branch: Option<&str>) -> Self {
         Self {
-            git: Git::new(project.root()),
+            git: Git::in_worktree(project.root()),
             branch: branch.filter(|b| !b.is_empty()).map(str::to_owned),
         }
+    }
+
+    /// Every branch that is or was the trunk: the declared one and each
+    /// branch an origin was read from. Agents never write to these, so no
+    /// step's branch may be one of them.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError`] when the origins cannot be read.
+    pub fn branches(&self, graph: &Graph) -> Result<Vec<String>, GraphError> {
+        let mut branches: Vec<String> = self.branch.iter().cloned().collect();
+        for origin in graph.origins()? {
+            if let Some(branch) = origin.branch.filter(|b| !b.is_empty())
+                && !branches.contains(&branch)
+            {
+                branches.push(branch);
+            }
+        }
+        Ok(branches)
     }
 
     /// If the trunk moved since the current origin, record its tip as the

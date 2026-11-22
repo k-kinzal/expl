@@ -192,6 +192,41 @@ ALTER TABLE nodes ADD COLUMN answer TEXT CHECK (answer IN ('yes', 'no', 'unknown
 -- not an edge: the failed step is not built on.
 ALTER TABLE nodes ADD COLUMN derived_from INTEGER REFERENCES nodes (id);
 ",
+    r"
+-- The exploration agent that proposed a step (NULL: added by a human, or
+-- not known). Steps proposed before it was recorded are attributed to the
+-- exploration run that finished within the 5 seconds before them, since an
+-- exploration records its proposals as soon as its agent returns.
+ALTER TABLE nodes ADD COLUMN proposed_by TEXT;
+UPDATE nodes SET proposed_by = (
+    SELECT r.agent FROM agent_runs r
+    WHERE r.role = 'exploration' AND r.status = 'succeeded'
+      AND r.finished_at <= nodes.created_at
+      AND r.finished_at >= strftime('%Y-%m-%dT%H:%M:%fZ', nodes.created_at, '-5 seconds')
+    ORDER BY r.finished_at DESC LIMIT 1
+) WHERE kind = 'step';
+",
+    r"
+-- What evaluation concluded about a step it judged, before (and apart
+-- from) the goals: whether it is done, abandoned, or to be continued, the
+-- hypothesis it stood for, what was found, and what that changes. A step
+-- continued is put back to run again, starting from `resume_commit` (what
+-- the attempt left, for a change step) with the conclusion as guidance;
+-- `reopened` says whether it was. `agent` is the evaluation agent.
+CREATE TABLE conclusions (
+    id            INTEGER PRIMARY KEY,
+    node_id       INTEGER NOT NULL REFERENCES nodes (id),
+    agent         TEXT,
+    decision      TEXT NOT NULL CHECK (decision IN ('done', 'abandoned', 'continue')),
+    hypothesis    TEXT NOT NULL,
+    finding       TEXT NOT NULL,
+    consequence   TEXT NOT NULL,
+    resume_commit TEXT,
+    reopened      INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX conclusions_node ON conclusions (node_id);
+",
 ];
 
 /// Open the database at `path`, creating and migrating it as needed.

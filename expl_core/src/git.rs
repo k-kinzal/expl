@@ -5,8 +5,9 @@
 //! [`workspace`](crate::workspace) (worktrees, merges, commits). This module
 //! knows how to talk to git; it does not know what a node is.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use thiserror::Error;
 
@@ -28,17 +29,59 @@ pub enum GitError {
     },
 }
 
+/// What stands in the way of a new branch
+/// ([`Git::branch_blocker`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchBlocker {
+    /// A branch of that name exists.
+    Exists,
+    /// A branch lives under the name (`name/…`): the one named.
+    Nested(String),
+    /// A parent path of the name is a branch: the one named.
+    Parent(String),
+}
+
 /// git, bound to one working directory.
+///
+/// Inherited repository location overrides are removed from git subprocesses.
 #[derive(Debug, Clone)]
 pub struct Git {
     dir: PathBuf,
+    discovery: Discovery,
+}
+
+#[derive(Debug, Clone)]
+enum Discovery {
+    Default,
+    Worktree,
+    Below(OsString),
 }
 
 impl Git {
-    /// git operating in `dir`.
+    /// git operating in `dir`, with normal repository discovery.
     #[must_use]
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            discovery: Discovery::Default,
+        }
+    }
+
+    /// git rooted at `dir`, using its `.git` directory or worktree file.
+    #[must_use]
+    pub fn in_worktree(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            discovery: Discovery::Worktree,
+        }
+    }
+
+    /// git discovering a repository below an encoded `GIT_CEILING_DIRECTORIES` path.
+    pub(crate) fn below_ceiling(dir: PathBuf, ceiling: OsString) -> Self {
+        Self {
+            dir,
+            discovery: Discovery::Below(ceiling),
+        }
     }
 
     /// The directory this git runs in.
@@ -47,18 +90,55 @@ impl Git {
         &self.dir
     }
 
+    fn output(&self, args: &[&str]) -> Result<Output, GitError> {
+        let mut command = Command::new("git");
+        // Start discovery and resolve Git's storage paths from the selected
+        // checkout, even when Expl was launched from a Git hook.
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_IMPLICIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_GRAFT_FILE",
+            "GIT_SHALLOW_FILE",
+            "GIT_NAMESPACE",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_PREFIX",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_CONFIG",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+        ] {
+            command.env_remove(name);
+        }
+        match &self.discovery {
+            Discovery::Default => {}
+            Discovery::Worktree => {
+                command.args(["--git-dir=.git", "--work-tree=."]);
+            }
+            Discovery::Below(ceiling) => {
+                command.env("GIT_CEILING_DIRECTORIES", ceiling);
+            }
+        }
+        command
+            .args(args)
+            .current_dir(&self.dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(GitError::Spawn)
+    }
+
     /// Run git and return trimmed stdout.
     ///
     /// # Errors
     ///
     /// [`GitError`] when git cannot start or exits non-zero.
     pub fn run(&self, args: &[&str]) -> Result<String, GitError> {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&self.dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map_err(GitError::Spawn)?;
+        let output = self.output(args)?;
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
         } else {
@@ -76,12 +156,7 @@ impl Git {
     ///
     /// [`GitError`] when git cannot start or exits with any other code.
     pub fn test(&self, args: &[&str]) -> Result<bool, GitError> {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&self.dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map_err(GitError::Spawn)?;
+        let output = self.output(args)?;
         match output.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
@@ -116,6 +191,31 @@ impl Git {
         }
     }
 
+    /// The full ref HEAD is attached to (such as `refs/heads/main`), or
+    /// `None` when HEAD is detached. Unlike
+    /// [`current_branch`](Self::current_branch), a repository git cannot
+    /// read is an error, not a detached HEAD.
+    ///
+    /// # Errors
+    ///
+    /// [`GitError`] when git cannot start or fails other than by finding
+    /// HEAD detached.
+    pub fn head_ref(&self) -> Result<Option<String>, GitError> {
+        let args = ["symbolic-ref", "-q", "HEAD"];
+        let output = self.output(&args)?;
+        match output.status.code() {
+            Some(0) => Ok(Some(
+                String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+            )),
+            Some(1) => Ok(None),
+            _ => Err(GitError::Failed {
+                args: args.join(" "),
+                dir: self.dir.display().to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            }),
+        }
+    }
+
     /// Whether a local branch named `name` exists.
     ///
     /// # Errors
@@ -124,6 +224,37 @@ impl Git {
     pub fn has_branch(&self, name: &str) -> Result<bool, GitError> {
         let reference = format!("refs/heads/{name}");
         self.test(&["show-ref", "--verify", "--quiet", &reference])
+    }
+
+    /// The ref that stands in the way of a new local branch named `name`,
+    /// if any: the branch itself, a branch under it (`name/…`), or a
+    /// branch at one of its parent paths — git keeps none of these beside
+    /// one another.
+    ///
+    /// # Errors
+    ///
+    /// [`GitError`] when git cannot start or fails.
+    pub fn branch_blocker(&self, name: &str) -> Result<Option<BranchBlocker>, GitError> {
+        if self.has_branch(name)? {
+            return Ok(Some(BranchBlocker::Exists));
+        }
+        let below = format!("refs/heads/{name}/");
+        let nested = self.run(&[
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname:short)",
+            &below,
+        ])?;
+        if !nested.is_empty() {
+            return Ok(Some(BranchBlocker::Nested(nested)));
+        }
+        for (slash, _) in name.match_indices('/') {
+            let parent = &name[..slash];
+            if self.has_branch(parent)? {
+                return Ok(Some(BranchBlocker::Parent(parent.to_owned())));
+            }
+        }
+        Ok(None)
     }
 
     /// The top-level directory of the working tree containing `dir`.
@@ -258,12 +389,7 @@ impl Git {
             ours,
             theirs,
         ];
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&self.dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map_err(GitError::Spawn)?;
+        let output = self.output(&args)?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         match (output.status.code(), stdout.lines().next()) {
             (Some(0), Some(tree)) if !tree.trim().is_empty() => Ok(Some(tree.trim().to_owned())),
@@ -280,6 +406,118 @@ impl Git {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_uses_selected_checkout_and_index() {
+        use crate::Project;
+        use std::fs;
+
+        // Only the child inherits the overrides, so other tests run normally.
+        const CHILD_ROOT: &str = "EXPL_TEST_GIT_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let project = Project::discover(&root.join(".expl")).expect("discover project");
+            assert_eq!(project.root(), root);
+
+            let worktree = project.worktrees_dir().join("node-test");
+            assert_eq!(
+                Project::for_repository(&worktree)
+                    .expect("discover linked worktree")
+                    .root(),
+                worktree
+            );
+            let git = Git::in_worktree(worktree);
+            assert!(git.has_branch("selected").expect("read shared refs"));
+            git.run(&["add", "--", "change"]).expect("stage change");
+            assert_eq!(git.status_paths().expect("worktree status"), ["change"]);
+            assert_eq!(
+                git.run(&["status", "--porcelain"]).expect("staged status"),
+                "A  change"
+            );
+            git.run(&["branch", "created-by-child"])
+                .expect("write selected ref");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = dir.path().canonicalize().expect("canonical tempdir");
+        let root = dir_path.join("selected");
+        let other = dir_path.join("other");
+        for (repo, branch) in [(&root, "selected"), (&other, "other")] {
+            fs::create_dir(repo).expect("create repository directory");
+            let git = Git::new(repo);
+            git.run(&["init", "-q", "-b", branch]).expect("init");
+            fs::write(repo.join(branch), branch).expect("write tracked file");
+            git.run(&["add", "--", branch]).expect("stage tracked file");
+            git.run(&[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "initial",
+            ])
+            .expect("commit");
+        }
+        let project = Project::at(&root);
+        fs::create_dir_all(project.worktrees_dir()).expect("create worktrees directory");
+        fs::write(project.database_path(), "").expect("mark project initialized");
+        let worktree = project.worktrees_dir().join("node-test");
+        let git = Git::new(&root);
+        git.run(&[
+            "worktree",
+            "add",
+            "-qb",
+            "node-test",
+            worktree.to_str().expect("worktree path"),
+        ])
+        .expect("add worktree");
+        fs::write(worktree.join("change"), "new content").expect("write change");
+
+        let other_git = Git::new(&other);
+        let other_refs = other_git.run(&["show-ref", "--head"]).expect("other refs");
+        let other_dir = other.join(".git");
+        let other_index = fs::read(other_dir.join("index")).expect("other index");
+        let output = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "git::tests::git_uses_selected_checkout_and_index",
+            ])
+            .env(CHILD_ROOT, &root)
+            .env("GIT_DIR", &other_dir)
+            .env("GIT_WORK_TREE", &other)
+            .env("GIT_COMMON_DIR", &other_dir)
+            .env("GIT_INDEX_FILE", other_dir.join("index"))
+            .env("GIT_OBJECT_DIRECTORY", other_dir.join("objects"))
+            .env("GIT_CEILING_DIRECTORIES", &root)
+            .output()
+            .expect("run child test");
+        assert!(
+            output.status.success(),
+            "child test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(git.has_branch("created-by-child").expect("selected refs"));
+        assert_eq!(
+            Git::new(worktree)
+                .run(&["show", ":change"])
+                .expect("staged content"),
+            "new content"
+        );
+        assert_eq!(
+            other_git.run(&["show-ref", "--head"]).expect("other refs"),
+            other_refs
+        );
+        assert_eq!(
+            fs::read(other_dir.join("index")).expect("other index"),
+            other_index
+        );
+        assert_eq!(fs::read(other.join("other")).expect("other file"), b"other");
+        assert_eq!(fs::read_dir(other).expect("other checkout").count(), 2);
+    }
 
     #[test]
     fn restore_undoes_commits_edits_and_new_files_but_keeps_ignored_ones() {

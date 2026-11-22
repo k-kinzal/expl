@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use expl_core::{
     AgentRunRecord, AgentRunStatus, Declaration, Edge, Evaluation, GoalTree, Graph, GraphError,
-    Lineage, Node, NodeFilter, NodeId, NodeKind, NodeStatus, ProcessId, ProcessRecord,
+    Lineage, Node, NodeFilter, NodeId, NodeKind, NodeStatus, PlannedPath, ProcessId, ProcessRecord,
     ProcessState, Processes, Project, StoreError,
 };
 use thiserror::Error;
@@ -40,6 +40,8 @@ pub(crate) struct DeclaredAgent {
     pub(crate) role: String,
     /// How many processes `expl up` keeps.
     pub(crate) replicas: usize,
+    /// Its share when its role's events are routed between agents.
+    pub(crate) weight: u32,
 }
 
 /// One consistent view of the project.
@@ -57,6 +59,8 @@ pub(crate) struct Snapshot {
     pub(crate) lineage: Lineage,
     /// Which goals are subgoals of which.
     pub(crate) goal_tree: GoalTree,
+    /// The latest plan's paths, in the planner's order.
+    pub(crate) paths: Vec<PlannedPath>,
     /// Declared agents (empty when `expl.toml` cannot be read).
     pub(crate) agents: Vec<DeclaredAgent>,
     /// Processes that have not exited (running, starting, or dead).
@@ -89,6 +93,10 @@ impl Snapshot {
         let lineage = Lineage::of(&nodes, &edges);
         let goal_tree = GoalTree::of(&nodes, &edges);
         let runs = graph.agent_runs(None, RUN_TAIL)?;
+        let paths = graph
+            .latest_plan()?
+            .map(|plan| plan.paths)
+            .unwrap_or_default();
 
         let records: Vec<ProcessRecord> = processes
             .list(true)
@@ -106,6 +114,7 @@ impl Snapshot {
                         name,
                         role: agent.role.as_str().to_owned(),
                         replicas: agent.replicas,
+                        weight: agent.weight.unwrap_or(1),
                     })
                     .collect()
             })
@@ -118,6 +127,7 @@ impl Snapshot {
             candidates,
             lineage,
             goal_tree,
+            paths,
             agents,
             processes: records,
             runs,

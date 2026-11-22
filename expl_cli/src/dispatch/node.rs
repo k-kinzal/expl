@@ -106,6 +106,7 @@ fn describe(graph: &Graph, id: expl_core::NodeId) -> Result<serde_json::Value, C
         "grown_from_failure": ids(graph.derived_from(id)?),
         "explored_from": lineage.explored_from(id),
         "adopted_into": lineage.absorbed_by(id),
+        "conclusions": graph.conclusions_of(id)?,
         "evaluations": graph.evaluations_of(id)?,
         "agent_runs": graph.agent_runs(Some(id), 20)?,
     }))
@@ -118,14 +119,15 @@ fn add(start: &Path, args: &NodeAddArgs) -> Result<(), CliError> {
         after.push(graph.origin()?.id);
     }
     let objective = args.objective.clone().unwrap_or_else(|| args.title.clone());
-    let id = graph.propose(
-        args.investigation,
-        &args.title,
-        &objective,
-        &after,
-        &args.before,
-        args.derived_from,
-    )?;
+    let id = graph.propose(&expl_core::NewStep {
+        investigation: args.investigation,
+        title: &args.title,
+        objective: &objective,
+        after: &after,
+        before: &args.before,
+        derived_from: args.derived_from,
+        proposed_by: None,
+    })?;
     if let Some(priority) = args.priority {
         graph.plan_step(id, priority)?;
     }

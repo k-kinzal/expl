@@ -15,6 +15,12 @@
 //!   origin that took work in is a merge: it carries a halo, and its label
 //!   counts the steps it merged. Steps explored from an origin the trunk
 //!   has moved past fade, unless they are still candidates.
+//! - **Left to right is time; nearer the spine is more believed in.**
+//!   Work is drawn in groups, one horizontal band each: every path of the
+//!   latest plan (on a faint ground of its own), every chain grown past a
+//!   step. The planner's strongest paths lie nearest the spine, and the
+//!   first to fit carries it on toward the goals; alternatives nothing
+//!   builds on yet gather outside the bands ([`crate::layout`]).
 //! - **Edges are hairlines.** Edges into goals are drawn only once a step
 //!   satisfies the goal (or the step is selected), so the picture shows
 //!   reached goals rather than intentions. A faint red line joins a failed
@@ -45,17 +51,16 @@ use std::time::{Duration, Instant};
 
 use expl_core::{Epoch, Node, NodeId, NodeKind, NodeStatus, ProcessRecord, ProcessState, Project};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Context, ElementId, FocusHandle, Hsla, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
-    Point, Render, Rgba, ScrollWheelEvent, Size, Task, Window, canvas, div, point, prelude::*, px,
+    AnyElement, Context, FocusHandle, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Render, Rgba, ScrollWheelEvent, Size,
+    Task, Window, canvas, div, point, prelude::*, px,
 };
 
-use crate::layout::Layout;
+use crate::layout::{Layout, Streams};
 use crate::snapshot::{Snapshot, SnapshotError};
 use crate::theme;
 
 /// Distance between columns and rows, dot centre to dot centre.
-const COLUMN_STRIDE: f32 = 200.0;
 const ROW_STRIDE: f32 = 56.0;
 /// Smallest left margin of the first column.
 const MARGIN: f32 = 120.0;
@@ -68,6 +73,14 @@ const DOT_BOX: f32 = 16.0;
 const LABEL_W: f32 = 172.0;
 /// One trip of the comet along an edge into a running step.
 const COMET: Duration = Duration::from_millis(1400);
+/// Time one ripple takes to spread.
+const RIPPLE: Duration = Duration::from_millis(1600);
+/// Time between frames while comets move: smooth enough for a slow comet,
+/// without redrawing every edge at the display's rate.
+const COMET_FRAME: Duration = Duration::from_millis(66);
+/// How far outside the window something may lie and still be drawn, so
+/// labels and edges entering the window are never cut.
+const OVERSCAN: f32 = 240.0;
 /// Movement beyond this is a drag, not a click.
 const CLICK_SLOP: f32 = 4.0;
 /// Corner panels.
@@ -80,7 +93,7 @@ const TRUNK_W: f32 = 320.0;
 const TRUNK_ROWS: usize = 6;
 /// Zoom range, the factor of one `+` / `-`, and the zoom below which only
 /// labels that matter are drawn.
-const MIN_ZOOM: f32 = 0.1;
+const MIN_ZOOM: f32 = 0.002;
 const MAX_ZOOM: f32 = 3.0;
 const ZOOM_STEP: f32 = 1.25;
 const QUIET_LABELS_BELOW: f32 = 0.55;
@@ -111,6 +124,8 @@ pub(crate) struct ExplView {
     /// The press came from a panel: bring the node into view on select.
     reveal: bool,
     epoch: Instant,
+    /// The next frame of moving comets, while one is pending.
+    ticking: Option<Task<()>>,
     _poll: Task<()>,
 }
 
@@ -168,6 +183,7 @@ impl ExplView {
             drag: None,
             pressed: None,
             reveal: false,
+            ticking: None,
             epoch: Instant::now(),
             _poll: poll,
         }
@@ -177,8 +193,23 @@ impl ExplView {
         match result {
             Ok(snapshot) => {
                 let changed = !self.loaded || self.error.is_some() || snapshot != self.snapshot;
-                if snapshot.nodes != self.snapshot.nodes || snapshot.edges != self.snapshot.edges {
-                    self.layout = Layout::of(&snapshot.nodes, &snapshot.edges);
+                if snapshot.nodes != self.snapshot.nodes
+                    || snapshot.edges != self.snapshot.edges
+                    || snapshot.agents != self.snapshot.agents
+                    || snapshot.paths != self.snapshot.paths
+                {
+                    let explorers: Vec<(&str, u32)> = snapshot
+                        .agents
+                        .iter()
+                        .filter(|a| a.role == "exploration")
+                        .map(|a| (a.name.as_str(), a.weight))
+                        .collect();
+                    self.layout = Layout::of(
+                        &snapshot.nodes,
+                        &snapshot.edges,
+                        &snapshot.paths,
+                        &Streams::of(&explorers),
+                    );
                 }
                 self.snapshot = snapshot;
                 self.loaded = true;
@@ -213,7 +244,7 @@ impl ExplView {
     /// before panning: centred while the graph fits, else right-aligned so
     /// the present and the goals stay in view.
     fn anchor(&self, zoom: f32, viewport: Size<Pixels>) -> Point<Pixels> {
-        let span = self.layout.width * COLUMN_STRIDE * zoom;
+        let span = self.layout.width * ROW_STRIDE * zoom;
         let width = f32::from(viewport.width);
         let left = if span + 2.0 * MARGIN <= width {
             (width - span) / 2.0
@@ -227,10 +258,40 @@ impl ExplView {
     fn centre(&self, id: NodeId, viewport: Size<Pixels>) -> Option<Point<Pixels>> {
         let slot = self.layout.slots.get(&id)?;
         let offset = point(
-            px(slot.x * COLUMN_STRIDE * self.zoom),
+            px(slot.x * ROW_STRIDE * self.zoom),
             px(slot.row * ROW_STRIDE * self.zoom),
         );
         Some(self.anchor(self.zoom, viewport) + offset + self.pan)
+    }
+
+    /// A faint ground under each path of the latest plan, so each reads as
+    /// one group.
+    fn bands(&self, viewport: Size<Pixels>) -> Vec<AnyElement> {
+        let scale = ROW_STRIDE * self.zoom;
+        let origin = self.anchor(self.zoom, viewport) + self.pan;
+        self.layout
+            .bands
+            .iter()
+            .filter(|band| band.goal.is_some())
+            .map(|band| {
+                let left = origin.x + px((band.x.0 - 0.5) * scale);
+                let top = origin.y + px((band.rows.0 - 0.5) * scale);
+                div()
+                    .absolute()
+                    .left(left)
+                    .top(top)
+                    .w(px((band.x.1 - band.x.0 + 1.0) * scale))
+                    .h(px((band.rows.1 - band.rows.0 + 1.0) * scale))
+                    .rounded(px(0.5 * scale))
+                    .bg(theme::alpha(theme::text(), 0.05))
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// How far through one ripple every ripple is now (0 to 1).
+    fn ripple_phase(&self) -> f32 {
+        (self.epoch.elapsed().as_secs_f32() / RIPPLE.as_secs_f32()).fract()
     }
 
     /// Zoom by `factor`, keeping the graph point under `at` where it is.
@@ -246,7 +307,7 @@ impl ExplView {
     fn fit(&mut self, viewport: Size<Pixels>) {
         let rows = self.layout.slots.values().map(|slot| slot.row);
         let (top, bottom) = rows.fold((0.0_f32, 0.0_f32), |(lo, hi), r| (lo.min(r), hi.max(r)));
-        let span_x = self.layout.width * COLUMN_STRIDE;
+        let span_x = self.layout.width * ROW_STRIDE;
         let span_y = (bottom - top) * ROW_STRIDE;
         let room_x = (f32::from(viewport.width) - 2.0 * FIT_INSET_X).max(1.0);
         let room_y = (f32::from(viewport.height) - 2.0 * FIT_INSET_Y).max(1.0);
@@ -437,13 +498,16 @@ impl ExplView {
             if !focused {
                 color = color.opacity(OUT_OF_FOCUS);
             }
-            lines.push(Line {
+            let line = Line {
                 from: from + point(px(radius(source) + 4.0), px(0.0)),
                 to: to - point(px(radius(target) + 4.0), px(0.0)),
                 color,
                 width,
                 comet: target.status == NodeStatus::Running,
-            });
+            };
+            if line.visible(viewport) {
+                lines.push(line);
+            }
         }
         // A new hypothesis and the failure it was grown from: not an edge
         // (the failure is not built on), so a faint line in the failure's
@@ -463,13 +527,16 @@ impl ExplView {
             if !(lens.in_focus(failed.id) && lens.in_focus(derived.id)) {
                 color = color.opacity(OUT_OF_FOCUS);
             }
-            lines.push(Line {
+            let line = Line {
                 from: from + point(px(radius(failed) + 4.0), px(0.0)),
                 to: to - point(px(radius(derived) + 4.0), px(0.0)),
                 color,
                 width: 1.0,
                 comet: false,
-            });
+            };
+            if line.visible(viewport) {
+                lines.push(line);
+            }
         }
         lines
     }
@@ -629,7 +696,6 @@ impl ExplView {
             }
         };
 
-        let id = node.id.0 as u64;
         div()
             .relative()
             .flex_none()
@@ -638,7 +704,7 @@ impl ExplView {
             .items_center()
             .justify_center()
             .when(node.status == NodeStatus::Running, |el| {
-                el.child(ripple(("ripple", id), DOT_BOX, 8.0, 26.0))
+                el.child(ripple(DOT_BOX, 8.0, 26.0, self.ripple_phase()))
             })
             .when(current, |el| {
                 el.child(ring(size + 8.0, theme::alpha(theme::text(), 0.6)))
@@ -1069,7 +1135,7 @@ impl ExplView {
                     .children(
                         processes
                             .into_iter()
-                            .map(|p| process_dot(p, busy.contains_key(&p.id))),
+                            .map(|p| process_dot(p, busy.contains_key(&p.id), self.ripple_phase())),
                     )
                     .children((0..missing).map(|_| {
                         div()
@@ -1087,13 +1153,40 @@ impl Render for ExplView {
         let viewport = window.viewport_size();
         let lens = self.lens();
         let lines = self.edges(viewport, &lens);
+        let bands = self.bands(viewport);
         let phase = (self.epoch.elapsed().as_secs_f32() / COMET.as_secs_f32()).fract();
         let nodes: Vec<AnyElement> = self
             .snapshot
             .nodes
             .iter()
-            .filter_map(|node| Some(self.node(node, self.centre(node.id, viewport)?, &lens, cx)))
+            .filter_map(|node| {
+                let centre = self.centre(node.id, viewport)?;
+                let x = f32::from(centre.x);
+                let y = f32::from(centre.y);
+                let shown = (-OVERSCAN..=f32::from(viewport.width) + OVERSCAN).contains(&x)
+                    && (-OVERSCAN..=f32::from(viewport.height) + OVERSCAN).contains(&y);
+                shown.then(|| self.node(node, centre, &lens, cx))
+            })
             .collect();
+        // Moving comets and ripples redraw at their own pace, not the
+        // display's.
+        let animated = lines.iter().any(|line| line.comet)
+            || self
+                .snapshot
+                .nodes
+                .iter()
+                .any(|n| n.status == NodeStatus::Running)
+            || !self.snapshot.working_on().is_empty();
+        if animated && self.ticking.is_none() {
+            self.ticking = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(COMET_FRAME).await;
+                this.update(cx, |view, cx| {
+                    view.ticking = None;
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
         let empty = self.loaded && !self.snapshot.nodes.iter().any(|n| n.kind == NodeKind::Goal);
 
         div()
@@ -1108,20 +1201,16 @@ impl Render for ExplView {
             .size_full()
             .overflow_hidden()
             .bg(theme::background())
+            .children(bands)
             .child(
                 canvas(
                     |_, _, _| {},
                     move |bounds, (), window, _| {
-                        let mut moving = false;
                         for line in &lines {
                             line.paint(bounds.origin, window);
                             if line.comet {
-                                moving = true;
                                 line.paint_comet(bounds.origin, phase, window);
                             }
-                        }
-                        if moving {
-                            window.request_animation_frame();
                         }
                     },
                 )
@@ -1281,32 +1370,30 @@ impl Row {
 
 /// A ring of light expanding from the centre of a `square`-sized box and
 /// fading out: the mark of work in progress, on nodes and agents alike.
-fn ripple(id: impl Into<ElementId>, square: f32, from: f32, to: f32) -> impl IntoElement {
+/// A ring spreading from `from` to `to` across a `square` box, `phase`
+/// (0 to 1) of the way through one ripple. The view redraws on its own
+/// tick while anything ripples ([`COMET_FRAME`]), not at the display's
+/// rate.
+fn ripple(square: f32, from: f32, to: f32, phase: f32) -> impl IntoElement {
+    let size = from + (to - from) * phase;
+    let offset = (square - size) / 2.0;
     div()
         .absolute()
         .rounded_full()
         .bg(theme::bright())
-        .with_animation(
-            id,
-            Animation::new(Duration::from_millis(1600)).repeat(),
-            move |el, delta| {
-                let size = from + (to - from) * delta;
-                let offset = (square - size) / 2.0;
-                el.size(px(size))
-                    .left(px(offset))
-                    .top(px(offset))
-                    .opacity(0.4 * (1.0 - delta))
-            },
-        )
+        .size(px(size))
+        .left(px(offset))
+        .top(px(offset))
+        .opacity(0.4 * (1.0 - phase))
 }
 
-fn process_dot(process: &ProcessRecord, busy: bool) -> AnyElement {
+fn process_dot(process: &ProcessRecord, busy: bool, phase: f32) -> AnyElement {
     let dot = div().size(px(6.0)).rounded_full();
     match process.state {
         ProcessState::Running if busy => div()
             .relative()
             .size(px(6.0))
-            .child(ripple(("process", process.id.0 as u64), 6.0, 6.0, 20.0))
+            .child(ripple(6.0, 6.0, 20.0, phase))
             .child(dot.bg(theme::bright()))
             .into_any_element(),
         ProcessState::Running => dot.bg(theme::quiet()).into_any_element(),
@@ -1329,6 +1416,24 @@ struct Line {
 }
 
 impl Line {
+    /// Whether any of the curve can show in `viewport`: it lies within the
+    /// box of its end and control points.
+    fn visible(&self, viewport: Size<Pixels>) -> bool {
+        let (first, second) = self.controls();
+        let xs = [self.from.x, self.to.x, first.x, second.x].map(f32::from);
+        let ys = [self.from.y, self.to.y].map(f32::from);
+        let (left, right) = xs
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(*x), hi.max(*x)));
+        let (top, bottom) = ys
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), y| (lo.min(*y), hi.max(*y)));
+        right >= -OVERSCAN
+            && left <= f32::from(viewport.width) + OVERSCAN
+            && bottom >= -OVERSCAN
+            && top <= f32::from(viewport.height) + OVERSCAN
+    }
+
     /// Control points of the horizontal S-curve.
     fn controls(&self) -> (Point<Pixels>, Point<Pixels>) {
         let reach = ((self.to.x - self.from.x) * 0.5).max(px(24.0));

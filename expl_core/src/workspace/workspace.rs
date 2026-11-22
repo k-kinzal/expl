@@ -5,13 +5,17 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::git::{Git, GitError};
+use crate::git::{BranchBlocker, Git, GitError};
 use crate::graph::{Node, NodeId};
 use crate::project::Project;
 use crate::workspace::WorkspaceError;
 
 /// Distinguishes scratch worktrees made by one process.
 static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// How many names [`Workspaces::create`] tries for a step's branch before
+/// it gives up.
+const BRANCH_ATTEMPTS: u32 = 100;
 
 /// The worktrees of one project. See the [module docs](crate::workspace).
 #[derive(Debug, Clone)]
@@ -111,16 +115,31 @@ impl Workspaces {
     #[must_use]
     pub fn new(project: &Project) -> Self {
         Self {
-            repository: Git::new(project.root()),
+            repository: Git::in_worktree(project.root()),
             root: project.worktrees_dir(),
             lock: project.git_lock_path(),
         }
     }
 
-    /// The branch that holds `node`.
+    /// The name first tried for `node`'s branch. [`Workspaces::create`]
+    /// moves on to a fresh name ([`Workspaces::branch_candidate`]) when a
+    /// ref already takes it, so the branch a step is on is the one recorded
+    /// on it ([`Workspace::branch`]), not necessarily this one.
     #[must_use]
     pub fn branch_name(node: NodeId) -> String {
         format!("expl/node-{}", node.0)
+    }
+
+    /// The `attempt`-th name tried for `node`'s branch, counting from 1:
+    /// [`branch_name`](Self::branch_name) first, then `expl/node-<id>-2`,
+    /// `expl/node-<id>-3`, and so on.
+    #[must_use]
+    pub fn branch_candidate(node: NodeId, attempt: u32) -> String {
+        if attempt <= 1 {
+            Self::branch_name(node)
+        } else {
+            format!("expl/node-{}-{attempt}", node.0)
+        }
     }
 
     /// Where `node`'s own worktree lives.
@@ -133,16 +152,30 @@ impl Workspaces {
     /// first one's tip, merged with the others in order. Merging stops at
     /// the first conflict, which is left in the worktree
     /// ([`Workspace::conflicts`]); once it is resolved,
-    /// [`Workspace::resume`] merges the remaining predecessors. Any
-    /// previous worktree and branch of the node (an earlier attempt) are
-    /// discarded first.
+    /// [`Workspace::resume`] merges the remaining predecessors. A previous
+    /// worktree of the node (an earlier attempt) is removed first.
+    ///
+    /// The step gets a branch of its own that did not exist before: names
+    /// are tried in turn ([`branch_candidate`](Self::branch_candidate)),
+    /// each created only if no ref is in its way, and one that git reports
+    /// taken — by an earlier attempt of the step, an unrelated branch, or
+    /// the trunk — is passed over for the next. Names among the `trunk`
+    /// branches ([`Trunk::branches`](crate::trunk::Trunk::branches)) are
+    /// passed over even while they do not exist. No existing ref is ever
+    /// replaced or deleted; the name taken is [`Workspace::branch`].
     ///
     /// # Errors
     ///
     /// [`WorkspaceError::PredecessorNotRealized`] when a predecessor has no
-    /// commit; [`WorkspaceError::Git`] when git fails other than by a merge
-    /// conflict.
-    pub fn create(&self, node: &Node, predecessors: &[Node]) -> Result<Workspace, WorkspaceError> {
+    /// commit; [`WorkspaceError::NoFreeBranch`] when every name tried is
+    /// taken; [`WorkspaceError::Git`] when git fails other than by a name
+    /// collision or a merge conflict.
+    pub fn create(
+        &self,
+        node: &Node,
+        predecessors: &[Node],
+        trunk: &[String],
+    ) -> Result<Workspace, WorkspaceError> {
         let mut commits = Vec::new();
         for predecessor in predecessors {
             let commit = predecessor
@@ -157,16 +190,28 @@ impl Workspaces {
             return Err(WorkspaceError::PredecessorNotRealized(node.id));
         };
 
+        let base = self.repository.resolve_commit(base)?;
         let path = self.path_of(node.id);
-        let branch = Self::branch_name(node.id);
-        {
+        let branch = {
             let _guard = lock(&self.lock)?;
-            self.discard_locked(node.id)?;
+            self.remove_worktree_locked(node.id)?;
+            let branch = self.allocate_branch_locked(node.id, &base, trunk)?;
             std::fs::create_dir_all(&self.root)?;
             let path_text = path.display().to_string();
-            self.repository
-                .run(&["worktree", "add", "-b", &branch, &path_text, base])?;
-        }
+            if let Err(error) = self
+                .repository
+                .run(&["worktree", "add", &path_text, &branch])
+            {
+                // The branch was made just now, at `base`: take it back
+                // unless something moved it meanwhile.
+                let reference = format!("refs/heads/{branch}");
+                self.repository
+                    .run(&["update-ref", "-d", &reference, &base])
+                    .ok();
+                return Err(error.into());
+            }
+            branch
+        };
 
         let mut workspace = Workspace {
             node: node.id,
@@ -307,17 +352,18 @@ impl Workspaces {
         Ok(())
     }
 
-    /// Remove `node`'s worktree and branch, if present.
+    /// Remove `node`'s worktree, if present. Its branches are kept: they
+    /// hold the attempts' work, and expl never deletes a branch.
     ///
     /// # Errors
     ///
     /// [`WorkspaceError::Git`] when git fails.
     pub fn discard(&self, node: NodeId) -> Result<(), WorkspaceError> {
         let _guard = lock(&self.lock)?;
-        self.discard_locked(node)
+        self.remove_worktree_locked(node)
     }
 
-    fn discard_locked(&self, node: NodeId) -> Result<(), WorkspaceError> {
+    fn remove_worktree_locked(&self, node: NodeId) -> Result<(), WorkspaceError> {
         let path = self.path_of(node);
         if path.exists() {
             let path_text = path.display().to_string();
@@ -325,19 +371,53 @@ impl Workspaces {
                 .run(&["worktree", "remove", "--force", &path_text])?;
         }
         self.repository.run(&["worktree", "prune"])?;
-        let branch = Self::branch_name(node);
-        let reference = format!("refs/heads/{branch}");
-        match self
-            .repository
-            .run(&["show-ref", "--verify", "--quiet", &reference])
-        {
-            Ok(_) => {
-                self.repository.run(&["branch", "-D", &branch])?;
-            }
-            Err(GitError::Failed { .. }) => {}
-            Err(error @ GitError::Spawn(_)) => return Err(error.into()),
-        }
         Ok(())
+    }
+
+    /// Create a new branch for `node` at `base` under the first free
+    /// [candidate](Self::branch_candidate) name, and return the name. A
+    /// name is created only if it does not exist (`git branch` without
+    /// `--force`); when git refuses because a ref is in the way, the next
+    /// name is tried — unless the ref is at a parent path (`expl`), which
+    /// every name shares. Names among `trunk` are never created.
+    fn allocate_branch_locked(
+        &self,
+        node: NodeId,
+        base: &str,
+        trunk: &[String],
+    ) -> Result<String, WorkspaceError> {
+        let mut tried = 0;
+        for attempt in 1..=BRANCH_ATTEMPTS {
+            tried = attempt;
+            let branch = Self::branch_candidate(node, attempt);
+            if trunk
+                .iter()
+                .any(|t| t.strip_prefix("refs/heads/").unwrap_or(t) == branch)
+            {
+                continue;
+            }
+            match self
+                .repository
+                .run(&["branch", "--no-track", &branch, base])
+            {
+                Ok(_) => return Ok(branch),
+                Err(error @ GitError::Failed { .. }) => {
+                    match self.repository.branch_blocker(&branch)? {
+                        None => return Err(error.into()),
+                        // Every candidate shares the parent path: none can
+                        // be made.
+                        Some(BranchBlocker::Parent(_)) => break,
+                        Some(BranchBlocker::Exists | BranchBlocker::Nested(_)) => {}
+                    }
+                }
+                Err(error @ GitError::Spawn(_)) => return Err(error.into()),
+            }
+        }
+        Err(WorkspaceError::NoFreeBranch {
+            node,
+            first: Self::branch_name(node),
+            tried,
+        })
     }
 }
 
@@ -354,7 +434,9 @@ impl Workspace {
         &self.path
     }
 
-    /// Branch checked out in it.
+    /// The branch created for the step and checked out in it — the one to
+    /// record on the step. Usually [`Workspaces::branch_name`], but a fresh
+    /// name when a ref already took that one.
     #[must_use]
     pub fn branch(&self) -> &str {
         &self.branch
@@ -373,21 +455,63 @@ impl Workspace {
         self.merging.is_none() && self.pending.is_empty()
     }
 
+    /// Check that the worktree still has the step's own branch checked
+    /// out: HEAD is attached to exactly `refs/heads/<branch>`. Every write
+    /// expl makes in the worktree checks this first, since a write lands on
+    /// whatever HEAD points at, and an agent may have switched the worktree
+    /// to another branch (the trunk, say) or detached it.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::LeftBranch`] naming where HEAD points instead;
+    /// [`WorkspaceError::Git`] when git fails.
+    pub fn check_branch(&self) -> Result<(), WorkspaceError> {
+        let head = Git::in_worktree(&self.path).head_ref()?;
+        if head.as_deref() == Some(format!("refs/heads/{}", self.branch).as_str()) {
+            return Ok(());
+        }
+        Err(WorkspaceError::LeftBranch {
+            node: self.node,
+            branch: self.branch.clone(),
+            head,
+        })
+    }
+
+    /// Put the worktree back at `head` on the step's branch, discarding
+    /// what an attempt left behind (a reset and a clean, as
+    /// [`Git::restore`] does) — only while the worktree is still on the
+    /// step's branch ([`check_branch`](Self::check_branch)).
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::LeftBranch`], with nothing reset, when the
+    /// worktree left its branch; [`WorkspaceError::Git`] when git fails.
+    pub fn restore(&self, head: &str) -> Result<(), WorkspaceError> {
+        self.check_branch()?;
+        Git::in_worktree(&self.path).restore(head)?;
+        Ok(())
+    }
+
     /// Conclude the predecessor merge whose [conflicts](Self::conflicts)
     /// were resolved in the worktree, then merge the remaining
     /// predecessors until the next conflict or until all are merged.
     ///
     /// # Errors
     ///
+    /// [`WorkspaceError::LeftBranch`], with nothing written, when the
+    /// worktree left the step's branch;
     /// [`WorkspaceError::UnresolvedConflicts`] when a conflicted file still
     /// holds conflict markers; [`WorkspaceError::MergeAbandoned`] when the
     /// merge was aborted instead of resolved; [`WorkspaceError::Git`] when
     /// git fails other than by a merge conflict.
     pub fn resume(&mut self) -> Result<(), WorkspaceError> {
+        let git = Git::in_worktree(&self.path);
+        // Even a resume with no pending merges requires a valid worktree.
+        git.toplevel()?;
+        self.check_branch()?;
         let Some(commit) = self.merging.clone() else {
             return self.merge_pending();
         };
-        let git = Git::new(&self.path);
         let mut unresolved = Vec::new();
         for path in &self.conflicts {
             if has_conflict_markers(&self.path.join(path))? {
@@ -442,7 +566,7 @@ impl Workspace {
     /// predecessor commit `tip` does not contain; [`WorkspaceError::Git`]
     /// when git fails.
     pub fn verify_predecessors(&self, tip: &str) -> Result<(), WorkspaceError> {
-        let git = Git::new(&self.path);
+        let git = Git::in_worktree(&self.path);
         for commit in &self.predecessors {
             if !git.is_ancestor(commit, tip)? {
                 return Err(WorkspaceError::PredecessorNotMerged {
@@ -455,9 +579,14 @@ impl Workspace {
     }
 
     /// Merge the pending predecessors in order, stopping at the first
-    /// conflict and leaving it in the worktree.
+    /// conflict and leaving it in the worktree. Merges nothing when the
+    /// worktree left the step's branch.
     fn merge_pending(&mut self) -> Result<(), WorkspaceError> {
-        let git = Git::new(&self.path);
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        self.check_branch()?;
+        let git = Git::in_worktree(&self.path);
         let identity = identity_args(&git)?;
         while let Some(commit) = self.pending.pop_front() {
             let mut args: Vec<&str> = identity.iter().map(String::as_str).collect();
@@ -485,16 +614,19 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// [`WorkspaceError::JoinIncomplete`] while predecessors are not all
-    /// merged; [`WorkspaceError::UnresolvedConflicts`] when conflicts
-    /// remain.
+    /// [`WorkspaceError::LeftBranch`], with nothing written, when the
+    /// worktree left the step's branch; [`WorkspaceError::JoinIncomplete`]
+    /// while predecessors are not all merged;
+    /// [`WorkspaceError::UnresolvedConflicts`] when conflicts remain;
+    /// [`WorkspaceError::Git`] when git fails.
     pub fn commit(&self, message: &str) -> Result<String, WorkspaceError> {
         if !self.is_joined() {
             return Err(WorkspaceError::JoinIncomplete(
                 self.merging.iter().chain(&self.pending).cloned().collect(),
             ));
         }
-        let git = Git::new(&self.path);
+        self.check_branch()?;
+        let git = Git::in_worktree(&self.path);
         let unmerged = git.unmerged_paths()?;
         if !unmerged.is_empty() {
             return Err(WorkspaceError::UnresolvedConflicts(unmerged));
@@ -528,6 +660,24 @@ impl ScratchWorkspace {
         &self.head
     }
 
+    /// Put the worktree back at the commit it was created at, discarding
+    /// what an attempt left behind (a reset and a clean, as
+    /// [`Git::restore`] does) — only while HEAD is still detached, so no
+    /// branch is ever reset.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::ScratchAttached`], with nothing reset, when a
+    /// branch is checked out there; [`WorkspaceError::Git`] when git fails.
+    pub fn restore(&self) -> Result<(), WorkspaceError> {
+        let git = Git::in_worktree(&self.path);
+        if let Some(head) = git.head_ref()? {
+            return Err(WorkspaceError::ScratchAttached { head });
+        }
+        git.restore(&self.head)?;
+        Ok(())
+    }
+
     /// What changed since the worktree was created: whether HEAD moved,
     /// files changed, or untracked files appeared (ignored files aside).
     ///
@@ -535,7 +685,7 @@ impl ScratchWorkspace {
     ///
     /// [`WorkspaceError::Git`] when git fails.
     pub fn changes(&self) -> Result<ScratchChanges, WorkspaceError> {
-        let git = Git::new(&self.path);
+        let git = Git::in_worktree(&self.path);
         let head = git.resolve_commit("HEAD")?;
         let mut paths = git.status_paths()?;
         let moved_to = if head == self.head {
@@ -607,4 +757,482 @@ fn identity_args(git: &Git) -> Result<Vec<String>, WorkspaceError> {
         args.extend(["-c".to_owned(), "user.email=expl@localhost".to_owned()]);
     }
     Ok(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use crate::graph::Graph;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        Git::new(dir).run(args).expect("git")
+    }
+
+    /// A repository on `main` with one commit, an initialised graph, and a
+    /// planned step after the origin.
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        graph: Graph,
+        workspaces: Workspaces,
+        step: NodeId,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path().join("repo");
+            fs::create_dir(&root).expect("mkdir");
+            git(&root, &["init", "-q", "-b", "main"]);
+            git(&root, &["config", "user.name", "t"]);
+            git(&root, &["config", "user.email", "t@example.com"]);
+            fs::write(root.join("README"), "hi\n").expect("write");
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "-q", "-m", "initial"]);
+            let project = Project::at(&root);
+            fs::create_dir_all(project.state_dir()).expect("state");
+            let mut graph = Graph::open(&project.database_path()).expect("graph");
+            let base = git(&root, &["rev-parse", "HEAD"]);
+            let origin = graph
+                .create_origin("Origin", Some("main"), &base)
+                .expect("origin");
+            let step = graph
+                .propose_step("step", "step", &[origin], &[])
+                .expect("step");
+            Self {
+                _dir: dir,
+                root,
+                graph,
+                workspaces: Workspaces::new(&project),
+                step,
+            }
+        }
+
+        fn create(&self, trunk: &[String]) -> Result<Workspace, WorkspaceError> {
+            let node = self.graph.node(self.step).expect("node");
+            let origin = self.graph.origin().expect("origin");
+            self.workspaces.create(&node, &[origin], trunk)
+        }
+
+        /// A branch `name` at a commit of its own, not checked out.
+        fn occupy(&self, name: &str) -> String {
+            git(&self.root, &["checkout", "-q", "-b", name]);
+            fs::write(self.root.join("other.txt"), name).expect("write");
+            git(&self.root, &["add", "."]);
+            git(&self.root, &["commit", "-q", "-m", name]);
+            git(&self.root, &["checkout", "-q", "main"]);
+            self.tip(name)
+        }
+
+        fn tip(&self, branch: &str) -> String {
+            git(&self.root, &["rev-parse", &format!("refs/heads/{branch}")])
+        }
+
+        fn has_branch(&self, branch: &str) -> bool {
+            Git::new(&self.root).has_branch(branch).expect("branch")
+        }
+    }
+
+    #[test]
+    fn create_takes_the_first_name_when_it_is_free() {
+        let fx = Fixture::new();
+        let workspace = fx.create(&[]).expect("create");
+        assert_eq!(workspace.branch(), Workspaces::branch_name(fx.step));
+        assert_eq!(fx.tip(workspace.branch()), fx.tip("main"));
+    }
+
+    #[test]
+    fn create_passes_over_taken_and_reserved_names_and_replaces_nothing() {
+        let fx = Fixture::new();
+        let id = fx.step;
+        // Taken outright, by a branch nested under the name, and reserved
+        // for a trunk that does not exist yet.
+        let unrelated = fx.occupy(&Workspaces::branch_name(id));
+        let nested_name = format!("{}/x", Workspaces::branch_candidate(id, 2));
+        let nested = fx.occupy(&nested_name);
+        let reserved = Workspaces::branch_candidate(id, 3);
+        let trunk = vec!["main".to_owned(), format!("refs/heads/{reserved}")];
+
+        let first = fx.create(&trunk).expect("create");
+        let expected = Workspaces::branch_candidate(id, 4);
+        assert_eq!(first.branch(), expected);
+        assert_eq!(fx.tip(&expected), fx.tip("main"));
+        assert_eq!(
+            Git::new(first.path()).current_branch().expect("branch"),
+            Some(expected.clone())
+        );
+        fs::write(first.path().join("work.txt"), "work").expect("write");
+        let work = first.commit("work").expect("commit");
+
+        // A retry neither reuses nor replaces the earlier attempt's branch.
+        let retry = fx.create(&trunk).expect("retry");
+        assert_eq!(retry.branch(), Workspaces::branch_candidate(id, 5));
+        assert_eq!(fx.tip(&expected), work);
+        assert_eq!(fx.tip(&Workspaces::branch_name(id)), unrelated);
+        assert_eq!(fx.tip(&nested_name), nested);
+        assert!(!fx.has_branch(&reserved), "a trunk name is never created");
+    }
+
+    #[test]
+    fn create_leaves_a_symbolic_trunk_and_its_target_alone() {
+        let fx = Fixture::new();
+        let target = Workspaces::branch_name(fx.step);
+        let target_ref = format!("refs/heads/{target}");
+        let commit = fx.occupy(&target);
+        git(&fx.root, &["symbolic-ref", "refs/heads/trunk", &target_ref]);
+
+        // Only the symref's name is declared: the target is passed over
+        // because it exists, not because it is listed.
+        let workspace = fx.create(&["trunk".to_owned()]).expect("create");
+        assert_eq!(workspace.branch(), Workspaces::branch_candidate(fx.step, 2));
+        assert_eq!(
+            git(&fx.root, &["symbolic-ref", "refs/heads/trunk"]),
+            target_ref
+        );
+        assert_eq!(fx.tip("trunk"), commit);
+        assert_eq!(fx.tip(&target), commit);
+    }
+
+    #[test]
+    fn create_gives_up_when_no_name_is_free() {
+        let fx = Fixture::new();
+        let trunk: Vec<String> = (1..=BRANCH_ATTEMPTS)
+            .map(|attempt| Workspaces::branch_candidate(fx.step, attempt))
+            .collect();
+        let error = fx.create(&trunk).expect_err("no free name");
+        assert!(
+            matches!(error, WorkspaceError::NoFreeBranch { node, tried, .. }
+                if node == fx.step && tried == BRANCH_ATTEMPTS),
+            "{error}"
+        );
+        assert!(!fx.workspaces.path_of(fx.step).exists());
+    }
+
+    #[test]
+    fn create_gives_up_at_once_when_a_parent_path_is_a_branch() {
+        let fx = Fixture::new();
+        // A branch `expl` stands in the way of every `expl/…` name.
+        let blocker = fx.occupy("expl");
+        let error = fx.create(&[]).expect_err("no free name");
+        assert!(
+            matches!(error, WorkspaceError::NoFreeBranch { node, tried: 1, .. }
+                if node == fx.step),
+            "{error}"
+        );
+        assert_eq!(fx.tip("expl"), blocker);
+        assert!(!fx.workspaces.path_of(fx.step).exists());
+    }
+
+    #[test]
+    fn missing_worktree_git_file_cannot_redirect_operations_to_trunk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let repository = Git::new(root);
+        let git = |args: &[&str]| repository.run(args).expect("git");
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        fs::write(root.join(".git/info/exclude"), "/.expl/\n").expect("exclude worktrees");
+        fs::write(root.join("tracked"), "base\n").expect("tracked file");
+        git(&["add", "tracked"]);
+        git(&["commit", "-qm", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+
+        let mut graph = Graph::in_memory().expect("graph");
+        let origin = graph
+            .create_origin("Origin", Some("main"), &base)
+            .expect("origin");
+        let step = graph
+            .propose_step("Step", "Change code", &[origin], &[])
+            .expect("step");
+        let workspaces = Workspaces::new(&Project::at(root));
+        let origin = graph.node(origin).expect("origin node");
+        let mut workspace = workspaces
+            .create(&graph.node(step).expect("step node"), &[origin], &[])
+            .expect("step worktree");
+        let worktree_git = Git::in_worktree(workspace.path());
+        let scratch = workspaces
+            .scratch_at(step, &base)
+            .expect("scratch worktree");
+
+        fs::write(root.join("tracked"), "trunk advanced\n").expect("advance trunk");
+        git(&["commit", "-qam", "advance trunk"]);
+        assert_ne!(git(&["rev-parse", "refs/heads/main"]), base);
+        fs::write(root.join("tracked"), "staged\n").expect("stage change");
+        git(&["add", "tracked"]);
+        fs::write(root.join("tracked"), "unstaged\n").expect("unstaged change");
+        fs::write(root.join("untracked"), "untracked\n").expect("untracked file");
+        let checkout = || {
+            [
+                ".git/refs/heads/main",
+                ".git/HEAD",
+                ".git/index",
+                "tracked",
+                "untracked",
+            ]
+            .map(|path| fs::read(root.join(path)).expect(path))
+        };
+        let before = checkout();
+
+        fs::remove_file(workspace.path().join(".git")).expect("remove step git file");
+        let commit = workspace
+            .commit("step commit")
+            .expect_err("commit must fail");
+        assert!(matches!(
+            commit,
+            WorkspaceError::Git(GitError::Failed { .. })
+        ));
+        assert_eq!(checkout(), before, "commit changed the main checkout");
+
+        let resume = workspace.resume().expect_err("resume must fail");
+        assert!(matches!(
+            resume,
+            WorkspaceError::Git(GitError::Failed { .. })
+        ));
+        assert_eq!(checkout(), before, "resume changed the main checkout");
+
+        let restore = worktree_git.restore(&base).expect_err("restore must fail");
+        assert!(matches!(restore, GitError::Failed { .. }));
+        assert_eq!(checkout(), before, "restore changed the main checkout");
+
+        fs::remove_file(scratch.path().join(".git")).expect("remove scratch git file");
+        let changes = scratch.changes().expect_err("scratch inspection must fail");
+        assert!(matches!(
+            changes,
+            WorkspaceError::Git(GitError::Failed { .. })
+        ));
+        assert_eq!(
+            checkout(),
+            before,
+            "scratch inspection changed the main checkout"
+        );
+    }
+
+    /// Where an agent took a step's worktree instead of the step's branch.
+    #[derive(Debug, Clone, Copy)]
+    enum Departure {
+        Trunk,
+        OtherBranch,
+        Detached,
+    }
+
+    /// Every ref in the repository, with what it points at.
+    fn refs(repository: &Git) -> String {
+        repository
+            .run(&["for-each-ref", "--format=%(refname) %(objectname)"])
+            .expect("refs")
+    }
+
+    #[test]
+    fn a_worktree_that_left_its_branch_is_never_written_to() {
+        for departure in [
+            Departure::Trunk,
+            Departure::OtherBranch,
+            Departure::Detached,
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            let repository = Git::new(root);
+            let git = |args: &[&str]| repository.run(args).expect("git");
+            git(&["init", "-q", "-b", "main"]);
+            git(&["config", "user.name", "test"]);
+            git(&["config", "user.email", "test@example.com"]);
+            fs::write(root.join(".git/info/exclude"), "/.expl/\n").expect("exclude worktrees");
+            fs::write(root.join("tracked"), "base\n").expect("tracked file");
+            git(&["add", "tracked"]);
+            git(&["commit", "-qm", "base"]);
+            let base = git(&["rev-parse", "HEAD"]);
+            git(&["branch", "other"]);
+            fs::write(root.join("tracked"), "second\n").expect("tracked file");
+            git(&["commit", "-qam", "second"]);
+            let second = git(&["rev-parse", "HEAD"]);
+
+            let mut graph = Graph::in_memory().expect("graph");
+            let origin = graph
+                .create_origin("Origin", Some("main"), &base)
+                .expect("origin");
+            let step = graph
+                .propose_step("Step", "Change code", &[origin], &[])
+                .expect("step");
+            let workspaces = Workspaces::new(&Project::at(root));
+            let origin = graph.node(origin).expect("origin node");
+            let mut workspace = workspaces
+                .create(&graph.node(step).expect("step node"), &[origin], &[])
+                .expect("step worktree");
+            workspace.check_branch().expect("on its own branch");
+
+            let worktree = Git::in_worktree(workspace.path());
+            let expected_head = match departure {
+                Departure::Trunk => {
+                    worktree
+                        .run(&["switch", "-q", "--ignore-other-worktrees", "main"])
+                        .expect("switch to the trunk");
+                    Some("refs/heads/main".to_owned())
+                }
+                Departure::OtherBranch => {
+                    worktree
+                        .run(&["switch", "-q", "other"])
+                        .expect("switch to another branch");
+                    Some("refs/heads/other".to_owned())
+                }
+                Departure::Detached => {
+                    worktree.run(&["switch", "-q", "--detach"]).expect("detach");
+                    None
+                }
+            };
+            fs::write(workspace.path().join("tracked"), "agent edit\n").expect("edit");
+            fs::write(workspace.path().join("new"), "agent file\n").expect("new file");
+
+            let checkout = || {
+                [".git/HEAD", ".git/index", "tracked"]
+                    .map(|path| fs::read(root.join(path)).expect(path))
+            };
+            let refs_before = refs(&repository);
+            let edited = workspace.path().to_path_buf();
+            let checkout_before = checkout();
+            let left = |error: WorkspaceError, what: &str| {
+                let WorkspaceError::LeftBranch { node, branch, head } = error else {
+                    panic!("{departure:?} {what}: {error}");
+                };
+                assert_eq!(node, step, "{departure:?} {what}");
+                assert_eq!(
+                    branch,
+                    Workspaces::branch_name(step),
+                    "{departure:?} {what}"
+                );
+                assert_eq!(head, expected_head, "{departure:?} {what}");
+            };
+            let unchanged = |what: &str| {
+                assert_eq!(
+                    refs(&repository),
+                    refs_before,
+                    "{departure:?}: {what} moved a ref"
+                );
+                assert_eq!(
+                    checkout(),
+                    checkout_before,
+                    "{departure:?}: {what} changed the main checkout"
+                );
+                assert_eq!(
+                    fs::read_to_string(edited.join("tracked")).expect("edit"),
+                    "agent edit\n",
+                    "{departure:?}: {what} reset the worktree"
+                );
+            };
+
+            let error = workspace.commit("step commit").expect_err("commit refuses");
+            assert!(
+                error.to_string().contains(match departure {
+                    Departure::Trunk => "`refs/heads/main`",
+                    Departure::OtherBranch => "`refs/heads/other`",
+                    Departure::Detached => "detached",
+                }),
+                "{error}"
+            );
+            left(error, "commit");
+            unchanged("commit");
+            left(workspace.resume().expect_err("resume refuses"), "resume");
+            unchanged("resume");
+            left(
+                workspace.restore(&base).expect_err("restore refuses"),
+                "restore",
+            );
+            unchanged("restore");
+            workspace.pending.push_back(second.clone());
+            left(
+                workspace.merge_pending().expect_err("merge refuses"),
+                "merge",
+            );
+            unchanged("merge");
+            workspace.pending.clear();
+            assert_eq!(git(&["rev-parse", "refs/heads/main"]), second);
+            assert_eq!(git(&["rev-parse", "refs/heads/other"]), base);
+            assert_eq!(
+                git(&["rev-parse", &format!("refs/heads/{}", workspace.branch())]),
+                base
+            );
+        }
+    }
+
+    #[test]
+    fn a_worktree_on_its_branch_commits_there() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let repository = Git::new(root);
+        let git = |args: &[&str]| repository.run(args).expect("git");
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        fs::write(root.join(".git/info/exclude"), "/.expl/\n").expect("exclude worktrees");
+        fs::write(root.join("tracked"), "base\n").expect("tracked file");
+        git(&["add", "tracked"]);
+        git(&["commit", "-qm", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+
+        let mut graph = Graph::in_memory().expect("graph");
+        let origin = graph
+            .create_origin("Origin", Some("main"), &base)
+            .expect("origin");
+        let step = graph
+            .propose_step("Step", "Change code", &[origin], &[])
+            .expect("step");
+        let workspaces = Workspaces::new(&Project::at(root));
+        let origin = graph.node(origin).expect("origin node");
+        let workspace = workspaces
+            .create(&graph.node(step).expect("step node"), &[origin], &[])
+            .expect("step worktree");
+
+        // A failed attempt's leftovers are restored away on the branch.
+        fs::write(workspace.path().join("litter"), "x\n").expect("litter");
+        workspace.restore(&base).expect("restore");
+        assert!(!workspace.path().join("litter").exists());
+
+        fs::write(workspace.path().join("tracked"), "step\n").expect("edit");
+        let head = workspace.commit("step commit").expect("commit");
+        assert_eq!(
+            git(&["rev-parse", &format!("refs/heads/{}", workspace.branch())]),
+            head
+        );
+        assert_eq!(git(&["rev-parse", "refs/heads/main"]), base);
+        assert_eq!(git(&["show", &format!("{head}:tracked")]), "step");
+    }
+
+    #[test]
+    fn a_scratch_worktree_with_a_branch_checked_out_is_not_restored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let repository = Git::new(root);
+        let git = |args: &[&str]| repository.run(args).expect("git");
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        fs::write(root.join(".git/info/exclude"), "/.expl/\n").expect("exclude worktrees");
+        fs::write(root.join("tracked"), "base\n").expect("tracked file");
+        git(&["add", "tracked"]);
+        git(&["commit", "-qm", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        fs::write(root.join("tracked"), "second\n").expect("tracked file");
+        git(&["commit", "-qam", "second"]);
+        let second = git(&["rev-parse", "HEAD"]);
+
+        let workspaces = Workspaces::new(&Project::at(root));
+        let scratch = workspaces.scratch_at(NodeId(1), &base).expect("scratch");
+        fs::write(scratch.path().join("litter"), "x\n").expect("litter");
+        scratch.restore().expect("restore a detached scratch");
+        assert!(!scratch.path().join("litter").exists());
+
+        Git::in_worktree(scratch.path())
+            .run(&["switch", "-q", "--ignore-other-worktrees", "main"])
+            .expect("switch to the trunk");
+        let before = refs(&repository);
+        let error = scratch.restore().expect_err("restore refuses");
+        let WorkspaceError::ScratchAttached { head } = error else {
+            panic!("{error}");
+        };
+        assert_eq!(head, "refs/heads/main");
+        assert_eq!(refs(&repository), before);
+        assert_eq!(git(&["rev-parse", "refs/heads/main"]), second);
+    }
 }
