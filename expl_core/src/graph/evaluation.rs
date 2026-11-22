@@ -25,7 +25,7 @@ pub struct Evaluation {
 }
 
 /// An evaluation about to be recorded.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct NewEvaluation {
     /// The goal judged against.
     pub goal: NodeId,

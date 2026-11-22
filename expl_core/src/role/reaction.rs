@@ -114,7 +114,9 @@ impl<'a> Reaction<'a> {
         prompt: &Prompt,
         schema: &serde_json::Value,
     ) -> Result<T, RoleError> {
-        self.run(graph, node, Place::Step(workspace), prompt, schema)
+        self.run(graph, node, Place::Step(workspace), prompt, schema, |_| {
+            Ok(())
+        })
     }
 
     /// Invoke the agent once in the read-only `scratch` worktree, as
@@ -135,7 +137,28 @@ impl<'a> Reaction<'a> {
         prompt: &Prompt,
         schema: &serde_json::Value,
     ) -> Result<T, RoleError> {
-        self.run(graph, node, Place::Scratch(scratch), prompt, schema)
+        self.invoke_read_only_validated(graph, node, scratch, prompt, schema, |_| Ok(()))
+    }
+
+    /// Invoke the agent as [`invoke_read_only`](Self::invoke_read_only)
+    /// does, checking each decoded response with `validate`.
+    pub(crate) fn invoke_read_only_validated<T: DeserializeOwned>(
+        &self,
+        graph: &mut Graph,
+        node: Option<NodeId>,
+        scratch: &ScratchWorkspace,
+        prompt: &Prompt,
+        schema: &serde_json::Value,
+        validate: impl Fn(&T) -> Result<(), AgentError>,
+    ) -> Result<T, RoleError> {
+        self.run(
+            graph,
+            node,
+            Place::Scratch(scratch),
+            prompt,
+            schema,
+            validate,
+        )
     }
 
     fn run<T: DeserializeOwned>(
@@ -145,6 +168,7 @@ impl<'a> Reaction<'a> {
         place: Place<'_>,
         prompt: &Prompt,
         schema: &serde_json::Value,
+        validate: impl Fn(&T) -> Result<(), AgentError>,
     ) -> Result<T, RoleError> {
         let (directory, scratch) = match place {
             Place::Step(workspace) => (workspace.path(), None),
@@ -197,15 +221,18 @@ impl<'a> Reaction<'a> {
         };
         let outcome = self
             .agent
-            .invoke::<T>(&Invocation {
-                directory,
-                prompt,
-                response_schema: schema,
-                facts: &facts,
-                log: &log,
-                interrupt: self.interrupt,
-                restore: Some(&restore),
-            })
+            .invoke_validated(
+                &Invocation {
+                    directory,
+                    prompt,
+                    response_schema: schema,
+                    facts: &facts,
+                    log: &log,
+                    interrupt: self.interrupt,
+                    restore: Some(&restore),
+                },
+                validate,
+            )
             .map(|run| (run.response, run.session_id))
             .map_err(RoleError::from);
         let outcome = match scratch {

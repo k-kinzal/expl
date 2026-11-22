@@ -328,6 +328,10 @@ mod tests {
 
         let mut processes = Processes::open(&db, &project.logs_dir()).expect("processes");
         let interrupt = Interrupt::default();
+        let evaluation_reply = serde_json::json!({
+            "evaluations": [{"goal": goal, "satisfied": false, "score": 0, "reason": "missing"}]
+        })
+        .to_string();
         let cases = [
             (
                 "explorer",
@@ -354,7 +358,7 @@ mod tests {
                 "evaluator",
                 Role::Evaluation,
                 "",
-                r#"{"evaluations":[]}"#,
+                evaluation_reply.as_str(),
                 None,
             ),
         ];
