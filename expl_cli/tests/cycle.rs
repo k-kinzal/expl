@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 /// and commits `sneaky.txt` while `@DIR@/eval-commits` exists. An
 /// investigation answers `no` (whether `hello.txt` exists), and its findings
 /// are judged to settle the goal; while `@DIR@/investigation-writes` exists
-/// it first creates `hello.txt` itself. Prompts are kept in `@DIR@/prompts/`
+/// it first creates `hello.txt` itself, and it answers with
+/// `@DIR@/finding.json` when present. Prompts are kept in `@DIR@/prompts/`
 /// for inspection. While `@DIR@/fast-revisits` exists, the fake explorer
 /// records the first revisit prompt and immediately returns no proposals.
 const AGENT: &str = r#"#!/bin/sh
@@ -58,6 +59,7 @@ execution)
   if grep -q '^## Question' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
     if [ -f "@DIR@/investigation-writes" ]; then echo made > hello.txt; fi
     if [ -f hello.txt ]; then answer=yes; else answer=no; fi
+    if [ -f "@DIR@/finding.json" ]; then cat "@DIR@/finding.json"; exit 0; fi
     echo "{\"investigated\":true,\"answer\":\"$answer\",\"evidence\":\"looked for hello.txt\"}"
     exit 0
   fi
@@ -429,6 +431,19 @@ fn an_investigation_answers_without_a_commit_and_its_finding_is_judged() {
             "1",
         ],
     );
+    // Long, multiline evidence whose decisive lines come past the digest's
+    // cutoff.
+    let padding = "Searched the tree for hello.txt, directory by directory. ".repeat(15);
+    let decisive = [
+        "Decisive:",
+        "$ ls hello.txt",
+        "ls: hello.txt: No such file or directory (exit status 1)",
+        "src/main.rs:7: never writes hello.txt",
+    ];
+    let evidence = format!("{padding}\n\n{}\n", decisive.join("\n"));
+    assert!(evidence.find("Decisive").expect("decisive") > 600);
+    let finding = serde_json::json!({"investigated": true, "answer": "no", "evidence": evidence});
+    std::fs::write(sandbox.dir.path().join("finding.json"), finding.to_string()).expect("finding");
     ok(repo, &["run", "executor", "--exit-when-idle"]);
 
     // Answered, at the code it was about, with no branch or commit of its own.
@@ -455,8 +470,16 @@ fn an_investigation_answers_without_a_commit_and_its_finding_is_judged() {
     let judged = std::fs::read_dir(&prompts)
         .expect("prompts")
         .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("prompt"))
-        .any(|text| text.contains("## Findings") && text.contains("Look for hello.txt: no"));
-    assert!(judged, "no evaluation was shown the finding");
+        .find(|text| text.contains("## Findings") && text.contains("Look for hello.txt: no"))
+        .expect("no evaluation was shown the finding");
+    // Complete: every decisive line past the cutoff, in its original form.
+    for line in decisive {
+        assert!(
+            judged.lines().any(|l| l == format!("    {line}")),
+            "{line:?} did not reach the evaluator:\n{judged}"
+        );
+    }
+    assert!(judged.contains(padding.trim_end()), "{judged}");
     let candidates = ok(repo, &["candidate", "ls"]);
     assert!(candidates.contains("answer: no"), "{candidates}");
 
