@@ -227,6 +227,52 @@ fn set_status_in(
     Ok(())
 }
 
+/// Refuse to settle step `id` a second time: [`GraphError::NotInStatus`]
+/// (expecting [`GraphError::RUNNING`]) when it completed, failed or was
+/// pruned already, [`GraphError::NodeNotFound`] when it does not exist.
+/// Checked before the lease, so whoever comes late learns the step was
+/// settled elsewhere rather than that it lost the step.
+fn ensure_unsettled(conn: &Connection, id: NodeId) -> Result<(), GraphError> {
+    let node = node_in(conn, id)?;
+    if matches!(
+        node.status,
+        NodeStatus::Completed | NodeStatus::Failed | NodeStatus::Pruned
+    ) {
+        return Err(GraphError::NotInStatus {
+            node: id,
+            expected: GraphError::RUNNING,
+        });
+    }
+    Ok(())
+}
+
+/// Settle the running step `id` at `status` with `outcome`. Only a running
+/// step is touched: [`GraphError::NotInStatus`] (expecting
+/// [`GraphError::RUNNING`]) otherwise, [`GraphError::NodeNotFound`] when
+/// it does not exist.
+fn settle_in(
+    conn: &Connection,
+    id: NodeId,
+    status: NodeStatus,
+    outcome: &str,
+) -> Result<(), GraphError> {
+    let changed = conn.execute(
+        &format!(
+            "UPDATE nodes SET status = ?2, outcome = ?3, holder_token = NULL, updated_at = {NOW} \
+             WHERE id = ?1 AND status = 'running'"
+        ),
+        params![id.0, status.as_str(), outcome],
+    )?;
+    if changed == 0 {
+        node_in(conn, id)?;
+        return Err(GraphError::NotInStatus {
+            node: id,
+            expected: GraphError::RUNNING,
+        });
+    }
+    Ok(())
+}
+
 /// Record `node.ready` when `id` is a planned step whose predecessors are
 /// all completed.
 fn emit_if_ready(conn: &Connection, id: NodeId) -> Result<(), GraphError> {
@@ -987,10 +1033,11 @@ impl Graph {
     ///
     /// # Errors
     ///
-    /// [`GraphError::LeaseLost`] when the delivery does not hold the step,
-    /// [`GraphError::Uncommitted`] when a completion has no tip commit,
-    /// [`GraphError::NotInStatus`] when the held step is an investigation,
-    /// or [`GraphError::Sqlite`] on SQLite failure.
+    /// [`GraphError::NotInStatus`] when the step was settled already
+    /// (expecting [`GraphError::RUNNING`]) or the held step is an
+    /// investigation, [`GraphError::LeaseLost`] when the delivery does not
+    /// hold the step, [`GraphError::Uncommitted`] when a completion has no
+    /// tip commit, or [`GraphError::Sqlite`] on SQLite failure.
     pub fn publish(
         &mut self,
         id: NodeId,
@@ -1006,6 +1053,7 @@ impl Graph {
             return Err(GraphError::Uncommitted(id));
         }
         let tx = self.write()?;
+        ensure_unsettled(&tx, id)?;
         ensure_holder(&tx, id, token)?;
         let changed = tx.execute(
             &format!(
@@ -1037,12 +1085,15 @@ impl Graph {
     }
 
     /// A running step was realised: records `node.completed`, and
-    /// `node.ready` for every successor that can run now.
+    /// `node.ready` for every successor that can run now. A step settled
+    /// already is left as it is, and nothing is recorded.
     ///
     /// # Errors
     ///
-    /// [`GraphError::LeaseLost`] when the delivery does not hold the step,
-    /// or [`GraphError::Sqlite`] on SQLite failure.
+    /// [`GraphError::NotInStatus`] when the step was settled already
+    /// (expecting [`GraphError::RUNNING`]), [`GraphError::NodeNotFound`]
+    /// when it does not exist, [`GraphError::LeaseLost`] when the delivery
+    /// does not hold the step, or [`GraphError::Sqlite`] on SQLite failure.
     pub fn complete(
         &mut self,
         id: NodeId,
@@ -1050,8 +1101,9 @@ impl Graph {
         outcome: &str,
     ) -> Result<(), GraphError> {
         let tx = self.write()?;
+        ensure_unsettled(&tx, id)?;
         ensure_holder(&tx, id, token)?;
-        set_status_in(&tx, id, NodeStatus::Completed, Some(outcome))?;
+        settle_in(&tx, id, NodeStatus::Completed, outcome)?;
         emit_completion(&tx, id)?;
         tx.commit()?;
         Ok(())
@@ -1061,13 +1113,17 @@ impl Graph {
     /// the commit it was about, which its successors build on — with no
     /// branch, and `evidence` as its outcome. Validates the delivery's claim
     /// on the step and records `node.completed` and any
-    /// successors' `node.ready` events in the same transaction.
+    /// successors' `node.ready` events in the same transaction. A step
+    /// settled already keeps its answer and evidence, and nothing is
+    /// recorded.
     ///
     /// # Errors
     ///
-    /// [`GraphError::LeaseLost`] when the delivery does not hold the step,
-    /// or [`GraphError::NotInStatus`] when the held step is not an investigation.
-    /// SQLite failures are returned as [`GraphError::Sqlite`].
+    /// [`GraphError::NotInStatus`] when the step was settled already
+    /// (expecting [`GraphError::RUNNING`]) or the held step is not an
+    /// investigation, [`GraphError::NodeNotFound`] when it does not exist,
+    /// or [`GraphError::LeaseLost`] when the delivery does not hold the
+    /// step. SQLite failures are returned as [`GraphError::Sqlite`].
     pub fn record_finding(
         &mut self,
         id: NodeId,
@@ -1077,6 +1133,7 @@ impl Graph {
         evidence: &str,
     ) -> Result<(), GraphError> {
         let tx = self.write()?;
+        ensure_unsettled(&tx, id)?;
         ensure_holder(&tx, id, token)?;
         let changed = tx.execute(
             &format!(
@@ -1097,12 +1154,16 @@ impl Graph {
         Ok(())
     }
 
-    /// A running step failed: records `node.failed`.
+    /// A running step failed: records `node.failed`. A step settled already
+    /// keeps its status and outcome — a completed investigation its answer
+    /// and evidence — and nothing is recorded.
     ///
     /// # Errors
     ///
-    /// [`GraphError::LeaseLost`] when the delivery does not hold the step,
-    /// or [`GraphError::Sqlite`] on SQLite failure.
+    /// [`GraphError::NotInStatus`] when the step was settled already
+    /// (expecting [`GraphError::RUNNING`]), [`GraphError::NodeNotFound`]
+    /// when it does not exist, [`GraphError::LeaseLost`] when the delivery
+    /// does not hold the step, or [`GraphError::Sqlite`] on SQLite failure.
     pub fn fail(
         &mut self,
         id: NodeId,
@@ -1110,8 +1171,9 @@ impl Graph {
         outcome: &str,
     ) -> Result<(), GraphError> {
         let tx = self.write()?;
+        ensure_unsettled(&tx, id)?;
         ensure_holder(&tx, id, token)?;
-        set_status_in(&tx, id, NodeStatus::Failed, Some(outcome))?;
+        settle_in(&tx, id, NodeStatus::Failed, outcome)?;
         emit(&tx, EventKind::NodeFailed, Some(id))?;
         tx.commit()?;
         Ok(())
@@ -1885,19 +1947,20 @@ mod tests {
         );
 
         // Settled, the step is no longer the delivery's to publish.
-        assert!(matches!(
-            graph.publish(
-                step,
-                &delivery.token,
-                &ChangeResult {
-                    branch: "expl/node-a-2",
-                    head_commit: None,
-                    completed: false,
-                    outcome: "late",
-                },
-            ),
-            Err(GraphError::LeaseLost(id)) if id == step
-        ));
+        assert!(
+            graph
+                .publish(
+                    step,
+                    &delivery.token,
+                    &ChangeResult {
+                        branch: "expl/node-a-2",
+                        head_commit: None,
+                        completed: false,
+                        outcome: "late",
+                    },
+                )
+                .is_err_and(|error| error.is_settled(step))
+        );
         assert_eq!(graph.node(step).expect("node"), node);
     }
 
@@ -1957,16 +2020,11 @@ mod tests {
         replacement_graph
             .record_finding(question, &replacement.token, code, Answer::Yes, "seen it")
             .expect("finding");
-        assert!(matches!(
-            replacement_graph.record_finding(
-                question,
-                &replacement.token,
-                code,
-                Answer::No,
-                "duplicate"
-            ),
-            Err(GraphError::LeaseLost(node)) if node == question
-        ));
+        assert!(
+            replacement_graph
+                .record_finding(question, &replacement.token, code, Answer::No, "duplicate")
+                .is_err_and(|error| error.is_settled(question))
+        );
         let answered = graph.node(question).expect("node");
         assert_eq!(answered.status, NodeStatus::Completed);
         assert_eq!(answered.answer, Some(Answer::Yes));
@@ -2341,6 +2399,172 @@ mod tests {
             graph.prune(origin, "x"),
             Err(GraphError::NotInStatus { .. })
         ));
+    }
+
+    /// A planned investigation (`investigation`) or change step on `origin`
+    /// toward `goal`, with a successor, claimed by a fresh delivery.
+    fn running(
+        graph: &mut Graph,
+        inbox: &mut Inbox,
+        origin: NodeId,
+        goal: NodeId,
+        investigation: bool,
+    ) -> (NodeId, NodeId, Delivery) {
+        let step = if investigation {
+            graph.propose_investigation("q", "is it so?", &[origin], &[goal])
+        } else {
+            graph.propose_step("s", "s", &[origin], &[goal])
+        }
+        .expect("step");
+        let next = graph
+            .propose_step("next", "next", &[step], &[goal])
+            .expect("next");
+        graph.plan_step(step, 1).expect("plan");
+        graph.plan_step(next, 1).expect("plan");
+        let delivery = lease_ready(inbox, 1, step);
+        assert!(graph.claim(step, &delivery.token).expect("claim"));
+        (step, next, delivery)
+    }
+
+    #[test]
+    fn a_late_failure_leaves_a_recorded_finding_alone() {
+        let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
+        let (question, _, delivery) = running(&mut graph, &mut inbox, origin, goal, true);
+        graph
+            .record_finding(question, &delivery.token, "abc", Answer::Yes, "seen it")
+            .expect("finding");
+        let answered = graph.node(question).expect("node");
+        let before = graph.last_event().expect("last");
+
+        // Still under the same delivery's lease, as a late executor is.
+        let late = graph.fail(question, &delivery.token, "late failure");
+        assert!(
+            matches!(
+                &late,
+                Err(GraphError::NotInStatus { node, expected })
+                    if *node == question && *expected == GraphError::RUNNING
+            ),
+            "{late:?}"
+        );
+        assert!(late.is_err_and(|error| error.is_settled(question)));
+        let after = graph.node(question).expect("node");
+        assert_eq!(after, answered);
+        assert_eq!(after.status, NodeStatus::Completed);
+        assert_eq!(after.answer, Some(Answer::Yes));
+        assert_eq!(after.outcome.as_deref(), Some("seen it"));
+        assert_eq!(graph.last_event().expect("last"), before);
+        assert!(
+            !kinds(&graph).contains(&(EventKind::NodeFailed, Some(question.0))),
+            "no node.failed follows node.completed"
+        );
+
+        // Nor can a second finding replace it.
+        assert!(
+            graph
+                .record_finding(question, &delivery.token, "abc", Answer::No, "again")
+                .is_err_and(|error| error.is_settled(question))
+        );
+        assert_eq!(graph.node(question).expect("node"), answered);
+        assert_eq!(graph.last_event().expect("last"), before);
+    }
+
+    #[test]
+    fn a_failed_step_cannot_complete_late() {
+        let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
+        let (step, next, delivery) = running(&mut graph, &mut inbox, origin, goal, false);
+        graph
+            .fail(step, &delivery.token, "did not compile")
+            .expect("fail");
+        let failed = graph.node(step).expect("node");
+        let before = graph.last_event().expect("last");
+
+        assert!(
+            graph
+                .complete(step, &delivery.token, "done after all")
+                .is_err_and(|error| error.is_settled(step))
+        );
+        assert!(
+            graph
+                .fail(step, &delivery.token, "failed again")
+                .is_err_and(|error| error.is_settled(step))
+        );
+        assert_eq!(graph.node(step).expect("node"), failed);
+        assert_eq!(failed.status, NodeStatus::Failed);
+        assert_eq!(failed.outcome.as_deref(), Some("did not compile"));
+        assert_eq!(graph.last_event().expect("last"), before);
+        assert_eq!(graph.node(next).expect("next").status, NodeStatus::Planned);
+
+        // A step that does not exist is not found, not settled.
+        assert!(matches!(
+            graph.fail(NodeId(9999), &delivery.token, "x"),
+            Err(GraphError::NodeNotFound(NodeId(9999)))
+        ));
+    }
+
+    #[test]
+    fn a_running_step_completes_or_fails_once() {
+        let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
+        let (failed, _, delivery) = running(&mut graph, &mut inbox, origin, goal, false);
+        let before = kinds(&graph).len();
+        graph.fail(failed, &delivery.token, "boom").expect("fail");
+        let node = graph.node(failed).expect("node");
+        assert_eq!(node.status, NodeStatus::Failed);
+        assert_eq!(node.outcome.as_deref(), Some("boom"));
+        assert_eq!(
+            kinds(&graph)[before..],
+            [(EventKind::NodeFailed, Some(failed.0))]
+        );
+        inbox.ack(&delivery, None).expect("ack");
+
+        let (done, next, delivery) = running(&mut graph, &mut inbox, origin, goal, false);
+        let before = kinds(&graph).len();
+        graph
+            .complete(done, &delivery.token, "done")
+            .expect("complete");
+        let node = graph.node(done).expect("node");
+        assert_eq!(node.status, NodeStatus::Completed);
+        assert_eq!(node.outcome.as_deref(), Some("done"));
+        assert_eq!(
+            kinds(&graph)[before..],
+            [
+                (EventKind::NodeCompleted, Some(done.0)),
+                (EventKind::NodeReady, Some(next.0))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_step_replanned_runs_and_settles_again() {
+        let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
+        let (step, next, first) = running(&mut graph, &mut inbox, origin, goal, false);
+        graph.fail(step, &first.token, "boom").expect("fail");
+        inbox.ack(&first, None).expect("ack");
+
+        graph.replan(step).expect("replan");
+        assert_eq!(graph.node(step).expect("node").status, NodeStatus::Planned);
+        let retry = lease_ready(&mut inbox, 2, step);
+        assert_ne!(retry.event.id, first.event.id);
+        assert!(graph.claim(step, &retry.token).expect("claim"));
+        // The first attempt's delivery cannot settle the attempt that
+        // replaced it.
+        assert!(matches!(
+            graph.complete(step, &first.token, "stale"),
+            Err(GraphError::LeaseLost(id)) if id == step
+        ));
+        let before = kinds(&graph).len();
+        graph
+            .complete(step, &retry.token, "done this time")
+            .expect("complete");
+        let node = graph.node(step).expect("node");
+        assert_eq!(node.status, NodeStatus::Completed);
+        assert_eq!(node.outcome.as_deref(), Some("done this time"));
+        assert_eq!(
+            kinds(&graph)[before..],
+            [
+                (EventKind::NodeCompleted, Some(step.0)),
+                (EventKind::NodeReady, Some(next.0))
+            ]
+        );
     }
 
     #[test]

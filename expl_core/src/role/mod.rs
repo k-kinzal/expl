@@ -182,8 +182,9 @@ impl Role {
     /// succeeding (its attempts were used up, or the process gave up on
     /// it), so no work is left hanging. Execution fails a step still
     /// held by the delivery (records `node.failed` with `why`), so planning can
-    /// replan or prune it; other roles leave nothing behind. Returns the
-    /// step failed, if any.
+    /// replan or prune it; other roles leave nothing behind. A step
+    /// settled elsewhere already is left as it is. Returns what became of
+    /// the delivery's step.
     ///
     /// # Errors
     ///
@@ -193,10 +194,35 @@ impl Role {
         delivery: &Delivery,
         graph: &mut Graph,
         why: &str,
-    ) -> Result<Option<NodeId>, GraphError> {
+    ) -> Result<Abandonment, GraphError> {
         match self {
             Self::Execution => execution::abandon(delivery, graph, why),
-            Self::Exploration | Self::Planning | Self::Evaluation => Ok(None),
+            Self::Exploration | Self::Planning | Self::Evaluation => Ok(Abandonment::Nothing),
+        }
+    }
+}
+
+/// What [`Role::abandon`] did with the step of a delivery that ended for
+/// good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Abandonment {
+    /// Nothing was left behind: the role holds no steps, the event names
+    /// none, or the delivery does not hold its step (another one does).
+    Nothing,
+    /// The step the delivery still held, now failed.
+    Failed(NodeId),
+    /// The step was settled elsewhere already (completed, failed or
+    /// pruned) and is left as it is: the delivery has nothing left to do.
+    Settled(NodeId),
+}
+
+impl Abandonment {
+    /// The step that was failed, if any.
+    #[must_use]
+    pub fn failed(self) -> Option<NodeId> {
+        match self {
+            Self::Failed(id) => Some(id),
+            Self::Nothing | Self::Settled(_) => None,
         }
     }
 }
