@@ -169,7 +169,7 @@ impl<'a> Reaction<'a> {
         // so a failed attempt's leftovers can be reset before the next CLI.
         // Not while it resolves a merge: resetting would abort the merge
         // the next CLI is to finish.
-        let git = Git::new(directory);
+        let git = Git::in_worktree(directory);
         let merging = git
             .run(&["rev-parse", "-q", "--verify", "MERGE_HEAD"])
             .is_ok();
@@ -178,9 +178,7 @@ impl<'a> Reaction<'a> {
             .flatten();
         let restore = || -> std::io::Result<()> {
             match &started_at {
-                Some(head) => Git::new(directory)
-                    .restore(head)
-                    .map_err(std::io::Error::other),
+                Some(head) => git.restore(head).map_err(std::io::Error::other),
                 None => Ok(()),
             }
         };

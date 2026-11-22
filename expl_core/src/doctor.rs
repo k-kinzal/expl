@@ -244,7 +244,7 @@ impl Doctor {
     #[must_use]
     pub fn new(project: &Project) -> Self {
         Self {
-            repository: Git::new(project.root()),
+            repository: Git::in_worktree(project.root()),
             workspaces: Workspaces::new(project),
         }
     }

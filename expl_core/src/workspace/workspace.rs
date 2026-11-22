@@ -111,7 +111,7 @@ impl Workspaces {
     #[must_use]
     pub fn new(project: &Project) -> Self {
         Self {
-            repository: Git::new(project.root()),
+            repository: Git::in_worktree(project.root()),
             root: project.worktrees_dir(),
             lock: project.git_lock_path(),
         }
@@ -401,10 +401,12 @@ impl Workspace {
     /// merge was aborted instead of resolved; [`WorkspaceError::Git`] when
     /// git fails other than by a merge conflict.
     pub fn resume(&mut self) -> Result<(), WorkspaceError> {
+        let git = Git::in_worktree(&self.path);
+        // Even a resume with no pending merges requires a valid worktree.
+        git.toplevel()?;
         let Some(commit) = self.merging.clone() else {
             return self.merge_pending();
         };
-        let git = Git::new(&self.path);
         let mut unresolved = Vec::new();
         for path in &self.conflicts {
             if has_conflict_markers(&self.path.join(path))? {
@@ -459,7 +461,7 @@ impl Workspace {
     /// predecessor commit `tip` does not contain; [`WorkspaceError::Git`]
     /// when git fails.
     pub fn verify_predecessors(&self, tip: &str) -> Result<(), WorkspaceError> {
-        let git = Git::new(&self.path);
+        let git = Git::in_worktree(&self.path);
         for commit in &self.predecessors {
             if !git.is_ancestor(commit, tip)? {
                 return Err(WorkspaceError::PredecessorNotMerged {
@@ -474,7 +476,7 @@ impl Workspace {
     /// Merge the pending predecessors in order, stopping at the first
     /// conflict and leaving it in the worktree.
     fn merge_pending(&mut self) -> Result<(), WorkspaceError> {
-        let git = Git::new(&self.path);
+        let git = Git::in_worktree(&self.path);
         let identity = identity_args(&git)?;
         while let Some(commit) = self.pending.pop_front() {
             let mut args: Vec<&str> = identity.iter().map(String::as_str).collect();
@@ -504,14 +506,14 @@ impl Workspace {
     ///
     /// [`WorkspaceError::JoinIncomplete`] while predecessors are not all
     /// merged; [`WorkspaceError::UnresolvedConflicts`] when conflicts
-    /// remain.
+    /// remain; [`WorkspaceError::Git`] when git fails.
     pub fn commit(&self, message: &str) -> Result<String, WorkspaceError> {
         if !self.is_joined() {
             return Err(WorkspaceError::JoinIncomplete(
                 self.merging.iter().chain(&self.pending).cloned().collect(),
             ));
         }
-        let git = Git::new(&self.path);
+        let git = Git::in_worktree(&self.path);
         let unmerged = git.unmerged_paths()?;
         if !unmerged.is_empty() {
             return Err(WorkspaceError::UnresolvedConflicts(unmerged));
@@ -552,7 +554,7 @@ impl ScratchWorkspace {
     ///
     /// [`WorkspaceError::Git`] when git fails.
     pub fn changes(&self) -> Result<ScratchChanges, WorkspaceError> {
-        let git = Git::new(&self.path);
+        let git = Git::in_worktree(&self.path);
         let head = git.resolve_commit("HEAD")?;
         let mut paths = git.status_paths()?;
         let moved_to = if head == self.head {
@@ -624,4 +626,97 @@ fn identity_args(git: &Git) -> Result<Vec<String>, WorkspaceError> {
         args.extend(["-c".to_owned(), "user.email=expl@localhost".to_owned()]);
     }
     Ok(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use crate::graph::Graph;
+
+    #[test]
+    fn missing_worktree_git_file_cannot_redirect_operations_to_trunk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let repository = Git::new(root);
+        let git = |args: &[&str]| repository.run(args).expect("git");
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        fs::write(root.join(".git/info/exclude"), "/.expl/\n").expect("exclude worktrees");
+        fs::write(root.join("tracked"), "base\n").expect("tracked file");
+        git(&["add", "tracked"]);
+        git(&["commit", "-qm", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+
+        let mut graph = Graph::in_memory().expect("graph");
+        let origin = graph
+            .create_origin("Origin", Some("main"), &base)
+            .expect("origin");
+        let step = graph
+            .propose_step("Step", "Change code", &[origin], &[])
+            .expect("step");
+        let workspaces = Workspaces::new(&Project::at(root));
+        let origin = graph.node(origin).expect("origin node");
+        let mut workspace = workspaces
+            .create(&graph.node(step).expect("step node"), &[origin], &[])
+            .expect("step worktree");
+        let worktree_git = Git::in_worktree(workspace.path());
+        let scratch = workspaces
+            .scratch_at(step, &base)
+            .expect("scratch worktree");
+
+        fs::write(root.join("tracked"), "trunk advanced\n").expect("advance trunk");
+        git(&["commit", "-qam", "advance trunk"]);
+        assert_ne!(git(&["rev-parse", "refs/heads/main"]), base);
+        fs::write(root.join("tracked"), "staged\n").expect("stage change");
+        git(&["add", "tracked"]);
+        fs::write(root.join("tracked"), "unstaged\n").expect("unstaged change");
+        fs::write(root.join("untracked"), "untracked\n").expect("untracked file");
+        let checkout = || {
+            [
+                ".git/refs/heads/main",
+                ".git/HEAD",
+                ".git/index",
+                "tracked",
+                "untracked",
+            ]
+            .map(|path| fs::read(root.join(path)).expect(path))
+        };
+        let before = checkout();
+
+        fs::remove_file(workspace.path().join(".git")).expect("remove step git file");
+        let commit = workspace
+            .commit("step commit")
+            .expect_err("commit must fail");
+        assert!(matches!(
+            commit,
+            WorkspaceError::Git(GitError::Failed { .. })
+        ));
+        assert_eq!(checkout(), before, "commit changed the main checkout");
+
+        let resume = workspace.resume().expect_err("resume must fail");
+        assert!(matches!(
+            resume,
+            WorkspaceError::Git(GitError::Failed { .. })
+        ));
+        assert_eq!(checkout(), before, "resume changed the main checkout");
+
+        let restore = worktree_git.restore(&base).expect_err("restore must fail");
+        assert!(matches!(restore, GitError::Failed { .. }));
+        assert_eq!(checkout(), before, "restore changed the main checkout");
+
+        fs::remove_file(scratch.path().join(".git")).expect("remove scratch git file");
+        let changes = scratch.changes().expect_err("scratch inspection must fail");
+        assert!(matches!(
+            changes,
+            WorkspaceError::Git(GitError::Failed { .. })
+        ));
+        assert_eq!(
+            checkout(),
+            before,
+            "scratch inspection changed the main checkout"
+        );
+    }
 }

@@ -1170,6 +1170,15 @@ fn discovery_stops_at_node_worktrees() {
     let out = expl(&worktree, &["node", "ls"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no expl project"));
+
+    let nested = worktree.join("nested");
+    std::fs::create_dir(&nested).expect("nested directory");
+    std::fs::remove_file(worktree.join(".git")).expect("remove worktree git file");
+    for dir in [&worktree, &nested] {
+        let out = expl(dir, &["node", "ls"]);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not inside a git repository"));
+    }
 }
 
 #[test]
