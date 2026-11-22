@@ -154,8 +154,14 @@ impl Workspaces {
     /// first one's tip, merged with the others in order. Merging stops at
     /// the first conflict, which is left in the worktree
     /// ([`Workspace::conflicts`]); once it is resolved,
-    /// [`Workspace::resume`] merges the remaining predecessors. Registered
-    /// worktrees from earlier attempts are removed first.
+    /// [`Workspace::resume`] merges the remaining predecessors.
+    ///
+    /// Only this attempt's own path ([`path_of`](Self::path_of) for `lease`)
+    /// is allocated; worktrees of every other attempt of the step are left
+    /// alone, because the process holding one may be the step's current
+    /// holder. Each attempt releases its own worktree
+    /// ([`release`](Self::release), [`unregister`](Self::unregister)), and
+    /// `expl doctor` removes what is left once the step settles.
     ///
     /// The step gets a branch of its own that did not exist before: names
     /// are tried in turn ([`branch_candidate`](Self::branch_candidate)),
@@ -206,9 +212,6 @@ impl Workspaces {
                     .any(|(_, existing)| existing.file_name() == path.file_name())
             {
                 return Err(WorkspaceError::AttemptExists(path));
-            }
-            for (_, previous) in registered.iter().filter(|(id, _)| *id == node.id) {
-                self.remove_registered(previous, true)?;
             }
             let branch = self.allocate_branch_locked(node.id, &base, trunk)?;
             std::fs::create_dir_all(&self.root)?;
@@ -949,6 +952,9 @@ mod tests {
         assert_eq!(fx.tip(&Workspaces::branch_name(id)), unrelated);
         assert_eq!(fx.tip(&nested_name), nested);
         assert!(!fx.has_branch(&reserved), "a trunk name is never created");
+        first
+            .check_branch()
+            .expect("the earlier attempt's worktree is left alone");
     }
 
     #[test]

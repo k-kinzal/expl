@@ -124,27 +124,33 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
         return investigate(reaction, graph, &node, &predecessors);
     }
 
-    // Each attempt gets its own path and a fresh branch. A process left
-    // behind by an earlier attempt still has its old path.
+    // Each attempt gets its own path and a fresh branch, and touches no
+    // other attempt's worktree: a process left behind by an earlier attempt
+    // still has its old path, and the attempt that took the step over may
+    // already be working in its own.
     let context = reaction.context();
+    let workspaces = context.workspaces();
     let trunk = Trunk::new(context.project(), context.declaration().trunk.as_deref());
     let trunk = trunk.branches(graph)?;
-    let mut workspace = match context
-        .workspaces()
-        .create(&node, token, &predecessors, &trunk)
-    {
+    pause(Window::Allocate);
+    let mut workspace = match workspaces.create(&node, token, &predecessors, &trunk) {
         Ok(workspace) => workspace,
         Err(error) => return fail(graph, token, &node, "", None, error.to_string()),
     };
     let branch = workspace.branch().to_owned();
-    graph.set_branch(id, token, &branch, None)?;
-    let result = carry_out(reaction, graph, &node, &branch, &mut workspace);
-    // Settled either way: the branch holds what there is, and the worktree
-    // goes. On lease loss or interruption, leave cleanup to the next
-    // attempt or doctor.
+    let result = graph
+        .set_branch(id, token, &branch, None)
+        .map_err(RoleError::from)
+        .and_then(|()| carry_out(reaction, graph, &node, &branch, &mut workspace));
+    // This attempt releases its own worktree, and only that; both are best
+    // effort, and `expl doctor --fix` removes a leftover once the step
+    // settles. Settled: the branch holds what there is, and the worktree
+    // goes. On lease loss or interruption, the worktree goes only if
+    // nothing was left in it, so unsaved work stays to be inspected.
     if matches!(result, Ok(Report::Execution(_))) && !reaction.lease_lost() {
-        // Best effort: `expl doctor --fix` removes a leftover.
-        reaction.context().workspaces().release(workspace).ok();
+        workspaces.release(workspace).ok();
+    } else {
+        workspaces.unregister(workspace.path()).ok();
     }
     result
 }
@@ -242,6 +248,9 @@ fn carry_out(
 /// lease over in between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Window {
+    /// After the claim, before [`Workspaces::create`](crate::workspace::Workspaces::create)
+    /// allocates the attempt's worktree and branch.
+    Allocate,
     /// After the check that follows the agent's run, before
     /// [`Workspace::commit`] and the writes after it.
     Commit,
@@ -691,8 +700,9 @@ mod tests {
                 .expect("expire first holder's delivery");
             assert!(graph.claim(step, &delivery.token).expect("reclaim"));
             // At Commit, leave the old checkout in place so its commit
-            // reaches the fenced `set_branch` call.
-            let workspace = if at == Window::Complete {
+            // reaches the fenced `set_branch` call. Otherwise the new holder
+            // works in a worktree of its own, with a file not yet committed.
+            let workspace = if matches!(at, Window::Allocate | Window::Complete) {
                 let node = graph.node(step).expect("step");
                 let predecessors = vec![graph.origin().expect("origin")];
                 let trunk = Trunk::new(context.project(), context.declaration().trunk.as_deref())
@@ -705,6 +715,8 @@ mod tests {
                 graph
                     .set_branch(step, &delivery.token, workspace.branch(), None)
                     .expect("branch");
+                std::fs::write(workspace.path().join("replacement.txt"), "replacement\n")
+                    .expect("the new holder's work");
                 Some(workspace)
             } else {
                 None
@@ -788,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn an_execution_left_alone_passes_both_windows_and_completes() {
+    fn an_execution_left_alone_passes_every_window_and_completes() {
         let mut held = held_step(false);
         let reached = Rc::new(RefCell::new(Vec::new()));
         let seen = Rc::clone(&reached);
@@ -809,7 +821,10 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(*reached.borrow(), vec![Window::Commit, Window::Complete]);
+        assert_eq!(
+            *reached.borrow(),
+            vec![Window::Allocate, Window::Commit, Window::Complete]
+        );
         assert_eq!(
             held.graph.node(held.step).expect("step").status,
             NodeStatus::Completed
@@ -896,9 +911,75 @@ mod tests {
             old_path.join("stale.txt").is_file(),
             "the stale write succeeded"
         );
-        assert!(workspaces.registered().expect("registrations").is_empty());
+        // The reclaiming attempt released its own worktree and left the
+        // stale one's alone.
+        let registered = workspaces.registered().expect("registrations");
+        assert_eq!(registered.len(), 1, "{registered:?}");
+        assert_eq!(registered[0].0, held.step);
+        assert_eq!(registered[0].1.file_name(), old_path.file_name());
         workspaces.discard(held.step).expect("discard leftovers");
         assert!(!old_path.exists());
+    }
+
+    #[test]
+    fn a_takeover_before_allocation_leaves_the_step_to_the_new_holder() {
+        assert_takeover_at(Window::Allocate);
+    }
+
+    #[test]
+    fn a_stale_executor_resumed_before_allocation_leaves_the_replacement_worktree_intact() {
+        let mut held = held_step(false);
+        let (_hook, takeover) = take_over_at(&held, Window::Allocate);
+        let agent = held.context.agent("executor").expect("agent");
+        let reaction = Reaction::new(
+            &held.context,
+            &agent,
+            held.holder,
+            &held.delivery,
+            &held.interrupt,
+        );
+        assert!(matches!(
+            react(&reaction, &mut held.graph),
+            Err(RoleError::Graph(GraphError::LeaseLost(id))) if id == held.step
+        ));
+        let takeover = takeover.borrow();
+        let replacement = takeover
+            .as_ref()
+            .expect("the step was taken over")
+            .workspace
+            .as_ref()
+            .expect("the replacement's worktree");
+        let workspaces = held.context.workspaces();
+
+        let registered = workspaces.registered().expect("registrations");
+        assert_eq!(
+            registered
+                .iter()
+                .map(|(node, path)| (*node, path.file_name().map(ToOwned::to_owned)))
+                .collect::<Vec<_>>(),
+            vec![(
+                held.step,
+                replacement.path().file_name().map(ToOwned::to_owned)
+            )],
+            "only the replacement's registration is left"
+        );
+        replacement
+            .check_branch()
+            .expect("the replacement's checkout is on its branch");
+        assert_eq!(
+            std::fs::read_to_string(replacement.path().join("replacement.txt"))
+                .expect("the replacement's file"),
+            "replacement\n"
+        );
+        assert_eq!(
+            held.graph.node(held.step).expect("step").branch.as_deref(),
+            Some(replacement.branch())
+        );
+        let stale = workspaces.path_of(held.step, &held.delivery.token);
+        assert!(
+            !stale.exists(),
+            "the stale attempt released its own, clean worktree"
+        );
     }
 
     #[test]
