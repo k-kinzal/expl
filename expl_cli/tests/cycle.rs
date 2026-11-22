@@ -510,6 +510,55 @@ fn conflicting_joins_merge_every_predecessor() {
 }
 
 #[test]
+fn falling_over_starts_the_next_cli_clean_and_keeps_a_merge_in_progress() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let dir = sandbox.dir.path();
+    // A second executor CLI that dirties its directory, then fails.
+    let failing = dir.join("failing-executor.sh");
+    std::fs::write(
+        &failing,
+        "#!/bin/sh\ncat > /dev/null\necho dirt > \"dirt-$$.txt\"\nexit 1\n",
+    )
+    .expect("failing executor");
+    let mut perms = std::fs::metadata(&failing).expect("meta").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&failing, perms).expect("chmod");
+    let declaration = std::fs::read_to_string(repo.join("expl.toml")).expect("read");
+    std::fs::write(
+        repo.join("expl.toml"),
+        format!(
+            "{declaration}\n[[agent.executor.alternative]]\ndriver = \"generic\"\ncommand = [\"{}\"]\n",
+            failing.display()
+        ),
+    )
+    .expect("declaration");
+
+    // One process takes turns between the CLIs: some steps, and the first
+    // conflict resolution, start at the failing one and fall over.
+    let (parents, join) = sandbox.conflicting_join(3);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    let logs = std::fs::read_dir(repo.join(".expl/logs"))
+        .expect("logs")
+        .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("log"))
+        .collect::<Vec<_>>();
+    assert!(
+        logs.iter()
+            .any(|l| l.contains("resolved conflicts") && l.contains("falling over")),
+        "no resolution fell over"
+    );
+    for id in parents.iter().chain([&join]) {
+        let step = node(repo, id);
+        assert_eq!(step["node"]["status"], "completed", "{step}");
+        let files = git(
+            repo,
+            &["ls-tree", "--name-only", &format!("expl/node-{id}")],
+        );
+        assert!(!files.contains("dirt-"), "#{id}: {files}");
+    }
+}
+
+#[test]
 fn unresolved_conflicts_fail_the_step() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;

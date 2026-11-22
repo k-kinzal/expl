@@ -167,7 +167,15 @@ impl<'a> Reaction<'a> {
         }
         // Every directory an agent works in is a worktree expl made for it,
         // so a failed attempt's leftovers can be reset before the next CLI.
-        let started_at = Git::new(directory).resolve_commit("HEAD").ok();
+        // Not while it resolves a merge: resetting would abort the merge
+        // the next CLI is to finish.
+        let git = Git::new(directory);
+        let merging = git
+            .run(&["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+            .is_ok();
+        let started_at = (!merging)
+            .then(|| git.resolve_commit("HEAD").ok())
+            .flatten();
         let restore = || -> std::io::Result<()> {
             match &started_at {
                 Some(head) => Git::new(directory)
