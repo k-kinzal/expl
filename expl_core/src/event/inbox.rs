@@ -14,8 +14,11 @@ use crate::store::{self, EPOCH, NOW, StoreError};
 /// lease it holds on every heartbeat.
 pub const LEASE_SECONDS: i64 = 60;
 
-/// Proof of one lease: unique to it, so a process whose lease expired and
-/// was taken over cannot touch the replacement.
+/// Proof of one lease: unique to it, so a process whose lease was taken over
+/// cannot touch the replacement. Expiry alone does not end a lease: until
+/// another process takes the event over (which replaces the token), the
+/// holder can still renew and settle it — a heartbeat delayed by a busy
+/// database or a sleeping machine does not throw the work away.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LeaseToken(String);
 
@@ -61,9 +64,10 @@ pub enum InboxError {
 }
 
 /// The delivery row of `event_id = ?2` is held under token `?3`: still
-/// leased with that token, and not expired.
+/// leased with that token. An expired lease nobody took over is still held;
+/// a takeover replaces the token.
 fn held() -> String {
-    format!("status = 'leased' AND lease_token = ?3 AND leased_until >= {EPOCH}")
+    "status = 'leased' AND lease_token = ?3".to_owned()
 }
 
 /// The deliveries of one agent. See the [module docs](crate::event).
@@ -456,8 +460,8 @@ impl Inbox {
         Ok(changed == 1)
     }
 
-    /// Extend the lease of `delivery`. An expired lease cannot be renewed,
-    /// even if no other process has taken it over yet.
+    /// Extend the lease of `delivery` — also one that expired, as long as no
+    /// other process has taken it over.
     ///
     /// # Errors
     ///
@@ -650,10 +654,15 @@ mod tests {
             .expect("lease")
             .expect("e2");
 
-        // The first replica stops renewing; its lease runs out, and an
-        // expired lease cannot be renewed back to life.
+        // The first replica's heartbeat is late and its lease runs out.
+        // Nobody has taken it over, so it is still the first replica's.
         expire(&f.db, "planner", stale.event.id);
-        assert_lost(first.renew(&stale), stale.event.id);
+        first
+            .renew(&stale)
+            .expect("an expired lease nobody took over renews");
+
+        // Then it stops renewing for good.
+        expire(&f.db, "planner", stale.event.id);
 
         // The second replica reclaims the event under a new token.
         let replacement = second

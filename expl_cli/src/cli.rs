@@ -72,7 +72,7 @@ pub(crate) enum Command {
     #[command(
         long_about = "Report where the graph and git disagree, and exit non-zero if they do: \
                       completed or failed steps whose branch or head commit is missing or is not \
-                      the branch tip; running steps no live process holds a lease for; origins \
+                      the branch tip; running steps nobody holds a lease for; origins \
                       whose commit no longer exists; node worktrees still registered for steps \
                       that are settled or unknown. With --fix, repair what is safe: orphaned \
                       running steps are unclaimed so they are delivered again, and stale \

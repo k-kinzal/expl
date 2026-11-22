@@ -387,17 +387,9 @@ impl<'a> Process<'a> {
                     }
                     thread::sleep(POLL * 4);
                 }
-                Err(RoleError::Graph(error)) => {
-                    // The process gives up on the event, and a step it left
-                    // `running` fails. When even that fails, the lease is
-                    // left to expire: the event comes back, counted, until
-                    // it is abandoned.
-                    let why = format!("gave up after a graph failure: {error}");
-                    if role.abandon(&delivery.event, &mut graph, &why).is_ok() {
-                        holding(inbox.give_up(&delivery, &why))?;
-                    }
-                    return Err(error.into());
-                }
+                // Any other failure, a graph error included (often a race
+                // with another process, such as a step it just settled), is
+                // counted and retried; the last attempt fails the step.
                 Err(error) => {
                     let why = error.to_string();
                     // The last attempt: clean up before the delivery is

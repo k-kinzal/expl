@@ -168,7 +168,12 @@ impl Trunk {
         if commit == previous {
             return Ok(None);
         }
-        let descends = previous.is_empty() || self.contains(&commit, &previous)?;
+        // A previous position git no longer has (the trunk was rewritten and
+        // the old commit collected) is not an ancestor of anything, and held
+        // nothing that can still be checked.
+        let had_previous = !previous.is_empty() && self.known(&previous)?;
+        let descends =
+            previous.is_empty() || (had_previous && self.contains(&commit, &previous)?);
 
         let lineage = graph.lineage()?;
         let mut adopted: BTreeSet<NodeId> = BTreeSet::new();
@@ -182,12 +187,19 @@ impl Trunk {
             if lineage.in_trunk(step.id) {
                 continue;
             }
+            // A step whose commit git no longer has (its branch was deleted
+            // and the commit collected) cannot be shown to be in the trunk.
+            // It is not taken in — and it must not stop the trunk from being
+            // followed: every later move would fail on it forever.
+            if !self.known(head)? {
+                continue;
+            }
             // A step whose tip is still a predecessor's committed nothing.
             let committed = !graph
                 .predecessors(step.id)?
                 .iter()
                 .any(|p| p.head_commit.as_deref() == Some(head));
-            let already = !previous.is_empty() && self.takes_in(&previous, head, committed)?;
+            let already = had_previous && self.takes_in(&previous, head, committed)?;
             if !already && self.takes_in(&commit, head, committed)? {
                 adopted.insert(step.id);
             }
@@ -226,6 +238,17 @@ impl Trunk {
             branch,
             descends,
         }))
+    }
+
+    /// Whether git has `commit` at all.
+    ///
+    /// # Errors
+    ///
+    /// [`TrunkError::Ancestry`] when git cannot be run.
+    fn known(&self, commit: &str) -> Result<bool, TrunkError> {
+        self.git
+            .has_commit(commit)
+            .map_err(|source| ancestry(commit, commit, source))
     }
 
     /// Whether `ancestor` is in `commit`'s history.
@@ -467,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn a_git_failure_is_an_error_not_a_missed_adoption() {
+    fn a_step_whose_commit_is_gone_is_not_taken_in_and_does_not_stop_following() {
         let mut fx = Fixture::new();
         let origin = fx.graph.origin().expect("origin").id;
         let step = fx.step(origin, Some("a.txt"));
@@ -479,15 +502,16 @@ mod tests {
         git(&fx.root, &["commit", "-q", "-am", "edit"]);
 
         let trunk = Trunk::new(&fx.project, Some("main"));
-        match trunk.follow(&mut fx.graph) {
-            Err(TrunkError::Ancestry { commit, .. }) => assert_eq!(commit, gone),
-            other => panic!("expected an ancestry error, got {other:?}"),
-        }
-        assert_eq!(
-            fx.graph.origin().expect("origin").id,
-            origin,
-            "nothing is recorded while git cannot tell what was taken in"
+        let advance = trunk
+            .follow(&mut fx.graph)
+            .expect("following survives a collected commit")
+            .expect("the trunk moved");
+        assert_ne!(advance.origin, origin, "the new position is recorded");
+        assert!(
+            !fx.graph.lineage().expect("lineage").in_trunk(step),
+            "a commit git does not have is not taken in"
         );
+        // Asked directly, git's failure is still an error, not `false`.
         assert!(matches!(
             trunk.contains("HEAD", gone),
             Err(TrunkError::Ancestry { .. })

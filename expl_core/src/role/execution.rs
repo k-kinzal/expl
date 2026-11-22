@@ -120,6 +120,11 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
 
     let prompt = prompt(reaction, &node, &schema);
     let (succeeded, summary) = invoke(reaction, graph, id, &workspace, &prompt, &schema)?;
+    // The lease is the right to write this step. Lost while the agent ran,
+    // the step may already be another process's: touch nothing of it.
+    if reaction.lease_lost() {
+        return Err(RoleError::Agent(AgentError::Interrupted));
+    }
     let message = format!("{}\n\n{}", node.title, summary);
     let head = match workspace.commit(&message) {
         Ok(head) => head,
@@ -137,6 +142,9 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
             Some(head),
             format!("{summary}\n\n{error}"),
         );
+    }
+    if reaction.lease_lost() {
+        return Err(RoleError::Agent(AgentError::Interrupted));
     }
     graph.complete(id, &summary)?;
     Ok(Report::Execution(ExecutionReport {

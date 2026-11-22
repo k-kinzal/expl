@@ -10,7 +10,7 @@
 //! | Inconsistency | Repair |
 //! | --- | --- |
 //! | a completed or failed step whose branch or head commit is missing, or whose branch tip is not its head commit | none: which side is right is the human's call |
-//! | a running step that no live process executes (no live process holds a lease on its `node.ready`) | unclaimed: back to `planned`, with `node.ready` recorded again so execution is delivered it anew |
+//! | a running step whose `node.ready` nobody holds a lease on (an expired lease is left to the inbox, which delivers it again) | unclaimed: back to `planned`, with `node.ready` recorded again so execution is delivered it anew |
 //! | an origin whose commit no longer exists | none: the trunk's history is gone from git |
 //! | a node worktree registered with git for a step that is settled (completed, failed, pruned) or unknown | registration pruned when its directory is gone; otherwise the worktree is removed when clean, keeping its branch |
 //!
@@ -92,7 +92,7 @@ pub enum Inconsistency {
         /// The commit the branch points at.
         tip: String,
     },
-    /// A running step that no live process executes.
+    /// A running step whose `node.ready` nobody holds a lease on.
     OrphanedStep {
         /// The step.
         node: NodeId,
@@ -189,7 +189,7 @@ impl fmt::Display for Inconsistency {
             ),
             Self::OrphanedStep { node } => write!(
                 f,
-                "running step {node}: no live process holds a lease on its delivery"
+                "running step {node}: nobody holds a lease on its delivery"
             ),
             Self::MissingOriginCommit {
                 node,
@@ -734,20 +734,23 @@ mod tests {
             "the delivery is given up, so it is never redelivered"
         );
 
+        // The killed holder's step is not orphaned: its lease is still the
+        // inbox's to deliver again once it expires. Unclaiming it too would
+        // hand the step out twice — and a holder that merely looks dead may
+        // only be slow.
         let found = fx.examine();
-        let orphans = [killed, given_up, unleased]
+        let orphans = [given_up, unleased]
             .map(|node| Inconsistency::OrphanedStep { node })
             .to_vec();
         assert_eq!(found, orphans);
 
         let repairs = fx.repair(&found);
-        assert_eq!(repairs.len(), 3);
+        assert_eq!(repairs.len(), 2);
         assert!(repairs.iter().all(|r| r.repaired), "{repairs:?}");
-        assert_eq!(
-            fx.graph.node(held).expect("held").status,
-            NodeStatus::Running
-        );
-        for id in [killed, given_up, unleased] {
+        for id in [held, killed] {
+            assert_eq!(fx.graph.node(id).expect("step").status, NodeStatus::Running);
+        }
+        for id in [given_up, unleased] {
             assert_eq!(fx.graph.node(id).expect("step").status, NodeStatus::Planned);
         }
         assert_eq!(fx.examine(), Vec::new());

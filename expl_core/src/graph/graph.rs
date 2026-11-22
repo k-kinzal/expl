@@ -13,8 +13,7 @@ use crate::graph::{
     NewEvaluation, NewOrigin, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Plan, PlanId,
     PlannedPath, Snapshot,
 };
-use crate::process;
-use crate::store::{self, EPOCH, NOW};
+use crate::store::{self, NOW};
 
 const NODE_COLUMNS: &str = "id, kind, status, title, objective, priority, counter_exploration, \
                             branch, head_commit, outcome, created_at, updated_at";
@@ -167,17 +166,18 @@ fn emit_if_ready(conn: &Connection, id: NodeId) -> Result<(), GraphError> {
     Ok(())
 }
 
-/// SQL condition on a node `n`: a running step whose `node.ready` no live
-/// process holds an unexpired lease on.
+/// SQL condition on a node `n`: a running step whose `node.ready` nobody
+/// holds a lease on. A lease that is merely expired, or whose holder looks
+/// dead, is not orphaned: the inbox delivers it again itself (counted toward
+/// its attempts, and abandoned — failing the step — once they run out), and
+/// its holder may only be slow. Unclaiming it as well would run the step
+/// twice.
 fn orphaned() -> String {
     format!(
         "n.kind = 'step' AND n.status = 'running' AND NOT EXISTS ( \
              SELECT 1 FROM deliveries d JOIN events e ON e.id = d.event_id \
-             WHERE e.node_id = n.id AND e.kind = '{ready}' AND d.status = 'leased' \
-             AND d.leased_until >= {EPOCH} \
-             AND d.process_id IN (SELECT id FROM processes WHERE {live}))",
+             WHERE e.node_id = n.id AND e.kind = '{ready}' AND d.status = 'leased')",
         ready = EventKind::NodeReady.as_str(),
-        live = process::live(),
     )
 }
 
@@ -684,9 +684,9 @@ impl Graph {
         Ok(())
     }
 
-    /// Running steps that no live process is executing: no live process
-    /// holds an unexpired lease on a `node.ready` delivery about them. Their
-    /// execution was abandoned, and nothing may ever take it up again.
+    /// Running steps whose `node.ready` nobody holds a lease on (see
+    /// `orphaned`). Their execution was abandoned, and nothing would ever
+    /// take it up again.
     ///
     /// # Errors
     ///
