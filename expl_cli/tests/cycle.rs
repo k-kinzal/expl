@@ -1264,76 +1264,84 @@ fn the_origin_follows_the_trunk() {
 }
 
 #[test]
-fn a_step_whose_branch_is_the_trunk_fails_and_leaves_the_trunk_alone() {
+fn a_step_takes_a_fresh_branch_and_leaves_the_trunk_and_other_branches_alone() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
+    let tip = |branch: &str| git(repo, &["rev-parse", &format!("refs/heads/{branch}")]);
     ok(repo, &["goal", "add", "Say hello"]);
     let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
+    let b = ok(repo, &["node", "add", "B", "--priority", "1"]);
 
-    // The trunk is a branch that is not checked out and is named like the
-    // step's own branch.
+    // The trunk is a branch that is not checked out and is named like A's
+    // first branch name.
     let trunk = format!("expl/node-{a}");
     git(repo, &["checkout", "-q", "-b", &trunk]);
     std::fs::write(repo.join("trunk.txt"), "trunk\n").expect("write");
     git(repo, &["add", "trunk.txt"]);
     git(repo, &["commit", "-q", "-m", "Trunk work"]);
+    // An unrelated branch, never the trunk, takes B's first name.
+    let unrelated = format!("expl/node-{b}");
+    git(repo, &["checkout", "-q", "-b", &unrelated, "main"]);
+    std::fs::write(repo.join("unrelated.txt"), "unrelated\n").expect("write");
+    git(repo, &["add", "unrelated.txt"]);
+    git(repo, &["commit", "-q", "-m", "Unrelated work"]);
     git(repo, &["checkout", "-q", "main"]);
-    let tip = git(repo, &["rev-parse", &format!("refs/heads/{trunk}")]);
+    let trunk_tip = tip(&trunk);
+    let unrelated_tip = tip(&unrelated);
     let path = repo.join("expl.toml");
     let declaration = std::fs::read_to_string(&path).expect("declaration");
     assert!(declaration.contains("trunk = \"main\""), "{declaration}");
     let declaration = declaration.replacen("trunk = \"main\"", &format!("trunk = \"{trunk}\""), 1);
     std::fs::write(&path, declaration).expect("declaration");
 
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
-    let step = node(repo, &a);
-    assert_eq!(step["node"]["status"], "failed", "{step}");
-    let outcome = step["node"]["outcome"].as_str().unwrap_or_default();
-    assert!(
-        outcome.contains(&format!("branch `{trunk}` is the trunk")),
-        "{step}"
-    );
-    assert_eq!(
-        git(repo, &["rev-parse", &format!("refs/heads/{trunk}")]),
-        tip
-    );
-    assert!(!repo.join(format!(".expl/worktrees/node-{a}")).exists());
-    let completed = ok(
-        repo,
-        &[
-            "event",
-            "ls",
-            "--kind",
-            "node.completed",
-            "--format",
-            "json",
-        ],
-    );
-    assert_eq!(completed, "", "{completed}");
-
-    // A normal step still starts over on its own branch when retried.
-    let b = ok(repo, &["node", "add", "B", "--priority", "1"]);
+    // A first attempt that fails stays on a branch of its own.
     sandbox.marker("fail", true);
     ok(repo, &["run", "executor", "--exit-when-idle"]);
-    assert_eq!(node(repo, &b)["node"]["status"], "failed");
-    let branch = format!("expl/node-{b}");
-    assert!(git(repo, &["branch", "--list", &branch]).contains(&branch));
+    let mut failed = Vec::new();
+    for id in [&a, &b] {
+        let step = node(repo, id);
+        assert_eq!(step["node"]["status"], "failed", "{step}");
+        let branch = format!("expl/node-{id}-2");
+        assert_eq!(step["node"]["branch"], branch.as_str(), "{step}");
+        failed.push((branch.clone(), tip(&branch)));
+    }
+    assert_eq!(tip(&trunk), trunk_tip, "the trunk is never written to");
+    assert_eq!(
+        tip(&unrelated),
+        unrelated_tip,
+        "an unrelated branch is kept"
+    );
+
+    // A retry takes yet another fresh name; nothing earlier is replaced.
     sandbox.marker("fail", false);
+    ok(repo, &["node", "retry", &a]);
     ok(repo, &["node", "retry", &b]);
     ok(repo, &["run", "executor", "--exit-when-idle"]);
-    let step = node(repo, &b);
-    assert_eq!(step["node"]["status"], "completed", "{step}");
-    assert_eq!(step["node"]["branch"], branch.as_str(), "{step}");
+    for id in [&a, &b] {
+        let step = node(repo, id);
+        assert_eq!(step["node"]["status"], "completed", "{step}");
+        let branch = format!("expl/node-{id}-3");
+        assert_eq!(step["node"]["branch"], branch.as_str(), "{step}");
+        assert_eq!(step["node"]["head_commit"], tip(&branch).as_str(), "{step}");
+        assert_eq!(
+            git(repo, &["show", &format!("{branch}:node-{id}.txt")]),
+            format!("node {id}")
+        );
+    }
+    assert_eq!(tip(&trunk), trunk_tip, "the trunk is never written to");
+    assert_eq!(git(repo, &["show", &format!("{trunk}:trunk.txt")]), "trunk");
     assert_eq!(
-        git(repo, &["show", &format!("{branch}:node-{b}.txt")]),
-        format!("node {b}")
+        tip(&unrelated),
+        unrelated_tip,
+        "an unrelated branch is kept"
     );
-    // The trunk never moved; A stays failed.
     assert_eq!(
-        git(repo, &["rev-parse", &format!("refs/heads/{trunk}")]),
-        tip
+        git(repo, &["show", &format!("{unrelated}:unrelated.txt")]),
+        "unrelated"
     );
-    assert_eq!(node(repo, &a)["node"]["status"], "failed");
+    for (branch, commit) in &failed {
+        assert_eq!(&tip(branch), commit, "an earlier attempt's branch is kept");
+    }
 }
 
 #[test]

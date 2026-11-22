@@ -28,6 +28,18 @@ pub enum GitError {
     },
 }
 
+/// What stands in the way of a new branch
+/// ([`Git::branch_blocker`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchBlocker {
+    /// A branch of that name exists.
+    Exists,
+    /// A branch lives under the name (`name/…`): the one named.
+    Nested(String),
+    /// A parent path of the name is a branch: the one named.
+    Parent(String),
+}
+
 /// git, bound to one working directory.
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -124,6 +136,37 @@ impl Git {
     pub fn has_branch(&self, name: &str) -> Result<bool, GitError> {
         let reference = format!("refs/heads/{name}");
         self.test(&["show-ref", "--verify", "--quiet", &reference])
+    }
+
+    /// The ref that stands in the way of a new local branch named `name`,
+    /// if any: the branch itself, a branch under it (`name/…`), or a
+    /// branch at one of its parent paths — git keeps none of these beside
+    /// one another.
+    ///
+    /// # Errors
+    ///
+    /// [`GitError`] when git cannot start or fails.
+    pub fn branch_blocker(&self, name: &str) -> Result<Option<BranchBlocker>, GitError> {
+        if self.has_branch(name)? {
+            return Ok(Some(BranchBlocker::Exists));
+        }
+        let below = format!("refs/heads/{name}/");
+        let nested = self.run(&[
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname:short)",
+            &below,
+        ])?;
+        if !nested.is_empty() {
+            return Ok(Some(BranchBlocker::Nested(nested)));
+        }
+        for (slash, _) in name.match_indices('/') {
+            let parent = &name[..slash];
+            if self.has_branch(parent)? {
+                return Ok(Some(BranchBlocker::Parent(parent.to_owned())));
+            }
+        }
+        Ok(None)
     }
 
     /// The top-level directory of the working tree containing `dir`.

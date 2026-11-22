@@ -31,7 +31,7 @@ use crate::graph::{Answer, Graph, GraphError, Node, NodeId, NodeKind, NodeStatus
 use crate::prompt::Prompt;
 use crate::role::{Reaction, Report, RoleError};
 use crate::trunk::Trunk;
-use crate::workspace::{Workspace, Workspaces};
+use crate::workspace::Workspace;
 
 /// What one execution did.
 #[derive(Debug, Clone, Serialize)]
@@ -40,7 +40,8 @@ pub struct ExecutionReport {
     pub node: NodeId,
     /// `completed` or `failed`.
     pub status: NodeStatus,
-    /// Branch holding the work (empty for an investigation).
+    /// Branch holding the work (empty for an investigation, or when no
+    /// branch could be made).
     pub branch: String,
     /// What an investigation found.
     pub answer: Option<Answer>,
@@ -125,16 +126,17 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
         return investigate(reaction, graph, &node, &predecessors);
     }
 
-    let branch = Workspaces::branch_name(id);
-    // The step's branch is discarded and made afresh: never when it is the
-    // trunk.
+    // Each attempt gets a branch that did not exist before, under a name no
+    // existing ref and no trunk branch takes; the one git created is
+    // recorded.
     let context = reaction.context();
     let trunk = Trunk::new(context.project(), context.declaration().trunk.as_deref());
     let trunk = trunk.branches(graph)?;
     let mut workspace = match context.workspaces().create(&node, &predecessors, &trunk) {
         Ok(workspace) => workspace,
-        Err(error) => return fail(graph, &node, &branch, None, error.to_string()),
+        Err(error) => return fail(graph, &node, "", None, error.to_string()),
     };
+    let branch = workspace.branch().to_owned();
     graph.set_branch(id, &branch, None)?;
     let result = carry_out(reaction, graph, &node, &branch, &mut workspace);
     // Settled either way: the branch holds what there is, and the worktree

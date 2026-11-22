@@ -27,15 +27,17 @@ pub enum WorkspaceError {
     /// other than expl while its conflicts were being resolved.
     #[error("the merge of predecessor commit {0} is no longer in progress")]
     MergeAbandoned(String),
-    /// The branch that would hold the step is the trunk (or was): creating
-    /// the step's worktree would discard it, and expl never writes to the
-    /// trunk.
-    #[error("step {node}'s branch `{branch}` is the trunk, which is never written to")]
-    TrunkBranch {
-        /// The step whose branch it is.
+    /// Every name tried for the step's branch was taken by an existing
+    /// ref or reserved for the trunk; none was created, and no existing ref
+    /// was touched.
+    #[error("no free branch for step {node}: tried {tried} names, from `{first}`")]
+    NoFreeBranch {
+        /// The step that needs a branch.
         node: NodeId,
-        /// The branch, as named in the trunk.
-        branch: String,
+        /// The first name tried.
+        first: String,
+        /// How many names were tried.
+        tried: u32,
     },
     /// Predecessor commits are still waiting to be merged.
     #[error("predecessor commits not merged yet: {}", .0.join(", "))]
