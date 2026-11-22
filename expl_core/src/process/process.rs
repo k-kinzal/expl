@@ -351,6 +351,7 @@ impl<'a> Process<'a> {
             let lost = || observer.observe(&ProcessActivity::LeaseLost(&delivery));
             match result {
                 _ if interrupt.lease_lost() => lost(),
+                Err(RoleError::Graph(GraphError::LeaseLost { .. })) => lost(),
                 Ok(report) => {
                     let coalesced = match report.covered().or(covered) {
                         Some(through) if role.coalesces() => {

@@ -2,6 +2,7 @@
 
 use thiserror::Error;
 
+use crate::event::EventId;
 use crate::graph::{NodeId, NodeKind};
 
 /// A graph operation failed.
@@ -23,6 +24,14 @@ pub enum GraphError {
         node: NodeId,
         /// What it must be.
         expected: &'static str,
+    },
+    /// The delivery does not hold the lease required for the graph operation.
+    #[error("agent `{agent}` has no matching lease on event {event} for this graph operation")]
+    LeaseLost {
+        /// The agent whose inbox it is.
+        agent: String,
+        /// The event the agent is reacting to.
+        event: EventId,
     },
     /// The graph has no origin (not initialised).
     #[error("the graph has no origin node")]
