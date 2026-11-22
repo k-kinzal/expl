@@ -15,6 +15,12 @@
 //!   origin that took work in is a merge: it carries a halo, and its label
 //!   counts the steps it merged. Steps explored from an origin the trunk
 //!   has moved past fade, unless they are still candidates.
+//! - **Left to right is time; nearer the spine is more believed in.**
+//!   Work is drawn in groups, one horizontal band each: every path of the
+//!   latest plan (on a faint ground of its own), every chain grown past a
+//!   step. The planner's strongest paths lie nearest the spine, and the
+//!   first to fit carries it on toward the goals; alternatives nothing
+//!   builds on yet gather outside the bands ([`crate::layout`]).
 //! - **Edges are hairlines.** Edges into goals are drawn only once a step
 //!   satisfies the goal (or the step is selected), so the picture shows
 //!   reached goals rather than intentions. A faint red line joins a failed
@@ -179,6 +185,7 @@ impl ExplView {
                 if snapshot.nodes != self.snapshot.nodes
                     || snapshot.edges != self.snapshot.edges
                     || snapshot.agents != self.snapshot.agents
+                    || snapshot.paths != self.snapshot.paths
                 {
                     let explorers: Vec<(&str, u32)> = snapshot
                         .agents
@@ -186,8 +193,12 @@ impl ExplView {
                         .filter(|a| a.role == "exploration")
                         .map(|a| (a.name.as_str(), a.weight))
                         .collect();
-                    self.layout =
-                        Layout::of(&snapshot.nodes, &snapshot.edges, &Streams::of(&explorers));
+                    self.layout = Layout::of(
+                        &snapshot.nodes,
+                        &snapshot.edges,
+                        &snapshot.paths,
+                        &Streams::of(&explorers),
+                    );
                 }
                 self.snapshot = snapshot;
                 self.loaded = true;
@@ -240,6 +251,31 @@ impl ExplView {
             px(slot.row * ROW_STRIDE * self.zoom),
         );
         Some(self.anchor(self.zoom, viewport) + offset + self.pan)
+    }
+
+    /// A faint ground under each path of the latest plan, so each reads as
+    /// one group.
+    fn bands(&self, viewport: Size<Pixels>) -> Vec<AnyElement> {
+        let scale = ROW_STRIDE * self.zoom;
+        let origin = self.anchor(self.zoom, viewport) + self.pan;
+        self.layout
+            .bands
+            .iter()
+            .filter(|band| band.goal.is_some())
+            .map(|band| {
+                let left = origin.x + px((band.x.0 - 0.5) * scale);
+                let top = origin.y + px((band.rows.0 - 0.5) * scale);
+                div()
+                    .absolute()
+                    .left(left)
+                    .top(top)
+                    .w(px((band.x.1 - band.x.0 + 1.0) * scale))
+                    .h(px((band.rows.1 - band.rows.0 + 1.0) * scale))
+                    .rounded(px(0.5 * scale))
+                    .bg(theme::alpha(theme::text(), 0.05))
+                    .into_any_element()
+            })
+            .collect()
     }
 
     /// Zoom by `factor`, keeping the graph point under `at` where it is.
@@ -1096,6 +1132,7 @@ impl Render for ExplView {
         let viewport = window.viewport_size();
         let lens = self.lens();
         let lines = self.edges(viewport, &lens);
+        let bands = self.bands(viewport);
         let phase = (self.epoch.elapsed().as_secs_f32() / COMET.as_secs_f32()).fract();
         let nodes: Vec<AnyElement> = self
             .snapshot
@@ -1117,6 +1154,7 @@ impl Render for ExplView {
             .size_full()
             .overflow_hidden()
             .bg(theme::background())
+            .children(bands)
             .child(
                 canvas(
                     |_, _, _| {},
