@@ -64,7 +64,7 @@ pub enum InboxError {
 /// The delivery row of `event_id = ?2` is still leased under token `?3`. An
 /// expired lease remains valid until its token is replaced by a takeover,
 /// revoked by a conflicting lease, or settled.
-pub(crate) const HELD_LEASE: &str = "status = 'leased' AND lease_token = ?3";
+const HELD_LEASE: &str = "status = 'leased' AND lease_token = ?3";
 
 /// The deliveries of one agent. See the [module docs](crate::event).
 pub struct Inbox {
@@ -1165,9 +1165,8 @@ mod tests {
             .lease(&[EventKind::NodeReady], ProcessId(1), false, 3)
             .expect("lease")
             .expect("a is ready");
+        assert!(f.graph.claim(a, &stale.token).expect("record node.started"));
         expire(&f.db, "watcher", stale.event.id);
-
-        assert!(f.graph.claim(a, false).expect("record node.started"));
         let next = second
             .lease(&[EventKind::NodeStarted], ProcessId(2), false, 3)
             .expect("lease")

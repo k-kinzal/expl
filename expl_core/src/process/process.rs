@@ -351,7 +351,7 @@ impl<'a> Process<'a> {
             let lost = || observer.observe(&ProcessActivity::LeaseLost(&delivery));
             match result {
                 _ if interrupt.lease_lost() => lost(),
-                Err(RoleError::Graph(GraphError::LeaseLost { .. })) => lost(),
+                Err(RoleError::Graph(GraphError::LeaseLost(_))) => lost(),
                 Ok(report) => {
                     let coalesced = match report.covered().or(covered) {
                         Some(through) if role.coalesces() => {
@@ -409,7 +409,7 @@ impl<'a> Process<'a> {
                     // settled, so dying in between leaves it to be retried
                     // or abandoned rather than lost.
                     if delivery.attempts >= MAX_ATTEMPTS {
-                        role.abandon(&delivery.event, &mut graph, &why)?;
+                        role.abandon(&delivery, &mut graph, &why)?;
                     }
                     match holding(inbox.fail(&delivery, &why, MAX_ATTEMPTS))? {
                         Some(retry) => observer.observe(&ProcessActivity::Failed {
@@ -452,7 +452,7 @@ fn give_up_abandoned(
             Some(agent) => inbox.assignment(role, delivery.event.id)?.as_deref() == Some(agent),
         };
         let failed = if ours {
-            role.abandon(&delivery.event, graph, &why)?
+            role.abandon(&delivery, graph, &why)?
         } else {
             None
         };
@@ -541,7 +541,7 @@ mod tests {
             );
             ready = Some(delivery.event.id);
             // Each holder claims the step, then dies without settling.
-            assert!(graph.claim(step, attempt > 1).expect("claim"));
+            assert!(graph.claim(step, &delivery.token).expect("claim"));
             store::open(&db)
                 .expect("db")
                 .execute(
@@ -593,7 +593,12 @@ mod tests {
         graph.plan_step(step, 1).expect("plan"); // node.ready
         let role = Role::Execution;
         // The owner, `fast`, is carrying the step out.
-        assert!(graph.claim(step, false).expect("claim"));
+        let mut fast = Inbox::open(&db, "fast").expect("inbox");
+        let owner = fast
+            .lease(role.reactions(), ProcessId(9), false, MAX_ATTEMPTS)
+            .expect("lease")
+            .expect("node.ready");
+        assert!(graph.claim(step, &owner.token).expect("claim"));
         let mut slow = Inbox::open(&db, "slow").expect("inbox");
         for attempt in 1..=MAX_ATTEMPTS {
             let delivery = slow
@@ -606,7 +611,9 @@ mod tests {
             store::open(&db)
                 .expect("db")
                 .execute(
-                    &format!("UPDATE deliveries SET leased_until = {EPOCH} - 1"),
+                    &format!(
+                        "UPDATE deliveries SET leased_until = {EPOCH} - 1 WHERE agent = 'slow'"
+                    ),
                     [],
                 )
                 .expect("expire");

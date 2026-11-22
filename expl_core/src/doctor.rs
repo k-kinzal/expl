@@ -464,7 +464,7 @@ fn owner(graph: &Graph, node: NodeId) -> Result<Owner, GraphError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{EventKind, Inbox};
+    use crate::event::{Delivery, EventKind, Inbox};
     use crate::graph::NewOrigin;
     use crate::process::{ProcessId, Processes};
     use crate::store::{self, EPOCH};
@@ -531,17 +531,8 @@ mod tests {
             id
         }
 
-        /// A planned step, claimed (`running`) with no delivery behind it.
-        fn running(&mut self) -> NodeId {
-            let id = self.planned();
-            assert!(self.graph.claim(id, false).expect("claim"));
-            id
-        }
-
-        /// A planned step whose `node.ready` a live process leased and
-        /// which it claimed and gave a worktree, as execution does.
-        fn executing(&mut self) -> NodeId {
-            let id = self.planned();
+        /// Lease and claim a planned step's `node.ready`.
+        fn claim(&mut self, id: NodeId) -> Delivery {
             let process = self.process("executor");
             let mut inbox = self.inbox();
             loop {
@@ -550,11 +541,18 @@ mod tests {
                     .expect("lease")
                     .expect("the step's node.ready");
                 if delivery.event.node == Some(id) {
-                    break;
+                    assert!(self.graph.claim(id, &delivery.token).expect("claim"));
+                    return delivery;
                 }
                 inbox.ack(&delivery, None).expect("ack");
             }
-            assert!(self.graph.claim(id, false).expect("claim"));
+        }
+
+        /// A planned step whose `node.ready` a live process leased and
+        /// which it claimed and gave a worktree, as execution does.
+        fn executing(&mut self) -> NodeId {
+            let id = self.planned();
+            self.claim(id);
             let node = self.graph.node(id).expect("node");
             let origin = self.graph.origin().expect("origin");
             self.workspaces()
@@ -566,7 +564,8 @@ mod tests {
         /// A step executed as execution does: in its own worktree, which
         /// commits `file` and is left in place; then `complete`d or failed.
         fn executed(&mut self, file: &str, complete: bool) -> NodeId {
-            let id = self.running();
+            let id = self.planned();
+            let delivery = self.claim(id);
             let node = self.graph.node(id).expect("node");
             let origin = self.graph.origin().expect("origin");
             let workspace = self
@@ -576,13 +575,18 @@ mod tests {
             std::fs::write(workspace.path().join(file), file).expect("write");
             let head = workspace.commit(file).expect("commit");
             self.graph
-                .set_branch(id, workspace.branch(), Some(&head))
+                .set_branch(id, &delivery.token, workspace.branch(), Some(&head))
                 .expect("branch");
             if complete {
-                self.graph.complete(id, "done").expect("complete");
+                self.graph
+                    .complete(id, &delivery.token, "done")
+                    .expect("complete");
             } else {
-                self.graph.fail(id, "broken").expect("fail");
+                self.graph
+                    .fail(id, &delivery.token, "broken")
+                    .expect("fail");
             }
+            self.inbox().ack(&delivery, None).expect("ack");
             id
         }
 
@@ -643,8 +647,10 @@ mod tests {
             .propose_step("c", "c", &[origin], &[])
             .expect("step");
         fx.graph.plan_step(never_committed, 1).expect("plan");
-        assert!(fx.graph.claim(never_committed, false).expect("claim"));
-        fx.graph.fail(never_committed, "no worktree").expect("fail");
+        let delivery = fx.claim(never_committed);
+        fx.graph
+            .fail(never_committed, &delivery.token, "no worktree")
+            .expect("fail");
         fx.executing();
         let origin = fx.graph.origin().expect("origin");
         let _scratch = fx.workspaces().scratch(&origin).expect("scratch");
@@ -674,13 +680,19 @@ mod tests {
 
         let gone = fx.settled("gone.txt", true);
         let fabricated = "0123456789abcdef0123456789abcdef01234567";
-        let gone_branch = Workspaces::branch_name(gone);
-        fx.graph
-            .set_branch(gone, &gone_branch, Some(fabricated))
-            .expect("branch");
+        store::open(&fx.project.database_path())
+            .expect("db")
+            .execute(
+                "UPDATE nodes SET head_commit = ?1 WHERE id = ?2",
+                rusqlite::params![fabricated, gone.0],
+            )
+            .expect("record a missing commit");
 
-        let unrecorded = fx.running();
-        fx.graph.complete(unrecorded, "done").expect("complete");
+        let unrecorded = fx.planned();
+        let delivery = fx.claim(unrecorded);
+        fx.graph
+            .complete(unrecorded, &delivery.token, "done")
+            .expect("complete");
 
         let found = fx.examine();
         assert_eq!(
@@ -721,7 +733,7 @@ mod tests {
         let [held, killed, given_up, unleased] = [(); 4].map(|()| fx.planned());
 
         // Each of the first three is leased, by its own process, and
-        // claimed; the last is claimed without any delivery at all.
+        // claimed; the last was claimed before holder tokens were recorded.
         let mut leases = Vec::new();
         for id in [held, killed, given_up] {
             let process = fx.process("executor");
@@ -731,10 +743,16 @@ mod tests {
                 .expect("lease")
                 .expect("ready");
             assert_eq!(delivery.event.node, Some(id));
-            assert!(fx.graph.claim(id, false).expect("claim"));
+            assert!(fx.graph.claim(id, &delivery.token).expect("claim"));
             leases.push((process, delivery));
         }
-        assert!(fx.graph.claim(unleased, false).expect("claim"));
+        store::open(&fx.project.database_path())
+            .expect("db")
+            .execute(
+                "UPDATE nodes SET status = 'running' WHERE id = ?1",
+                [unleased.0],
+            )
+            .expect("legacy running step");
         fx.kill(leases[1].0);
         assert!(
             !fx.inbox().fail(&leases[2].1, "boom", 1).expect("give up"),

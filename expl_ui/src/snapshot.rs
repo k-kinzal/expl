@@ -258,6 +258,7 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expl_core::{EventKind, Inbox};
 
     #[test]
     fn reads_nodes_edges_events_and_candidates() {
@@ -273,8 +274,15 @@ mod tests {
             .propose_step("cache", "add a cache", &[origin], &[goal])
             .expect("step");
         graph.plan_step(step, 5).expect("plan");
-        assert!(graph.claim(step, false).expect("claim"));
-        graph.complete(step, "done").expect("complete");
+        let delivery = Inbox::open(&project.database_path(), "executor")
+            .expect("inbox")
+            .lease(&[EventKind::NodeReady], ProcessId(1), false, 3)
+            .expect("lease")
+            .expect("node.ready");
+        assert!(graph.claim(step, &delivery.token).expect("claim"));
+        graph
+            .complete(step, &delivery.token, "done")
+            .expect("complete");
         graph
             .record_evaluations(
                 step,

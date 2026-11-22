@@ -206,6 +206,12 @@ UPDATE nodes SET proposed_by = (
     ORDER BY r.finished_at DESC LIMIT 1
 ) WHERE kind = 'step';
 ",
+    r"
+-- Execution claims span agent inboxes. Existing running steps have no
+-- recorded holder and can be claimed on their next delivery.
+ALTER TABLE nodes ADD COLUMN holder_token TEXT;
+CREATE UNIQUE INDEX deliveries_token ON deliveries (lease_token) WHERE lease_token IS NOT NULL;
+",
 ];
 
 /// Open the database at `path`, creating and migrating it as needed.

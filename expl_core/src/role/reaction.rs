@@ -7,7 +7,7 @@ use std::path::Path;
 use serde::de::DeserializeOwned;
 
 use crate::agent::{Agent, AgentError, Invocation};
-use crate::event::{Delivery, Event};
+use crate::event::{Delivery, Event, LeaseToken};
 use crate::git::Git;
 use crate::graph::{AgentRunStatus, Graph, NodeId};
 use crate::process::{Interrupt, ProcessId};
@@ -56,9 +56,9 @@ impl<'a> Reaction<'a> {
         self.agent
     }
 
-    /// The delivery holding the reaction's lease.
-    pub(crate) fn delivery(&self) -> &'a Delivery {
-        self.delivery
+    /// The reaction's lease token.
+    pub(crate) fn token(&self) -> &'a LeaseToken {
+        &self.delivery.token
     }
 
     /// The event reacted to.

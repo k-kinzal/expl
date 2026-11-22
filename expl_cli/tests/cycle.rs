@@ -1112,8 +1112,8 @@ fn losing_the_lease_interrupts_the_reaction() {
     let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
     sandbox.slow(true);
     let name = ok(repo, &["run", "executor", "-d"]);
-    wait_until(repo, "the step to start", || {
-        node(repo, &a)["node"]["status"] == "running"
+    wait_until(repo, "the agent run to start", || {
+        node(repo, &a)["agent_runs"][0]["status"] == "running"
     });
 
     // Its lease runs out and another executor takes the event over, in one
