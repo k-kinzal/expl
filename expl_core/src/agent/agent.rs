@@ -203,6 +203,16 @@ impl Agent {
         &self,
         invocation: &Invocation<'_>,
     ) -> Result<AgentRun<R>, AgentError> {
+        self.invoke_validated(invocation, |_| Ok(()))
+    }
+
+    /// Invoke the agent, treating a response that fails `validate` as a
+    /// failed CLI attempt, just like a response that does not decode.
+    pub(crate) fn invoke_validated<R: DeserializeOwned>(
+        &self,
+        invocation: &Invocation<'_>,
+        validate: impl Fn(&R) -> Result<(), AgentError>,
+    ) -> Result<AgentRun<R>, AgentError> {
         let count = self.clis.len();
         let start = self.turn.fetch_add(1, Ordering::Relaxed) % count.max(1);
         let mut log = File::create(invocation.log)?;
@@ -220,7 +230,10 @@ impl Agent {
             match self
                 .attempt(cli, invocation, log.try_clone()?)
                 .and_then(AgentRun::decode)
-            {
+                .and_then(|run| {
+                    validate(&run.response)?;
+                    Ok(run)
+                }) {
                 Ok(run) => return Ok(run),
                 Err(AgentError::Interrupted) => return Err(AgentError::Interrupted),
                 // The directory is still in use: no other CLI may start on it.

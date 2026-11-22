@@ -39,7 +39,7 @@ pub enum AgentError {
         /// The process group, led by the CLI's process id.
         group: u32,
     },
-    /// The agent finished but its response is not the requested shape.
+    /// The agent finished but its response did not meet the request.
     #[error("agent response is unusable: {0}")]
     InvalidResponse(String),
     /// The agent replied with a JSON object, but it does not decode into

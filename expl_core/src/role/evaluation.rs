@@ -31,9 +31,12 @@
 //! sets exploration (what next from here, or in place of this failure?)
 //! and planning (re-prioritise) in motion.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::agent::AgentError;
 use crate::event::EventKind;
 use crate::graph::{
     Conclusion, Decision, GoalTree, Graph, NewConclusion, NewEvaluation, Node, NodeId, NodeKind,
@@ -79,7 +82,40 @@ struct Response {
     #[serde(default)]
     conclusion: Option<ConclusionResponse>,
     #[serde(default)]
-    evaluations: Vec<EvaluationResponse>,
+    evaluations: Vec<NewEvaluation>,
+}
+
+impl Response {
+    /// Require exactly one verdict per requested goal before recording anything.
+    fn validate(&self, goals: impl IntoIterator<Item = NodeId>) -> Result<(), AgentError> {
+        let expected: BTreeSet<_> = goals.into_iter().collect();
+        let mut seen = BTreeSet::new();
+        for verdict in &self.evaluations {
+            let goal = verdict.goal;
+            if !expected.contains(&goal) {
+                return Err(AgentError::InvalidResponse(format!(
+                    "verdict for unexpected goal {goal}"
+                )));
+            }
+            if !seen.insert(goal) {
+                return Err(AgentError::InvalidResponse(format!(
+                    "duplicate verdict for goal {goal}"
+                )));
+            }
+            if !(0..=100).contains(&verdict.score) {
+                return Err(AgentError::InvalidResponse(format!(
+                    "score {} for goal {goal} is outside 0–100",
+                    verdict.score
+                )));
+            }
+        }
+        if let Some(goal) = expected.difference(&seen).next() {
+            return Err(AgentError::InvalidResponse(format!(
+                "missing verdict for goal {goal}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,14 +124,6 @@ struct ConclusionResponse {
     hypothesis: String,
     finding: String,
     consequence: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct EvaluationResponse {
-    goal: i64,
-    satisfied: bool,
-    score: i64,
-    reason: String,
 }
 
 /// The response schema: verdicts against the goals and, for a step, the
@@ -220,26 +248,25 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     } else {
         prompt(reaction, Some(&step), &goals, &tree, &schema)
     };
-    let response: Response =
-        reaction.invoke_read_only(graph, Some(id), &scratch, &prompt, &schema)?;
+    let requested_goals: &[Node] = if failed { &[] } else { &goals };
+    let response = reaction.invoke_read_only_validated(
+        graph,
+        Some(id),
+        &scratch,
+        &prompt,
+        &schema,
+        |response: &Response| response.validate(requested_goals.iter().map(|goal| goal.id)),
+    )?;
     drop(scratch);
-    let mut evaluations = verdicts(response.evaluations, &goals);
+    let mut evaluations = response.evaluations;
     let Some(conclusion) = response.conclusion else {
         // No conclusion given: the verdicts alone, as before conclusions.
-        if failed {
-            evaluations.clear();
-        }
         graph.record_evaluations(id, &evaluations)?;
         return Ok(report(id, None, false, &evaluations));
     };
     let mut decision = conclusion.decision;
     if decision == Decision::Continue && !may_continue {
         decision = Decision::Abandoned;
-    }
-    // Verdicts on the goals are for work that stands: not a failure. (Nor
-    // an attempt carried on, which `conclude` leaves out when it reopens.)
-    if failed {
-        evaluations.clear();
     }
     let Some(reopened) = graph.conclude(
         id,
@@ -280,27 +307,18 @@ fn judge_origin(
         let schema = schema(false, false);
         let tree = graph.goal_tree()?;
         let prompt = prompt(reaction, None, &goals, &tree, &schema);
-        let response: Response =
-            reaction.invoke_read_only(graph, Some(id), &scratch, &prompt, &schema)?;
-        drop(scratch);
-        verdicts(response.evaluations, &goals)
+        let response = reaction.invoke_read_only_validated(
+            graph,
+            Some(id),
+            &scratch,
+            &prompt,
+            &schema,
+            |response: &Response| response.validate(goals.iter().map(|goal| goal.id)),
+        )?;
+        response.evaluations
     };
     graph.record_evaluations(id, &evaluations)?;
     Ok(report(id, None, false, &evaluations))
-}
-
-/// The agent's verdicts on `goals`, dropping any about other nodes.
-fn verdicts(evaluations: Vec<EvaluationResponse>, goals: &[Node]) -> Vec<NewEvaluation> {
-    evaluations
-        .into_iter()
-        .filter(|e| goals.iter().any(|g| g.id.0 == e.goal))
-        .map(|e| NewEvaluation {
-            goal: NodeId(e.goal),
-            satisfied: e.satisfied,
-            score: e.score.clamp(0, 100),
-            reason: e.reason,
-        })
-        .collect()
 }
 
 fn report(
@@ -391,14 +409,12 @@ impl StepUnderJudgment<'_> {
              concrete: name files, behaviours, commands, and causes.\n\n",
         );
         if failed {
-            out.push_str(
-                "A failed step's work does not stand, so return no evaluations against the \
-                 goals.\n\n",
-            );
+            out.push_str("For this failed step, return an empty `evaluations` array.\n\n");
         } else {
             out.push_str(
-                "Then judge the repository against the goals below, whatever you decided: the \
-                 verdicts are set aside if the step runs again.\n\n",
+                "Then judge the result against the goals below. Return one evaluation per goal, \
+                 using the number in brackets. The verdicts are set aside if the step runs \
+                 again.\n\n",
             );
         }
         out
@@ -417,16 +433,16 @@ fn prompt(
 ) -> Prompt {
     Prompt::from(format!(
         "## Task\n\n\
-         {first}Judge the repository in the working directory, as it is, against each goal below. \
+         {task} \
          Inspect the code and run builds and tests as needed. Do not modify files, and leave the \
          working directory as you found it: remove anything a build or test writes there outside \
-         ignored paths. Return one \
-         evaluation per goal, referring to it by the number in brackets.\n\n\
+         ignored paths.\n\n\
          {step}## Goals\n\n{goals}{instructions}{response}",
-        first = if step.is_some() {
-            "Conclude about the step below, then "
+        task = if step.is_some() {
+            "Conclude about the step below."
         } else {
-            ""
+            "Judge the repository in the working directory against each goal below. \
+             Return one evaluation per goal, using the number in brackets."
         },
         step = step.map(StepUnderJudgment::section).unwrap_or_default(),
         goals = digest::numbered_goals(goals, tree),
@@ -452,15 +468,14 @@ fn investigation_prompt(
     Prompt::from(format!(
         "## Task\n\n\
          The step {id} was an investigation: it changed nothing, and set out to answer the \
-         question \"{title}\". Conclude about it first (below). Then, unless it \
-         failed, judge the findings on its path (below, its own last) against each goal below: \
+         question \"{title}\". Conclude about it first (below). For a completed investigation, \
+         judge the findings on its path (below, its own last) against each goal below: \
          how far they settle it. A goal that asks a question is \
          satisfied when the findings answer it with convincing evidence — whatever the answer; \
          a goal that asks for a change is not satisfied by findings alone, but they can move it \
          (by ruling routes in or out). Check the evidence against the working directory, which \
          holds the code the investigation was about, rather than taking it on trust. Do not \
-         modify files. Return one evaluation per goal, referring to it by the number in \
-         brackets.\n\n\
+         modify files.\n\n\
          {step}## Findings\n\n{findings}\n## Goals\n\n{goals}{instructions}{response}",
         id = node.id,
         title = node.title,
@@ -487,6 +502,35 @@ fn findings(node: &Node, path: &[Node]) -> String {
 mod tests {
     use super::*;
     use crate::graph::Answer;
+
+    #[test]
+    fn verdicts_with_duplicate_or_unexpected_goals_or_invalid_scores_are_rejected() {
+        let goals = [NodeId(2), NodeId(3)];
+        for (verdicts, expected) in [
+            ([(2, 0), (2, 100)], "duplicate verdict for goal #2"),
+            ([(2, 0), (4, 100)], "verdict for unexpected goal #4"),
+            ([(2, 0), (3, -1)], "score -1 for goal #3 is outside 0–100"),
+            ([(2, 0), (3, 101)], "score 101 for goal #3 is outside 0–100"),
+        ] {
+            let response = Response {
+                conclusion: None,
+                evaluations: verdicts
+                    .into_iter()
+                    .map(|(goal, score)| NewEvaluation {
+                        goal: NodeId(goal),
+                        satisfied: false,
+                        score,
+                        reason: String::new(),
+                    })
+                    .collect(),
+            };
+            let error = response.validate(goals).expect_err("invalid verdicts");
+            assert!(
+                matches!(&error, AgentError::InvalidResponse(reason) if reason == expected),
+                "{error}"
+            );
+        }
+    }
 
     fn investigation(id: i64, title: &str, evidence: &str) -> Node {
         Node {

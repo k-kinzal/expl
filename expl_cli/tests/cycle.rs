@@ -105,6 +105,8 @@ evaluation)
   fi
   if [ -f "@DIR@/evaluation.sh" ]; then
     sh "@DIR@/evaluation.sh"
+  elif [ "$EXPL_EVENT" = node.failed ]; then
+    echo '{"evaluations":[]}'
   elif grep -q '^## Findings' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
     echo '{"evaluations":[{"goal":2,"satisfied":true,"score":100,"reason":"answered"}]}'
   elif ls node-*.txt > /dev/null 2>&1; then
@@ -2300,4 +2302,82 @@ fn a_clean_evaluation_records_its_verdicts() {
     assert_eq!(evaluation["status"], "succeeded", "{evaluation}");
     assert_eq!(step["evaluations"][0]["score"], 90, "{step}");
     assert_eq!(step["evaluations"][0]["satisfied"], true, "{step}");
+}
+
+#[test]
+fn a_partial_evaluation_records_nothing_until_a_complete_retry() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let first: i64 = ok(repo, &["goal", "add", "A file greets"])
+        .parse()
+        .expect("first goal ID");
+    let second: i64 = ok(repo, &["goal", "add", "A file says goodbye"])
+        .parse()
+        .expect("second goal ID");
+    let step_id = ok(repo, &["node", "add", "Write a file", "--priority", "1"]);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    assert_eq!(node(repo, &step_id)["node"]["status"], "completed");
+
+    let script = sandbox.dir.path().join("evaluation.sh");
+    let write_reply = |evaluations: &[serde_json::Value]| {
+        let reply = serde_json::json!({
+            "conclusion": {
+                "decision": "done",
+                "hypothesis": "A greeting can be written",
+                "finding": "The file contains a greeting",
+                "consequence": "The greeting goal is satisfied",
+            },
+            "evaluations": evaluations,
+        });
+        std::fs::write(&script, format!("echo '{reply}'\n")).expect("evaluation script");
+    };
+    let greeting =
+        serde_json::json!({"goal": first, "satisfied": true, "score": 100, "reason": "greeting"});
+    let goodbye =
+        serde_json::json!({"goal": second, "satisfied": false, "score": 0, "reason": "missing"});
+    write_reply(std::slice::from_ref(&greeting));
+    let attempt = expl(repo, &["run", "evaluator", "--once"]);
+    let stderr = String::from_utf8_lossy(&attempt.stderr);
+    assert!(attempt.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "agent response is unusable: missing verdict for goal #{second}"
+        )) && stderr.contains("will be delivered again"),
+        "{stderr}"
+    );
+    let step = node(repo, &step_id);
+    assert_nothing_recorded(repo, &step);
+    assert_eq!(step["conclusions"], serde_json::json!([]), "{step}");
+    assert_eq!(step["agent_runs"][0]["status"], "failed", "{step}");
+
+    write_reply(&[goodbye, greeting]);
+    ok(repo, &["run", "evaluator", "--exit-when-idle"]);
+    let step = node(repo, &step_id);
+    let verdicts: Vec<_> = step["evaluations"]
+        .as_array()
+        .expect("evaluations")
+        .iter()
+        .map(|verdict| (verdict["goal"].as_i64(), verdict["score"].as_i64()))
+        .collect();
+    assert_eq!(
+        verdicts,
+        [(Some(second), Some(0)), (Some(first), Some(100))]
+    );
+    assert_eq!(
+        step["conclusions"].as_array().expect("conclusions").len(),
+        1
+    );
+    let events = json_lines(&ok(
+        repo,
+        &[
+            "event",
+            "ls",
+            "--kind",
+            "node.evaluated",
+            "--format",
+            "json",
+        ],
+    ));
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["node"], step["node"]["id"]);
 }
