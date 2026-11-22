@@ -12,7 +12,9 @@ pub const HEARTBEAT_SECONDS: u64 = 2;
 /// A running process that has not beaten for this long is dead.
 pub const STALE_SECONDS: i64 = 15;
 /// A created record must be adopted within this long, or it is abandoned.
-pub const STARTUP_SECONDS: i64 = 30;
+/// Well above the store's 30s busy timeout: a healthy child opening a busy
+/// database can wait that long more than once before it adopts its record.
+pub const STARTUP_SECONDS: i64 = 120;
 
 /// Created and past its startup deadline (also without one).
 const EXPIRED: &str =
