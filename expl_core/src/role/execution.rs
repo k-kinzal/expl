@@ -184,6 +184,7 @@ fn carry_out(
     if reaction.lease_lost() {
         return Err(RoleError::Agent(AgentError::Interrupted));
     }
+    pause(Window::BeforeCommit);
     let message = format!("{}\n\n{}", node.title, summary);
     let head = match workspace.commit(&message) {
         Ok(head) => head,
@@ -205,6 +206,7 @@ fn carry_out(
     if reaction.lease_lost() {
         return Err(RoleError::Agent(AgentError::Interrupted));
     }
+    pause(Window::BeforeComplete);
     graph.complete(id, &summary)?;
     Ok(Report::Execution(ExecutionReport {
         node: id,
@@ -214,6 +216,41 @@ fn carry_out(
         head_commit: Some(head),
         summary,
     }))
+}
+
+/// A point in [`carry_out`] between a lease check and the write it guards:
+/// the check is not atomic with the write, so another process can take the
+/// lease over in between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Window {
+    /// After the check that follows the agent's run, before
+    /// [`Workspace::commit`] and the writes after it.
+    BeforeCommit,
+    /// After the last check, before [`Graph::complete`].
+    BeforeComplete,
+}
+
+/// What a test runs at a [`Window`].
+#[cfg(test)]
+type PauseHook = Box<dyn FnMut(Window)>;
+
+#[cfg(test)]
+thread_local! {
+    /// What [`pause`] runs on this thread (tests only).
+    static PAUSE: std::cell::RefCell<Option<PauseHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Reach `window`: tests can act there (take the lease over, say) before
+/// execution goes on; otherwise nothing happens.
+fn pause(window: Window) {
+    #[cfg(test)]
+    PAUSE.with_borrow_mut(|hook| {
+        if let Some(hook) = hook {
+            hook(window);
+        }
+    });
+    #[cfg(not(test))]
+    let _ = window;
 }
 
 /// Answer the question of the claimed investigation `node` at the code its
@@ -454,9 +491,301 @@ fn prompt(reaction: &Reaction<'_>, node: &Node, schema: &serde_json::Value) -> P
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+
     use super::*;
-    use crate::event::EventKind;
-    use crate::role::Role;
+    use crate::declaration::Declaration;
+    use crate::event::{Delivery, EventId, EventKind, Inbox, InboxError};
+    use crate::git::Git;
+    use crate::process::{Interrupt, MAX_ATTEMPTS, ProcessId, Processes};
+    use crate::project::Project;
+    use crate::role::{Context, Role};
+    use crate::store::{self, EPOCH};
+    use crate::workspace::Workspaces;
+
+    /// A change step leased by its first holder, ready to be carried out by
+    /// an agent that writes a file and reports success.
+    struct Held {
+        _dir: tempfile::TempDir,
+        db: PathBuf,
+        context: Context,
+        graph: Graph,
+        step: NodeId,
+        holder: ProcessId,
+        taker: ProcessId,
+        delivery: Delivery,
+        interrupt: Interrupt,
+    }
+
+    fn held_step() -> Held {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = Git::new(dir.path());
+        git.run(&["init", "-q", "-b", "main"]).expect("init");
+        git.run(&[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "Start",
+        ])
+        .expect("commit");
+        let project = Project::at(dir.path());
+        std::fs::create_dir(project.state_dir()).expect("state directory");
+        let db = project.database_path();
+        let mut graph = Graph::open(&db).expect("graph");
+        let origin = graph
+            .create_origin(
+                "Start",
+                Some("main"),
+                &git.resolve_commit("HEAD").expect("head"),
+            )
+            .expect("origin");
+        let goal = graph.add_goal("g", "g", false, &[]).expect("goal");
+        let step = graph
+            .propose_step("s", "s", &[origin], &[goal])
+            .expect("step");
+        graph.plan_step(step, 1).expect("plan"); // node.ready
+        let declaration = Declaration::parse(
+            r#"
+            [agent.executor]
+            role = "execution"
+            driver = "generic"
+            command = ["sh", "-c", '''cat >/dev/null; echo old > old.txt; printf '%s\n' "$1"''', "agent", '{"succeeded":true,"summary":"old holder"}']
+            replicas = 1
+            "#,
+        )
+        .expect("declaration");
+        let context = Context::new(project.clone(), declaration);
+        let mut processes = Processes::open(&db, &project.logs_dir()).expect("processes");
+        let holder = processes
+            .create("executor", None, false)
+            .expect("process")
+            .id;
+        let taker = processes
+            .create("executor", None, false)
+            .expect("process")
+            .id;
+        let delivery = Inbox::open(&db, "executor")
+            .expect("inbox")
+            .lease(Role::Execution.reactions(), holder, false, MAX_ATTEMPTS)
+            .expect("lease")
+            .expect("node.ready");
+        Held {
+            _dir: dir,
+            db,
+            context,
+            graph,
+            step,
+            holder,
+            taker,
+            delivery,
+            interrupt: Interrupt::default().for_reaction(),
+        }
+    }
+
+    /// What the process that took the step over recorded of it.
+    #[derive(Debug, Default)]
+    struct Takeover {
+        /// `node.started` of the takeover: events after it are not the old
+        /// holder's to record.
+        started: Option<EventId>,
+        /// The step's branch and tip as the takeover left them.
+        recorded: (Option<String>, Option<String>),
+        worktree: PathBuf,
+        /// Kept so the new holder's worktree outlives the hook.
+        workspace: Option<Workspace>,
+    }
+
+    /// Runs a [`pause`] hook on this thread for as long as it lives.
+    struct Hooked;
+
+    impl Hooked {
+        fn install(hook: impl FnMut(Window) + 'static) -> Self {
+            PAUSE.with_borrow_mut(|slot| *slot = Some(Box::new(hook)));
+            Self
+        }
+    }
+
+    impl Drop for Hooked {
+        fn drop(&mut self) {
+            PAUSE.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+
+    /// At `at`, a second process takes the event over, as it would once the
+    /// first holder's lease expired: its own [`Inbox`] leases the event again
+    /// (a new token), and execution reclaims the step and makes it a
+    /// workspace and branch. The first holder's lease flag stays as its
+    /// heartbeat last left it — not lost — as it does until the next beat.
+    fn take_over_at(held: &Held, at: Window) -> (Hooked, Rc<RefCell<Takeover>>) {
+        let takeover = Rc::new(RefCell::new(Takeover::default()));
+        let record = Rc::clone(&takeover);
+        let (db, context, step, taker) =
+            (held.db.clone(), held.context.clone(), held.step, held.taker);
+        let first = held.delivery.token.clone();
+        let hook = Hooked::install(move |window| {
+            if window != at {
+                return;
+            }
+            store::open(&db)
+                .expect("db")
+                .execute(
+                    &format!("UPDATE deliveries SET leased_until = {EPOCH} - 1"),
+                    [],
+                )
+                .expect("expire");
+            let delivery = Inbox::open(&db, "executor")
+                .expect("inbox")
+                .lease(Role::Execution.reactions(), taker, false, MAX_ATTEMPTS)
+                .expect("lease")
+                .expect("the expired lease is taken over");
+            assert!(delivery.attempts == 2 && delivery.token != first);
+            let mut graph = Graph::open(&db).expect("graph");
+            assert!(graph.claim(step, true).expect("reclaim"));
+            let node = graph.node(step).expect("step");
+            let predecessors = vec![graph.origin().expect("origin")];
+            let trunk = Trunk::new(context.project(), context.declaration().trunk.as_deref())
+                .branches(&graph)
+                .expect("trunk");
+            let workspace = context
+                .workspaces()
+                .create(&node, &predecessors, &trunk)
+                .expect("the new holder's workspace");
+            graph
+                .set_branch(step, workspace.branch(), None)
+                .expect("branch");
+            let mut record = record.borrow_mut();
+            record.started = graph.last_event().expect("last");
+            let node = graph.node(step).expect("step");
+            record.recorded = (node.branch, node.head_commit);
+            record.worktree = workspace.path().to_owned();
+            record.workspace = Some(workspace);
+        });
+        (hook, takeover)
+    }
+
+    /// Carry the held step out with a takeover at `at`, and list every
+    /// write of the first holder that landed on the step the new holder
+    /// owns by then. The inbox is checked to be atomic: the first holder
+    /// can no longer settle the delivery.
+    fn writes_landing_after_takeover_at(at: Window) -> Vec<String> {
+        let mut held = held_step();
+        let (_hook, takeover) = take_over_at(&held, at);
+        let agent = held.context.agent("executor").expect("agent");
+        let reaction = Reaction::new(
+            &held.context,
+            &agent,
+            held.holder,
+            &held.delivery,
+            &held.interrupt,
+        );
+        let result = react(&reaction, &mut held.graph);
+        eprintln!("first holder, taken over at {at:?}: {result:?}");
+        let takeover = takeover.borrow();
+        let started = takeover.started.expect("the event was taken over");
+        assert!(!reaction.lease_lost(), "no heartbeat has beaten since");
+        assert!(matches!(
+            Inbox::open(&held.db, "executor")
+                .expect("inbox")
+                .ack(&held.delivery, None),
+            Err(InboxError::LeaseLost { .. })
+        ));
+
+        let mut landed = Vec::new();
+        let step = held.graph.node(held.step).expect("step");
+        if step.status != NodeStatus::Running {
+            landed.push(format!("status `{}`", step.status));
+        }
+        if let Some(outcome) = &step.outcome {
+            landed.push(format!("outcome {outcome:?}"));
+        }
+        if (&step.branch, &step.head_commit) != (&takeover.recorded.0, &takeover.recorded.1) {
+            landed.push(format!(
+                "branch {:?} at {:?} (the takeover left {:?})",
+                step.branch, step.head_commit, takeover.recorded
+            ));
+        }
+        for event in held.graph.events(Some(started), 100).expect("events") {
+            landed.push(format!("event {} of {:?}", event.kind, event.node));
+        }
+        if !takeover.worktree.exists() {
+            landed.push(format!(
+                "the new holder's worktree {} was removed",
+                takeover.worktree.display()
+            ));
+        }
+        // The first holder's own branch: expl never deletes a branch, so a
+        // commit there is no write to the step unless the step records it.
+        let first = Workspaces::branch_name(held.step);
+        let repository = Git::new(held.context.project().root());
+        if repository.resolve_commit(&first).ok() != repository.resolve_commit("main").ok() {
+            eprintln!("note: the first holder committed on {first}");
+        }
+        eprintln!("landed: {landed:#?}");
+        landed
+    }
+
+    #[test]
+    fn an_execution_left_alone_passes_both_windows_and_completes() {
+        let mut held = held_step();
+        let reached = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&reached);
+        let _hook = Hooked::install(move |window| seen.borrow_mut().push(window));
+        let agent = held.context.agent("executor").expect("agent");
+        let reaction = Reaction::new(
+            &held.context,
+            &agent,
+            held.holder,
+            &held.delivery,
+            &held.interrupt,
+        );
+        let report = react(&reaction, &mut held.graph).expect("reaction");
+        assert!(matches!(
+            report,
+            Report::Execution(ExecutionReport {
+                status: NodeStatus::Completed,
+                ..
+            })
+        ));
+        assert_eq!(
+            *reached.borrow(),
+            vec![Window::BeforeCommit, Window::BeforeComplete]
+        );
+        assert_eq!(
+            held.graph.node(held.step).expect("step").status,
+            NodeStatus::Completed
+        );
+    }
+
+    #[test]
+    #[ignore = "window: a takeover between the lease check after the agent returns and \
+                `workspace.commit` lets the old holder fail the step the new holder is running \
+                (`node.failed` and its outcome, as its worktree path is the new holder's \
+                now) and remove the new holder's worktree (#549/#108)"]
+    fn a_takeover_before_the_commit_leaves_the_step_to_the_new_holder() {
+        let landed = writes_landing_after_takeover_at(Window::BeforeCommit);
+        assert!(
+            landed.is_empty(),
+            "the old holder's writes landed: {landed:#?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "window: a takeover between the last lease check and `Graph::complete` lets the \
+                old holder complete the step the new holder is running (status, outcome, \
+                `node.completed`) and remove the new holder's worktree (#549/#108)"]
+    fn a_takeover_before_completion_leaves_the_step_to_the_new_holder() {
+        let landed = writes_landing_after_takeover_at(Window::BeforeComplete);
+        assert!(
+            landed.is_empty(),
+            "the old holder's writes landed: {landed:#?}"
+        );
+    }
 
     #[test]
     fn a_terminally_failed_execution_leaves_its_step_failed() {
