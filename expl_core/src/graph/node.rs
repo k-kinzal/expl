@@ -35,7 +35,8 @@ pub enum NodeKind {
     /// one is `superseded` and kept as history. Each origin builds on the
     /// previous one and on the steps adopted into it.
     Origin,
-    /// A unit of work toward some goal, realised on its own branch.
+    /// A unit of work toward some goal: a change realised on its own branch,
+    /// or an investigation that answers a question and changes nothing.
     Step,
     /// What the human wants. Evaluated against; never executed.
     Goal,
@@ -68,6 +69,18 @@ pub enum NodeStatus {
     Active,
     /// An origin the trunk has advanced past.
     Superseded,
+}
+
+/// What an investigation found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Answer {
+    /// The question is answered yes.
+    Yes,
+    /// The question is answered no.
+    No,
+    /// The evidence does not settle it.
+    Unknown,
 }
 
 macro_rules! text_enum {
@@ -107,6 +120,7 @@ macro_rules! text_enum {
 }
 
 text_enum!(NodeKind { Origin => "origin", Step => "step", Goal => "goal" });
+text_enum!(Answer { Yes => "yes", No => "no", Unknown => "unknown" });
 text_enum!(NodeStatus {
     Proposed => "proposed",
     Planned => "planned",
@@ -137,9 +151,16 @@ pub struct Node {
     pub priority: i64,
     /// Goals only: also explore backward from this goal.
     pub counter_exploration: bool,
-    /// Git branch holding this node's work (origin and steps).
+    /// Steps only: an investigation, which answers a question and changes
+    /// nothing, rather than a change committed on its own branch.
+    pub investigation: bool,
+    /// Completed investigations: the answer found (its evidence is the
+    /// `outcome`).
+    pub answer: Option<Answer>,
+    /// Git branch holding this node's work (origin and change steps).
     pub branch: Option<String>,
-    /// Commit at the tip of the branch once executed (origin: base commit).
+    /// Commit at the tip of the branch once executed (origin: base commit;
+    /// investigation: the code it was about).
     pub head_commit: Option<String>,
     /// Executor's report, or the reason the node was pruned or failed.
     pub outcome: Option<String>,

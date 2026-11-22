@@ -10,7 +10,14 @@
 //! it a candidate; candidates are steps. The
 //! agent works in a scratch worktree at the step's commit, so it can build
 //! and test the result without disturbing anyone; its prompt holds only the
-//! goals. Recording the verdicts
+//! goals.
+//!
+//! An investigation changed nothing, so its evidence is not the working
+//! directory but its finding: the prompt then holds the question, the
+//! finding, and the findings of the investigations before it on its path,
+//! and the agent judges whether they settle each goal (a question is
+//! satisfied once answered); the scratch worktree is the code they were
+//! about, for checking the evidence. Recording the verdicts
 //! records `node.evaluated`, which sets exploration (what next from here?)
 //! and planning (re-prioritise) in motion.
 
@@ -108,7 +115,13 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     } else {
         let schema = schema();
         let tree = graph.goal_tree()?;
-        let prompt = prompt(reaction, &goals, &tree, &schema);
+        let prompt = if node.investigation {
+            let mut path = graph.ancestors(id)?;
+            path.push(node.clone());
+            investigation_prompt(reaction, &node, &path, &goals, &tree, &schema)
+        } else {
+            prompt(reaction, &goals, &tree, &schema)
+        };
         let response: Response =
             reaction.invoke_read_only(graph, Some(id), &scratch, &prompt, &schema)?;
         response
@@ -152,6 +165,37 @@ fn prompt(
          Inspect the code and run builds and tests as needed. Do not modify files. Return one \
          evaluation per goal, referring to it by the number in brackets.\n\n\
          ## Goals\n\n{goals}{instructions}{response}",
+        goals = digest::numbered_goals(goals, tree),
+        instructions = super::instructions_section(reaction.agent()),
+        response = super::response_section(schema),
+    ))
+}
+
+/// The prompt for an investigation: the goals, the question it answered,
+/// and the findings on its path — the evidence to judge.
+fn investigation_prompt(
+    reaction: &Reaction<'_>,
+    node: &Node,
+    path: &[Node],
+    goals: &[Node],
+    tree: &GoalTree,
+    schema: &serde_json::Value,
+) -> Prompt {
+    Prompt::from(format!(
+        "## Task\n\n\
+         The step {id} was an investigation: it changed nothing, and answered the question \
+         \"{title}\" with a finding. Below are the findings on its path, its own last. Judge \
+         them against each goal below: how far they settle it. A goal that asks a question is \
+         satisfied when the findings answer it with convincing evidence — whatever the answer; \
+         a goal that asks for a change is not satisfied by findings alone, but they can move it \
+         (by ruling routes in or out). Check the evidence against the working directory, which \
+         holds the code the investigation was about, rather than taking it on trust. Do not \
+         modify files. Return one evaluation per goal, referring to it by the number in \
+         brackets.\n\n\
+         ## Findings\n\n{findings}\n## Goals\n\n{goals}{instructions}{response}",
+        id = node.id,
+        title = node.title,
+        findings = digest::findings(path),
         goals = digest::numbered_goals(goals, tree),
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),

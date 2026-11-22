@@ -250,6 +250,10 @@ pub(crate) struct NodeAddArgs {
     /// Plan it immediately at this priority, without waiting for planning.
     #[arg(long)]
     pub(crate) priority: Option<i64>,
+    /// An investigation: a question to answer (the objective), changing
+    /// nothing, rather than a change committed on its own branch.
+    #[arg(long)]
+    pub(crate) investigation: bool,
 }
 
 /// A command targeting one node.

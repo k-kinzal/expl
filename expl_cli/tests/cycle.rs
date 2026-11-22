@@ -16,8 +16,10 @@ use std::time::{Duration, Instant};
 /// with `@DIR@/plan.json` when present; evaluation answers with
 /// `@DIR@/evaluation.sh` when present. Evaluation, which must not touch
 /// its worktree, writes `stray.txt` there while `@DIR@/eval-writes` exists
-/// and commits `sneaky.txt` while `@DIR@/eval-commits` exists. Every prompt
-/// is kept in `@DIR@/prompts/` for inspection.
+/// and commits `sneaky.txt` while `@DIR@/eval-commits` exists. An
+/// investigation answers `no` (whether `hello.txt` exists), and its findings
+/// are judged to settle the goal. Every prompt is kept in `@DIR@/prompts/`
+/// for inspection.
 const AGENT: &str = r#"#!/bin/sh
 mkdir -p "@DIR@/prompts"
 cat > "@DIR@/prompts/$EXPL_ROLE-$$.txt"
@@ -45,6 +47,11 @@ planning)
   fi ;;
 execution)
   while [ -f "@DIR@/slow" ]; do sleep 0.2; done
+  if grep -q '^## Question' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
+    if [ -f hello.txt ]; then answer=yes; else answer=no; fi
+    echo "{\"investigated\":true,\"answer\":\"$answer\",\"evidence\":\"looked for hello.txt\"}"
+    exit 0
+  fi
   conflicted=$(git diff --name-only --diff-filter=U)
   if [ -n "$conflicted" ]; then
     if [ ! -f "@DIR@/unresolvable" ]; then
@@ -67,6 +74,8 @@ evaluation)
   fi
   if [ -f "@DIR@/evaluation.sh" ]; then
     sh "@DIR@/evaluation.sh"
+  elif grep -q '^## Findings' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
+    echo '{"evaluations":[{"goal":2,"satisfied":true,"score":100,"reason":"answered"}]}'
   elif ls node-*.txt > /dev/null 2>&1; then
     echo '{"evaluations":[{"goal":2,"satisfied":true,"score":90,"reason":"file exists"}]}'
   else
@@ -321,6 +330,79 @@ fn events_flow_through_every_role() {
     assert_eq!(
         git(repo, &["log", "-1", "--format=%s", "expl/node-3"]),
         "Write hello"
+    );
+}
+
+#[test]
+fn an_investigation_answers_without_a_commit_and_its_finding_is_judged() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    ok(repo, &["goal", "add", "Is hello written yet?"]);
+    let question = ok(
+        repo,
+        &[
+            "node",
+            "add",
+            "Look for hello.txt",
+            "--objective",
+            "Does hello.txt exist?",
+            "--investigation",
+            "--before",
+            "2",
+            "--priority",
+            "1",
+        ],
+    );
+    let then = ok(
+        repo,
+        &[
+            "node",
+            "add",
+            "Write after asking",
+            "--after",
+            &question,
+            "--priority",
+            "1",
+        ],
+    );
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+
+    // Answered, at the code it was about, with no branch or commit of its own.
+    let origin_commit = git(repo, &["rev-parse", "main"]);
+    let finding = node(repo, &question)["node"].clone();
+    assert_eq!(finding["status"], "completed", "{finding}");
+    assert_eq!(finding["investigation"], true);
+    assert_eq!(finding["answer"], "no");
+    assert_eq!(finding["branch"], serde_json::Value::Null);
+    assert_eq!(finding["head_commit"].as_str(), Some(origin_commit.trim()));
+    let branches = git(repo, &["branch", "--list", "expl/*"]);
+    assert!(
+        !branches.contains(&format!("expl/node-{question}")),
+        "{branches}"
+    );
+    // The change after it starts from that same code.
+    assert_eq!(node(repo, &then)["node"]["status"], "completed");
+    let parent = git(repo, &["rev-parse", &format!("expl/node-{then}^")]);
+    assert_eq!(parent.trim(), origin_commit.trim());
+
+    // Its finding, not a working directory, is what evaluation judges.
+    ok(repo, &["run", "evaluator", "--exit-when-idle"]);
+    let prompts = sandbox.dir.path().join("prompts");
+    let judged = std::fs::read_dir(&prompts)
+        .expect("prompts")
+        .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("prompt"))
+        .any(|text| text.contains("## Findings") && text.contains("Look for hello.txt: no"));
+    assert!(judged, "no evaluation was shown the finding");
+    let candidates = ok(repo, &["candidate", "ls"]);
+    assert!(candidates.contains("answer: no"), "{candidates}");
+    // Never mistaken for work the trunk took in.
+    std::fs::write(repo.join("README.md"), "moved\n").expect("write");
+    git(repo, &["commit", "-qam", "move the trunk"]);
+    ok(repo, &["run", "planner", "--exit-when-idle"]);
+    let lineage = json_lines(&ok(repo, &["origin", "ls", "--format", "json"]));
+    assert_eq!(
+        lineage.last().expect("origin")["adopted"],
+        serde_json::json!([])
     );
 }
 

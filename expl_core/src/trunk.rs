@@ -184,7 +184,9 @@ impl Trunk {
             let Some(head) = step.head_commit.as_deref() else {
                 continue;
             };
-            if lineage.in_trunk(step.id) {
+            // An investigation changed nothing: its head commit is the code
+            // it was about, which is not work the trunk could take in.
+            if step.investigation || lineage.in_trunk(step.id) {
                 continue;
             }
             // A step whose commit git no longer has (its branch was deleted

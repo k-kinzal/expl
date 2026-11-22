@@ -492,6 +492,12 @@ impl ExplView {
             } else {
                 format!("{}  {}", short(node.head_commit.as_deref()), node.title)
             }
+        } else if node.investigation {
+            // A question, and once answered, its answer.
+            match node.answer {
+                Some(answer) => format!("? {}  → {answer}", node.title),
+                None => format!("? {}", node.title),
+            }
         } else {
             node.title.clone()
         };
@@ -718,7 +724,13 @@ impl ExplView {
                 rows.extend(candidates);
             }
             NodeKind::Step => {
-                header.push(node.status.to_string());
+                if node.investigation {
+                    header.push("investigation".to_owned());
+                }
+                header.push(match node.answer {
+                    Some(answer) => format!("{} — answered {answer}", node.status),
+                    None => node.status.to_string(),
+                });
                 if let Some(worker) = worker {
                     header.push(worker);
                 }

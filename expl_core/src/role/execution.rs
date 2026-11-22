@@ -13,6 +13,12 @@
 //! unresolved fails the step, and so does a tip that does not contain
 //! every predecessor's commit.
 //!
+//! An investigation step changes nothing: the agent answers its question in
+//! a scratch worktree at the code it is about (its predecessors' work, which
+//! must be one line of history), and the step completes with a finding — yes,
+//! no or unknown, with evidence — and no branch or commit of its own. Its
+//! `head_commit` is that code, so steps after it start from the same place.
+//!
 //! Each ready step is its own event, so as many steps run at once as there
 //! are execution processes.
 
@@ -21,7 +27,7 @@ use serde_json::json;
 
 use crate::agent::AgentError;
 use crate::event::Event;
-use crate::graph::{Graph, GraphError, Node, NodeId, NodeKind, NodeStatus};
+use crate::graph::{Answer, Graph, GraphError, Node, NodeId, NodeKind, NodeStatus};
 use crate::prompt::Prompt;
 use crate::role::{Reaction, Report, RoleError};
 use crate::workspace::{Workspace, Workspaces};
@@ -33,8 +39,10 @@ pub struct ExecutionReport {
     pub node: NodeId,
     /// `completed` or `failed`.
     pub status: NodeStatus,
-    /// Branch holding the work.
+    /// Branch holding the work (empty for an investigation).
     pub branch: String,
+    /// What an investigation found.
+    pub answer: Option<Answer>,
     /// Tip commit, when the work could be committed.
     pub head_commit: Option<String>,
     /// The agent's summary or the failure.
@@ -45,6 +53,26 @@ pub struct ExecutionReport {
 struct Response {
     succeeded: bool,
     summary: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Finding {
+    investigated: bool,
+    answer: Answer,
+    evidence: String,
+}
+
+fn finding_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["investigated", "answer", "evidence"],
+        "properties": {
+            "investigated": {"type": "boolean", "description": "Whether you could carry out the investigation at all. An open question is still investigated: answer `unknown`."},
+            "answer": {"type": "string", "enum": ["yes", "no", "unknown"], "description": "The answer to the question; `unknown` when the evidence does not settle it."},
+            "evidence": {"type": "string", "description": "What you checked and what you found, concretely enough that someone else can verify the answer."}
+        }
+    })
 }
 
 fn schema() -> serde_json::Value {
@@ -91,6 +119,9 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     let mut predecessors = graph.predecessors(id)?;
     if predecessors.is_empty() {
         predecessors.push(graph.origin()?);
+    }
+    if node.investigation {
+        return investigate(reaction, graph, &node, &predecessors);
     }
 
     let branch = Workspaces::branch_name(id);
@@ -151,9 +182,124 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
         node: id,
         status: NodeStatus::Completed,
         branch,
+        answer: None,
         head_commit: Some(head),
         summary,
     }))
+}
+
+/// Answer the question of the claimed investigation `node` at the code its
+/// `predecessors` make up, and record the finding.
+fn investigate(
+    reaction: &Reaction<'_>,
+    graph: &mut Graph,
+    node: &Node,
+    predecessors: &[Node],
+) -> Result<Report, RoleError> {
+    let id = node.id;
+    let mut commits: Vec<String> = Vec::new();
+    for predecessor in predecessors {
+        if let Some(commit) = &predecessor.head_commit
+            && !commits.contains(commit)
+        {
+            commits.push(commit.clone());
+        }
+    }
+    let workspaces = reaction.context().workspaces();
+    let code = match workspaces.newest_of(&commits) {
+        Ok(Some(code)) => code,
+        Ok(None) => {
+            return fail(
+                graph,
+                node,
+                "",
+                None,
+                "an investigation reads one state of the code, but the steps it builds on are on \
+                 separate lines of history; combine them in a change step first"
+                    .to_owned(),
+            );
+        }
+        Err(error) => return fail(graph, node, "", None, error.to_string()),
+    };
+    let scratch = match workspaces.scratch_at(id, &code) {
+        Ok(scratch) => scratch,
+        Err(error) => return fail(graph, node, "", None, error.to_string()),
+    };
+    let schema = finding_schema();
+    let path = graph.ancestors(id)?;
+    let prompt = investigation_prompt(reaction, node, &path, &schema);
+    let result: Result<Finding, RoleError> =
+        reaction.invoke(graph, Some(id), scratch.path(), &prompt, &schema);
+    drop(scratch);
+    let finding = match result {
+        Ok(finding) => finding,
+        Err(error @ RoleError::Agent(AgentError::Interrupted)) => {
+            if !reaction.lease_lost() {
+                graph.unclaim(id)?;
+            }
+            return Err(error);
+        }
+        Err(error @ RoleError::Agent(_)) => {
+            return fail(
+                graph,
+                node,
+                "",
+                None,
+                format!("investigation agent failed: {error}"),
+            );
+        }
+        Err(error) => {
+            graph.fail(id, &error.to_string())?;
+            return Err(error);
+        }
+    };
+    if reaction.lease_lost() {
+        return Err(RoleError::Agent(AgentError::Interrupted));
+    }
+    if !finding.investigated {
+        return fail(graph, node, "", None, finding.evidence);
+    }
+    graph.record_finding(id, &code, finding.answer, &finding.evidence)?;
+    Ok(Report::Execution(ExecutionReport {
+        node: id,
+        status: NodeStatus::Completed,
+        branch: String::new(),
+        answer: Some(finding.answer),
+        head_commit: Some(code),
+        summary: finding.evidence,
+    }))
+}
+
+/// The prompt for an investigation: its question, and what investigations
+/// before it on its path found — nothing about other paths or the goals.
+fn investigation_prompt(
+    reaction: &Reaction<'_>,
+    node: &Node,
+    path: &[Node],
+    schema: &serde_json::Value,
+) -> Prompt {
+    let earlier = super::digest::findings(path);
+    let earlier = if earlier.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Found earlier on this path\n\n{earlier}")
+    };
+    Prompt::from(format!(
+        "## Question\n\n{title}\n\n{objective}\n\n\
+         This is an investigation: answer the question, and change nothing. The working \
+         directory holds the code the question is about. Read the code, and run builds, tests \
+         or commands as you need to gather evidence, but do not edit files, commit, or switch \
+         branches: nothing you leave in the working directory is kept.\n\n\
+         Answer `yes` or `no` when the evidence settles the question, `unknown` when it does \
+         not, and give the evidence — what you checked and what you found — so that someone \
+         else can verify the answer. Report `investigated: false` only when you could not carry \
+         out the investigation at all.\n\
+         {earlier}{instructions}{response}",
+        title = node.title,
+        objective = node.objective,
+        instructions = super::instructions_section(reaction.agent()),
+        response = super::response_section(schema),
+    ))
 }
 
 /// Invoke the agent once in the step's worktree: whether it reports
@@ -221,6 +367,7 @@ fn fail(
         node: node.id,
         status: NodeStatus::Failed,
         branch: branch.to_owned(),
+        answer: None,
         head_commit,
         summary,
     }))

@@ -82,10 +82,30 @@ struct Response {
     nodes: Vec<ProposedNode>,
 }
 
+/// Which kind of step a proposal is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StepKind {
+    #[default]
+    Change,
+    Investigation,
+}
+
+/// The `kind` property every proposal schema carries.
+fn kind_property() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": ["change", "investigation"],
+        "description": "`change` to change the code; `investigation` to answer a question without changing anything (the objective states the question)."
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct ProposedNode {
     title: String,
     objective: String,
+    #[serde(default)]
+    kind: StepKind,
     /// The goals it heads for (forward exploration only).
     #[serde(default)]
     before: Vec<i64>,
@@ -100,6 +120,8 @@ struct SurveyResponse {
 struct SurveyedNode {
     title: String,
     objective: String,
+    #[serde(default)]
+    kind: StepKind,
     after: Vec<i64>,
     before: Vec<i64>,
 }
@@ -115,8 +137,9 @@ fn survey_schema() -> serde_json::Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["title", "objective", "after", "before"],
+                    "required": ["title", "objective", "kind", "after", "before"],
                     "properties": {
+                        "kind": kind_property(),
                         "title": {"type": "string", "description": "Short imperative name of the step."},
                         "objective": {"type": "string", "description": "What the step must achieve, concretely enough to be done in one session and checked afterwards."},
                         "after": {"type": "array", "items": {"type": "integer"}, "description": "Ids of the nodes it builds on: the origin, or completed steps. Several ids join their work; empty means the origin."},
@@ -134,14 +157,15 @@ fn schema(aiming: bool) -> serde_json::Value {
     let mut item = json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["title", "objective"],
+        "required": ["title", "objective", "kind"],
         "properties": {
             "title": {"type": "string", "description": "Short imperative name of the step."},
-            "objective": {"type": "string", "description": "What the step must achieve, concretely enough to be done in one session and checked afterwards."}
+            "objective": {"type": "string", "description": "What the step must achieve, concretely enough to be done in one session and checked afterwards."},
+            "kind": kind_property()
         }
     });
     if aiming {
-        item["required"] = json!(["title", "objective", "before"]);
+        item["required"] = json!(["title", "objective", "kind", "before"]);
         item["properties"]["before"] = json!({
             "type": "array",
             "items": {"type": "integer"},
@@ -467,10 +491,12 @@ fn record(
     report: &mut ExplorationReport,
     title: &str,
     objective: &str,
+    kind: StepKind,
     after: &[NodeId],
     before: &[NodeId],
 ) {
-    match graph.propose_step(title.trim(), objective.trim(), after, before) {
+    let investigation = kind == StepKind::Investigation;
+    match graph.propose(investigation, title.trim(), objective.trim(), after, before) {
         Ok(id) => report.proposed.push(id),
         Err(error) => report.rejected.push(Rejection {
             title: title.to_owned(),
@@ -552,6 +578,7 @@ fn explore(
             &mut report,
             &proposal.title,
             &proposal.objective,
+            proposal.kind,
             &after,
             &before,
         );
@@ -678,6 +705,7 @@ fn explore_failure(
             &mut report,
             &proposal.title,
             &proposal.objective,
+            proposal.kind,
             &base,
             &aim.resolve(&proposal.before),
         );
@@ -767,6 +795,7 @@ fn explore_ahead(
             &mut report,
             &proposal.title,
             &proposal.objective,
+            proposal.kind,
             &[start.id],
             &aim.resolve(&proposal.before),
         );
@@ -868,6 +897,7 @@ fn survey(
             &mut report,
             &proposal.title,
             &proposal.objective,
+            proposal.kind,
             &after,
             &before,
         );
@@ -905,7 +935,11 @@ fn prompt(
            likelihood; the steps are ranked and weeded out afterwards.\n\
          - Prefer genuinely different alternatives over one linear plan, and never repeat a \
            step that already exists.\n\
-         {instructions}{response}",
+         - Propose investigations, not only changes, wherever a question is worth answering \
+           first: whether a premise holds, why something failed, what a change would affect. \
+           A goal that asks a question is reached by investigations alone.\n\n\
+         {kinds}{instructions}{response}",
+        kinds = digest::STEP_KINDS,
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),
     ))

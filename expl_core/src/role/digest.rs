@@ -23,9 +23,44 @@ pub(crate) fn excerpt_to(text: &str, width: usize) -> String {
     }
 }
 
+/// What kind of node it is, as prompts name it: `origin`, `goal`, `step`
+/// (a change) or `investigation`.
+pub(crate) fn kind(node: &Node) -> &'static str {
+    if node.kind == NodeKind::Step && node.investigation {
+        "investigation"
+    } else {
+        node.kind.as_str()
+    }
+}
+
+/// What the two kinds of step are, said once wherever steps are proposed or
+/// planned.
+pub(crate) const STEP_KINDS: &str = "Steps come in two kinds. A `change` step changes the code, \
+     and the result can be adopted into it. An \
+     `investigation` step changes nothing: it answers a question about the code or the world \
+     (\"is this repository affected by CVE-…?\", \"does any caller rely on this behaviour?\", \
+     \"why did that step fail?\") with a finding — yes, no or unknown, with its evidence — that \
+     counts toward the goals it heads for. Investigations are cheap ways to test a hypothesis \
+     before building on it.\n";
+
+/// Completed investigations among `nodes`, with what they found.
+pub(crate) fn findings(nodes: &[Node]) -> String {
+    let mut out = String::new();
+    for node in nodes {
+        if node.investigation && node.status == crate::graph::NodeStatus::Completed {
+            let answer = node.answer.map_or("unknown", |a| a.as_str());
+            let _ = writeln!(out, "- {} — {}: {answer}", node.id, node.title);
+            if let Some(evidence) = &node.outcome {
+                let _ = writeln!(out, "  evidence: {}", excerpt(evidence));
+            }
+        }
+    }
+    out
+}
+
 /// One line identifying a node.
 pub(crate) fn headline(node: &Node) -> String {
-    let mut line = format!("{} {} [{}", node.id, node.kind, node.status);
+    let mut line = format!("{} {} [{}", node.id, kind(node), node.status);
     if node.kind == NodeKind::Step {
         let _ = write!(line, ", priority {}", node.priority);
     }
@@ -137,8 +172,16 @@ pub(crate) fn graph(snapshot: &Snapshot) -> String {
                 ids(before.get(&node.id))
             );
         }
+        if let Some(answer) = node.answer {
+            let _ = writeln!(out, "    finding: {answer}");
+        }
         if let Some(outcome) = &node.outcome {
-            let _ = writeln!(out, "    outcome: {}", excerpt(outcome));
+            let label = if node.answer.is_some() {
+                "evidence"
+            } else {
+                "outcome"
+            };
+            let _ = writeln!(out, "    {label}: {}", excerpt(outcome));
         }
         for ((_, goal), evaluation) in
             latest.range((node.id, NodeId(i64::MIN))..=(node.id, NodeId(i64::MAX)))

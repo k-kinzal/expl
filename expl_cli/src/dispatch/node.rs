@@ -65,10 +65,19 @@ fn ls(start: &Path, args: &NodeLsArgs) -> Result<(), CliError> {
     }
     let mut table = Table::new(&["ID", "KIND", "STATUS", "PRIO", "COMMIT", "TITLE"]);
     for node in &nodes {
+        let kind = if node.investigation {
+            "investigation".to_owned()
+        } else {
+            node.kind.to_string()
+        };
+        let status = match node.answer {
+            Some(answer) => format!("{} ({answer})", node.status),
+            None => node.status.to_string(),
+        };
         table.row(vec![
             node.id.to_string(),
-            node.kind.to_string(),
-            node.status.to_string(),
+            kind,
+            status,
             if node.kind == NodeKind::Step {
                 node.priority.to_string()
             } else {
@@ -108,7 +117,13 @@ fn add(start: &Path, args: &NodeAddArgs) -> Result<(), CliError> {
         after.push(graph.origin()?.id);
     }
     let objective = args.objective.clone().unwrap_or_else(|| args.title.clone());
-    let id = graph.propose_step(&args.title, &objective, &after, &args.before)?;
+    let id = graph.propose(
+        args.investigation,
+        &args.title,
+        &objective,
+        &after,
+        &args.before,
+    )?;
     if let Some(priority) = args.priority {
         graph.plan_step(id, priority)?;
     }

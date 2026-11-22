@@ -302,13 +302,26 @@ impl Report {
                 ids(&p.rebased),
                 ids(&p.pruned)
             ),
-            Self::Execution(e) => format!(
-                "{} {} on {} — {}",
-                e.node,
-                e.status,
-                e.branch,
-                digest::excerpt_to(&e.summary, 160)
-            ),
+            Self::Execution(e) => match e.answer {
+                Some(answer) => format!(
+                    "{} answered {answer} — {}",
+                    e.node,
+                    digest::excerpt_to(&e.summary, 160)
+                ),
+                None if e.branch.is_empty() => format!(
+                    "{} {} — {}",
+                    e.node,
+                    e.status,
+                    digest::excerpt_to(&e.summary, 160)
+                ),
+                None => format!(
+                    "{} {} on {} — {}",
+                    e.node,
+                    e.status,
+                    e.branch,
+                    digest::excerpt_to(&e.summary, 160)
+                ),
+            },
             Self::Evaluation(e) if e.verdicts.is_empty() => {
                 format!("{}: no goals to evaluate against", e.node)
             }

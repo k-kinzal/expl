@@ -309,6 +309,10 @@ fn prompt(reaction: &Reaction<'_>, shown: &Snapshot, schema: &serde_json::Value)
          stands now (the working directory), `superseded` ones are earlier states. Each origin \
          builds on the one before it and on the steps adopted into it, so their work is already \
          in. Steps that build on a superseded origin start from older code.\n\n\
+         {kinds}An investigation reads one state of the code, so join it only onto steps on \
+         one line of history; steps after an investigation start from the code it was about. \
+         Schedule an investigation early when its answer decides which other paths are worth \
+         running.\n\n\
          Steps are enumerated broadly, so many are weak, niche, or may even work against a \
          goal. Give those a low priority rather than pruning them, so the alternatives stay \
          on the map; prune only steps that duplicate another or are already covered. Balance \
@@ -320,6 +324,7 @@ fn prompt(reaction: &Reaction<'_>, shown: &Snapshot, schema: &serde_json::Value)
          \n## Goals\n\n{goals}\n## Steps\n\n{graph}{instructions}{response}",
         goals = digest::numbered_goals(&shown.goals(), &GoalTree::of(&shown.nodes, &shown.edges)),
         graph = digest::graph(shown),
+        kinds = digest::STEP_KINDS,
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),
     ))

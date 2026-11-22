@@ -9,14 +9,15 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::event::{Event, EventId, EventKind};
 use crate::graph::{
-    AgentRunId, AgentRunRecord, AgentRunStatus, Edge, Evaluation, GoalTree, GraphError, Lineage,
-    NewEvaluation, NewOrigin, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Plan, PlanId,
-    PlannedPath, Snapshot,
+    AgentRunId, AgentRunRecord, AgentRunStatus, Answer, Edge, Evaluation, GoalTree, GraphError,
+    Lineage, NewEvaluation, NewOrigin, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Plan,
+    PlanId, PlannedPath, Snapshot,
 };
 use crate::store::{self, NOW};
 
 const NODE_COLUMNS: &str = "id, kind, status, title, objective, priority, counter_exploration, \
-                            branch, head_commit, outcome, created_at, updated_at";
+                            branch, head_commit, outcome, created_at, updated_at, investigation, \
+                            answer";
 const EVALUATION_COLUMNS: &str = "id, node_id, goal_id, satisfied, score, reason, created_at";
 /// SQL condition on a predecessor `p`: it has no commit to build on yet.
 /// Every origin, current or superseded, is realised.
@@ -59,6 +60,8 @@ fn node_from_row(row: &Row<'_>) -> rusqlite::Result<Node> {
         outcome: row.get(9)?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
+        investigation: row.get(12)?,
+        answer: row.get::<_, Option<String>>(13)?.map(decode).transpose()?,
     })
 }
 
@@ -450,6 +453,38 @@ impl Graph {
         after: &[NodeId],
         before: &[NodeId],
     ) -> Result<NodeId, GraphError> {
+        self.propose(false, title, objective, after, before)
+    }
+
+    /// Propose an investigation step: a question to answer about the code or
+    /// the world, which changes nothing. Records `node.proposed`.
+    ///
+    /// # Errors
+    ///
+    /// As [`propose_step`](Self::propose_step).
+    pub fn propose_investigation(
+        &mut self,
+        title: &str,
+        objective: &str,
+        after: &[NodeId],
+        before: &[NodeId],
+    ) -> Result<NodeId, GraphError> {
+        self.propose(true, title, objective, after, before)
+    }
+
+    /// Propose a change step or, with `investigation`, an investigation.
+    ///
+    /// # Errors
+    ///
+    /// As [`propose_step`](Self::propose_step).
+    pub fn propose(
+        &mut self,
+        investigation: bool,
+        title: &str,
+        objective: &str,
+        after: &[NodeId],
+        before: &[NodeId],
+    ) -> Result<NodeId, GraphError> {
         let tx = self.write()?;
         let id = Self::insert_node(
             &tx,
@@ -459,6 +494,9 @@ impl Graph {
             objective,
             false,
         )?;
+        if investigation {
+            tx.execute("UPDATE nodes SET investigation = 1 WHERE id = ?1", [id.0])?;
+        }
         for source in after {
             connect_in(&tx, *source, id)?;
         }
@@ -755,6 +793,49 @@ impl Graph {
     pub fn complete(&mut self, id: NodeId, outcome: &str) -> Result<(), GraphError> {
         let tx = self.write()?;
         set_status_in(&tx, id, NodeStatus::Completed, Some(outcome))?;
+        emit(&tx, EventKind::NodeCompleted, Some(id))?;
+        for successor in nodes_where(
+            &tx,
+            "id IN (SELECT target_id FROM edges WHERE source_id = ?1)",
+            id,
+        )? {
+            emit_if_ready(&tx, successor.id)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A running investigation found its answer: it completes at `code` —
+    /// the commit it was about, which its successors build on — with no
+    /// branch, and `evidence` as its outcome. Records `node.completed` and
+    /// `node.ready` for every successor that can run now.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError::NotInStatus`] when `id` is not a running investigation.
+    pub fn record_finding(
+        &mut self,
+        id: NodeId,
+        code: &str,
+        answer: Answer,
+        evidence: &str,
+    ) -> Result<(), GraphError> {
+        let tx = self.write()?;
+        let changed = tx.execute(
+            &format!(
+                "UPDATE nodes SET status = 'completed', answer = ?2, outcome = ?3, \
+                 head_commit = ?4, branch = NULL, updated_at = {NOW} \
+                 WHERE id = ?1 AND kind = 'step' AND investigation = 1 AND status = 'running'"
+            ),
+            params![id.0, answer.as_str(), evidence, code],
+        )?;
+        if changed == 0 {
+            node_in(&tx, id)?;
+            return Err(GraphError::NotInStatus {
+                node: id,
+                expected: "a running investigation",
+            });
+        }
         emit(&tx, EventKind::NodeCompleted, Some(id))?;
         for successor in nodes_where(
             &tx,
@@ -1347,6 +1428,45 @@ mod tests {
             .into_iter()
             .map(|e| (e.kind, e.node.map(|n| n.0)))
             .collect()
+    }
+
+    #[test]
+    fn an_investigation_completes_with_a_finding_and_no_branch() {
+        let (mut graph, origin, goal) = seeded();
+        let question = graph
+            .propose_investigation("ask", "is it so?", &[origin], &[goal])
+            .expect("investigation");
+        let next = graph
+            .propose_step("then", "then", &[question], &[goal])
+            .expect("step");
+        assert!(graph.node(question).expect("node").investigation);
+        assert!(!graph.node(next).expect("node").investigation);
+        // Only a running investigation records a finding.
+        let code = "abc".to_owned();
+        assert!(matches!(
+            graph.record_finding(question, &code, Answer::Yes, "seen"),
+            Err(GraphError::NotInStatus { .. })
+        ));
+        graph.plan_step(question, 1).expect("plan");
+        graph.plan_step(next, 1).expect("plan");
+        assert!(graph.claim(question, false).expect("claim"));
+        graph
+            .record_finding(question, &code, Answer::Yes, "seen it")
+            .expect("finding");
+        let answered = graph.node(question).expect("node");
+        assert_eq!(answered.status, NodeStatus::Completed);
+        assert_eq!(answered.answer, Some(Answer::Yes));
+        assert_eq!(answered.outcome.as_deref(), Some("seen it"));
+        assert_eq!(answered.head_commit.as_deref(), Some(code.as_str()));
+        assert_eq!(answered.branch, None);
+        // What comes after it can run now, from the code it was about.
+        assert!(kinds(&graph).contains(&(EventKind::NodeReady, Some(next.0))));
+        // A change step cannot record a finding.
+        assert!(graph.claim(next, false).expect("claim"));
+        assert!(matches!(
+            graph.record_finding(next, &code, Answer::No, "x"),
+            Err(GraphError::NotInStatus { .. })
+        ));
     }
 
     #[test]

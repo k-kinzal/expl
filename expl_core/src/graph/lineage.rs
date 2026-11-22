@@ -226,6 +226,8 @@ mod tests {
             objective: String::new(),
             priority: 0,
             counter_exploration: false,
+            investigation: false,
+            answer: None,
             branch: None,
             head_commit: None,
             outcome: None,

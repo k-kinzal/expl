@@ -52,6 +52,6 @@ pub use evaluation::{Evaluation, NewEvaluation};
 pub use goals::GoalTree;
 pub use graph::Graph;
 pub use lineage::{Epoch, Lineage, NewOrigin};
-pub use node::{Node, NodeFilter, NodeId, NodeKind, NodeStatus};
+pub use node::{Answer, Node, NodeFilter, NodeId, NodeKind, NodeStatus};
 pub use plan::{Plan, PlanId, PlannedPath};
 pub use snapshot::Snapshot;

@@ -182,6 +182,24 @@ impl Workspaces {
         Ok(workspace)
     }
 
+    /// Of `commits`, the one whose history holds every other — the single
+    /// state of the code they make up — if there is one.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Git`] when git fails.
+    pub fn newest_of(&self, commits: &[String]) -> Result<Option<String>, WorkspaceError> {
+        'candidates: for candidate in commits {
+            for other in commits {
+                if other != candidate && !self.repository.is_ancestor(other, candidate)? {
+                    continue 'candidates;
+                }
+            }
+            return Ok(Some(candidate.clone()));
+        }
+        Ok(None)
+    }
+
     /// A private detached worktree at `node`'s commit.
     ///
     /// # Errors
@@ -193,11 +211,24 @@ impl Workspaces {
             .head_commit
             .as_deref()
             .ok_or(WorkspaceError::NoCommit(node.id))?;
+        self.scratch_at(node.id, commit)
+    }
+
+    /// A private detached worktree at `commit`, for work about `node`.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Git`] when git fails.
+    pub fn scratch_at(
+        &self,
+        node: NodeId,
+        commit: &str,
+    ) -> Result<ScratchWorkspace, WorkspaceError> {
         let commit = self.repository.resolve_commit(commit)?;
         let sequence = SCRATCH_SEQUENCE.fetch_add(1, Ordering::SeqCst);
         let path = self.root.join(format!(
             "scratch-{}-{}-{sequence}",
-            node.id.0,
+            node.0,
             std::process::id()
         ));
         let _guard = lock(&self.lock)?;

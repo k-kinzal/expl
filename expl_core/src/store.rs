@@ -178,6 +178,14 @@ CREATE TABLE assignments (
     PRIMARY KEY (role, event_id)
 );
 ",
+    r"
+-- Investigation steps change nothing: they answer a question about the code
+-- or the world and record a finding (yes, no, or unknown) with its evidence
+-- in `outcome`. Their `head_commit` is the code they were about; they have
+-- no branch and never reach the trunk.
+ALTER TABLE nodes ADD COLUMN investigation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE nodes ADD COLUMN answer TEXT CHECK (answer IN ('yes', 'no', 'unknown'));
+",
 ];
 
 /// Open the database at `path`, creating and migrating it as needed.

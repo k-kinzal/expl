@@ -16,7 +16,7 @@
 //!
 //! A failed step need not have committed anything (it can fail before its
 //! worktree exists, or while joining its predecessors), so only what it
-//! does record is checked; a completed step must record both its branch
+//! does record is checked; a completed change step must record both its branch
 //! and its head commit.
 
 use std::fmt;
@@ -346,8 +346,10 @@ impl Doctor {
         let (node, status) = (step.id, step.status);
         let completed = status == NodeStatus::Completed;
         let tip = match &step.branch {
+            // An investigation has no branch: its head commit is the code it
+            // was about.
             None => {
-                if completed || step.head_commit.is_some() {
+                if !step.investigation && (completed || step.head_commit.is_some()) {
                     found.push(Inconsistency::UnrecordedBranch { node, status });
                 }
                 None

@@ -1,4 +1,5 @@
-//! `expl candidate ls` — the steps a human chooses from.
+//! `expl candidate ls` — the steps a human chooses from: change steps to
+//! merge, and the findings of investigations that answer a goal.
 
 use std::path::Path;
 
@@ -20,11 +21,22 @@ pub(crate) fn ls(start: &Path, listing: &ListingArgs) -> Result<(), CliError> {
         return Ok(());
     }
     let mut table = Table::new(&[
-        "NODE", "GOAL", "SCORE", "FROM", "ADOPTED", "BRANCH", "TITLE", "REASON",
+        "NODE",
+        "GOAL",
+        "SCORE",
+        "FROM",
+        "ADOPTED",
+        "BRANCH/ANSWER",
+        "TITLE",
+        "REASON",
     ]);
     for candidate in &candidates {
         let node = graph.node(candidate.node)?;
         let branch = node.branch.clone().unwrap_or_default();
+        let shown = match node.answer {
+            Some(answer) => format!("answer: {answer}"),
+            None => branch.clone(),
+        };
         let from = lineage.explored_from(candidate.node);
         let behind = from.and_then(|o| lineage.behind(o)).unwrap_or(0);
         let adopted = lineage.absorbed_by(candidate.node);
@@ -37,6 +49,8 @@ pub(crate) fn ls(start: &Path, listing: &ListingArgs) -> Result<(), CliError> {
                 "behind": behind,
                 "adopted_into": adopted,
                 "branch": branch,
+                "investigation": node.investigation,
+                "answer": node.answer,
                 "head_commit": node.head_commit,
                 "title": node.title,
                 "reason": candidate.reason,
@@ -53,7 +67,7 @@ pub(crate) fn ls(start: &Path, listing: &ListingArgs) -> Result<(), CliError> {
                 (None, _) => "-".to_owned(),
             },
             adopted.map_or_else(|| "-".to_owned(), |o| o.to_string()),
-            branch,
+            shown,
             clip(&node.title, 40),
             clip(&candidate.reason, 60),
         ]);
