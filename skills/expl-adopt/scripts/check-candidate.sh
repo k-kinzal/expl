@@ -4,7 +4,9 @@
 # Usage: skills/expl-adopt/scripts/check-candidate.sh NODE_ID [TRUNK]
 #
 # Checks, in a throwaway worktree so the main checkout is never touched:
-#   1. the branch expl/node-<id> exists;
+#   1. the step's recorded branch exists and still points at the commit it
+#      recorded (what was evaluated) — the branch is read from the node, since
+#      a retried step's branch is expl/node-<id>-<n>, not expl/node-<id>;
 #   2. it adds, modifies, or deletes no Markdown (*.md) file — they are frozen;
 #   3. it merges into the trunk without conflicts;
 #   4. on the merged tree, cargo fmt --check, cargo clippy --all-targets and
@@ -15,10 +17,15 @@ node="${1:?usage: check-candidate.sh NODE_ID [TRUNK]}"
 node="${node#\#}"
 trunk="${2:-main}"
 repo="$(git rev-parse --show-toplevel)"
-branch="expl/node-${node}"
 cd "$repo"
-
+read -r branch head < <(expl node inspect "$node" | python3 -c '
+import json, sys
+n = json.load(sys.stdin)["node"]
+print(n.get("branch") or "-", n.get("head_commit") or "-")')
+[ "$branch" != "-" ] || { echo "#${node} records no branch"; exit 1; }
 git show-ref --verify --quiet "refs/heads/${branch}" || { echo "no branch ${branch}"; exit 1; }
+tip="$(git rev-parse "refs/heads/${branch}")"
+[ "$tip" = "$head" ] || { echo "REJECT: ${branch} is at ${tip}, not the commit #${node} recorded (${head})"; exit 1; }
 
 base="$(git merge-base "$trunk" "$branch")"
 md="$(git diff --name-only "$base" "$branch" -- '*.md' '*.MD')"
