@@ -23,6 +23,10 @@ use std::time::{Duration, Instant};
 /// `@DIR@/finding.json` when present. Prompts are kept in `@DIR@/prompts/`
 /// for inspection. While `@DIR@/fast-revisits` exists, the fake explorer
 /// records the first revisit prompt and immediately returns no proposals.
+/// While `@DIR@/switch` exists, execution first takes its worktree off the
+/// step's branch — to the branch named in it, or a detached HEAD when it
+/// says `detached` — and edits `README.md` there; with `@DIR@/switch-fails`
+/// too, it then exits 1 instead of reporting.
 const AGENT: &str = r#"#!/bin/sh
 if [ "$EXPL_ROLE" = exploration ] && [ "$EXPL_EVENT" = node.revisited ] && [ -f "@DIR@/fast-revisits" ]; then
   prompt="@DIR@/prompts/exploration-revisit.txt"
@@ -75,6 +79,16 @@ execution)
   if [ -f "@DIR@/fail" ]; then
     echo '{"succeeded":false,"summary":"could not compile hello.rs"}'
     exit 0
+  fi
+  if [ -f "@DIR@/switch" ]; then
+    target=$(cat "@DIR@/switch")
+    if [ "$target" = detached ]; then
+      git switch -q --detach
+    else
+      git switch -q --ignore-other-worktrees "$target"
+    fi
+    echo "edited by $EXPL_NODE" > README.md
+    if [ -f "@DIR@/switch-fails" ]; then exit 1; fi
   fi
   echo "node $EXPL_NODE" > "node-$EXPL_NODE.txt"
   if [ -f "@DIR@/shared" ]; then echo "node $EXPL_NODE" > shared.txt; fi
@@ -1343,6 +1357,133 @@ fn a_step_whose_branch_is_the_trunk_fails_and_leaves_the_trunk_alone() {
         tip
     );
     assert_eq!(node(repo, &a)["node"]["status"], "failed");
+}
+
+/// Every ref in `repo`, with what it points at.
+fn refs(repo: &Path) -> String {
+    git(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
+}
+
+/// A step whose agent takes its worktree to `target` (a branch, or
+/// `detached`) fails naming `head`, and moves no ref but the step's own
+/// branch's creation; with `fallback`, the agent fails there and a second
+/// CLI waits, so the restore before it is what must refuse.
+fn a_step_that_leaves_its_branch(target: &str, head: &str, fallback: bool) {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let dir = sandbox.dir.path();
+    git(repo, &["switch", "-q", "-c", "other"]);
+    std::fs::write(repo.join("other.txt"), "other\n").expect("write");
+    git(repo, &["add", "other.txt"]);
+    git(repo, &["commit", "-q", "-m", "Other work"]);
+    git(repo, &["switch", "-q", "main"]);
+    if fallback {
+        let declaration = std::fs::read_to_string(repo.join("expl.toml")).expect("read");
+        std::fs::write(
+            repo.join("expl.toml"),
+            format!(
+                "{declaration}\n[[agent.executor.alternative]]\ndriver = \"generic\"\ncommand = [\"{}\"]\n",
+                dir.join("agent.sh").display()
+            ),
+        )
+        .expect("declaration");
+        sandbox.marker("switch-fails", true);
+    }
+    ok(repo, &["goal", "add", "Say hello"]);
+    let step = ok(repo, &["node", "add", "A", "--priority", "1"]);
+    std::fs::write(dir.join("switch"), target).expect("switch marker");
+
+    let trunk = git(repo, &["rev-parse", "refs/heads/main"]);
+    let refs_before = refs(repo);
+    let status_before = git(repo, &["status", "--porcelain", "--untracked-files=all"]);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+
+    let inspected = node(repo, &step);
+    assert_eq!(inspected["node"]["status"], "failed", "{inspected}");
+    let outcome = inspected["node"]["outcome"].as_str().unwrap_or_default();
+    assert!(
+        outcome.contains(&format!("worktree left its branch `expl/node-{step}`"))
+            && outcome.contains(head),
+        "{outcome}"
+    );
+    let completed = ok(
+        repo,
+        &[
+            "event",
+            "ls",
+            "--kind",
+            "node.completed",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(completed, "", "{completed}");
+    // Every ref is where it was; the step's branch, made for it, holds
+    // nothing of the agent's.
+    let branch = format!("refs/heads/expl/node-{step}");
+    let refs_after = refs(repo);
+    let refs_after: Vec<&str> = refs_after
+        .lines()
+        .filter(|line| !line.starts_with(&format!("{branch} ")))
+        .collect();
+    assert_eq!(refs_after.join("\n"), refs_before, "{target}");
+    assert_eq!(git(repo, &["rev-parse", &branch]), trunk);
+    // The main checkout is untouched.
+    assert_eq!(git(repo, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(
+        git(repo, &["status", "--porcelain", "--untracked-files=all"]),
+        status_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("README.md")).expect("readme"),
+        "hello\n"
+    );
+    if fallback {
+        let log = std::fs::read_dir(repo.join(".expl/logs"))
+            .expect("logs")
+            .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("log"))
+            .collect::<String>();
+        assert!(!log.contains("restored the working directory"), "{log}");
+        assert!(!log.contains("falling over"), "{log}");
+    }
+
+    // An ordinary step still commits on its own branch.
+    std::fs::remove_file(dir.join("switch")).expect("switch marker");
+    let b = ok(repo, &["node", "add", "B", "--priority", "1"]);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    let inspected = node(repo, &b);
+    assert_eq!(inspected["node"]["status"], "completed", "{inspected}");
+    assert_eq!(
+        git(repo, &["show", &format!("expl/node-{b}:node-{b}.txt")]),
+        format!("node {b}")
+    );
+    assert_eq!(git(repo, &["rev-parse", "refs/heads/main"]), trunk);
+}
+
+#[test]
+fn a_step_that_switches_its_worktree_to_the_trunk_fails_and_moves_no_ref() {
+    a_step_that_leaves_its_branch("main", "`refs/heads/main`", false);
+}
+
+#[test]
+fn a_step_that_switches_its_worktree_to_another_branch_fails_and_moves_no_ref() {
+    a_step_that_leaves_its_branch("other", "`refs/heads/other`", false);
+}
+
+#[test]
+fn a_step_that_detaches_its_worktree_fails_and_moves_no_ref() {
+    a_step_that_leaves_its_branch("detached", "is detached", false);
+}
+
+#[test]
+fn the_restore_before_a_fallback_cli_refuses_a_worktree_off_its_branch() {
+    for (target, head) in [
+        ("main", "`refs/heads/main`"),
+        ("other", "`refs/heads/other`"),
+        ("detached", "is detached"),
+    ] {
+        a_step_that_leaves_its_branch(target, head, true);
+    }
 }
 
 #[test]

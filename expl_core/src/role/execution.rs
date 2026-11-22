@@ -351,7 +351,7 @@ fn invoke(
     schema: &serde_json::Value,
 ) -> Result<(bool, String), RoleError> {
     let result: Result<Response, RoleError> =
-        reaction.invoke(graph, Some(id), workspace.path(), prompt, schema);
+        reaction.invoke(graph, Some(id), workspace, prompt, schema);
     match result {
         Ok(response) => Ok((response.succeeded, response.summary)),
         Err(error @ RoleError::Agent(AgentError::Interrupted)) => {
