@@ -95,7 +95,7 @@ impl Trunk {
     #[must_use]
     pub fn new(project: &Project, branch: Option<&str>) -> Self {
         Self {
-            git: Git::new(project.root()),
+            git: Git::in_worktree(project.root()),
             branch: branch.filter(|b| !b.is_empty()).map(str::to_owned),
         }
     }

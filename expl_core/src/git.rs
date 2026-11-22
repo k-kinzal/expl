@@ -5,8 +5,9 @@
 //! [`workspace`](crate::workspace) (worktrees, merges, commits). This module
 //! knows how to talk to git; it does not know what a node is.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use thiserror::Error;
 
@@ -32,13 +33,41 @@ pub enum GitError {
 #[derive(Debug, Clone)]
 pub struct Git {
     dir: PathBuf,
+    discovery: Discovery,
+}
+
+#[derive(Debug, Clone)]
+enum Discovery {
+    Default,
+    Worktree,
+    Below(OsString),
 }
 
 impl Git {
-    /// git operating in `dir`.
+    /// git operating in `dir`, with normal repository discovery.
     #[must_use]
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            discovery: Discovery::Default,
+        }
+    }
+
+    /// git rooted at `dir`, using its `.git` directory or worktree file.
+    #[must_use]
+    pub fn in_worktree(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            discovery: Discovery::Worktree,
+        }
+    }
+
+    /// git discovering a repository below an encoded `GIT_CEILING_DIRECTORIES` path.
+    pub(crate) fn below_ceiling(dir: PathBuf, ceiling: OsString) -> Self {
+        Self {
+            dir,
+            discovery: Discovery::Below(ceiling),
+        }
     }
 
     /// The directory this git runs in.
@@ -47,18 +76,35 @@ impl Git {
         &self.dir
     }
 
+    fn output(&self, args: &[&str]) -> Result<Output, GitError> {
+        let mut command = Command::new("git");
+        match &self.discovery {
+            Discovery::Default => {}
+            Discovery::Worktree => {
+                command.args(["--git-dir=.git", "--work-tree=."]);
+            }
+            Discovery::Below(ceiling) => {
+                command
+                    .env_remove("GIT_DIR")
+                    .env_remove("GIT_WORK_TREE")
+                    .env("GIT_CEILING_DIRECTORIES", ceiling);
+            }
+        }
+        command
+            .args(args)
+            .current_dir(&self.dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(GitError::Spawn)
+    }
+
     /// Run git and return trimmed stdout.
     ///
     /// # Errors
     ///
     /// [`GitError`] when git cannot start or exits non-zero.
     pub fn run(&self, args: &[&str]) -> Result<String, GitError> {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&self.dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map_err(GitError::Spawn)?;
+        let output = self.output(args)?;
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
         } else {
@@ -76,12 +122,7 @@ impl Git {
     ///
     /// [`GitError`] when git cannot start or exits with any other code.
     pub fn test(&self, args: &[&str]) -> Result<bool, GitError> {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&self.dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map_err(GitError::Spawn)?;
+        let output = self.output(args)?;
         match output.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
@@ -258,12 +299,7 @@ impl Git {
             ours,
             theirs,
         ];
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&self.dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map_err(GitError::Spawn)?;
+        let output = self.output(&args)?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         match (output.status.code(), stdout.lines().next()) {
             (Some(0), Some(tree)) if !tree.trim().is_empty() => Ok(Some(tree.trim().to_owned())),

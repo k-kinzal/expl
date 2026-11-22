@@ -12,7 +12,7 @@
 //! the top level of the working tree that contains the start directory.
 //! This matters when expl develops expl — an agent running inside a node's
 //! worktree (itself a git working tree) cannot accidentally reach the
-//! enclosing project's graph.
+//! enclosing project's graph, even if its `.git` file is missing.
 
 use std::path::{Path, PathBuf};
 
@@ -51,6 +51,7 @@ impl Project {
     pub const DECLARATION_FILE: &'static str = "expl.toml";
     /// Name of the state directory at the project root.
     pub const STATE_DIR: &'static str = ".expl";
+    const WORKTREES_DIR: &'static str = "worktrees";
 
     /// A project rooted at `root` (no checks).
     #[must_use]
@@ -63,9 +64,25 @@ impl Project {
     ///
     /// # Errors
     ///
-    /// [`ProjectError::NotARepository`] when `start` is outside git.
+    /// [`ProjectError::NotARepository`] when `start` is outside git;
+    /// [`ProjectError::Io`] when a worktree's discovery ceiling cannot be encoded.
     pub fn for_repository(start: &Path) -> Result<Self, ProjectError> {
-        let root = Git::new(start)
+        let dir = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
+        let worktrees = Path::new(Self::STATE_DIR).join(Self::WORKTREES_DIR);
+        let ceiling = dir
+            .ancestors()
+            .skip(1)
+            .find(|path| path.ends_with(&worktrees));
+        let git = if let Some(ceiling) = ceiling {
+            let ceiling = std::env::join_paths([ceiling]).map_err(|error| ProjectError::Io {
+                context: format!("set git discovery ceiling for {}", start.display()),
+                source: std::io::Error::other(error),
+            })?;
+            Git::below_ceiling(dir, ceiling)
+        } else {
+            Git::new(dir)
+        };
+        let root = git
             .toplevel()
             .map_err(|e| ProjectError::NotARepository(start.display().to_string(), e))?;
         Ok(Self::at(root))
@@ -75,7 +92,8 @@ impl Project {
     ///
     /// # Errors
     ///
-    /// [`ProjectError::NotARepository`] or [`ProjectError::NotInitialized`].
+    /// [`ProjectError::NotARepository`], [`ProjectError::NotInitialized`], or
+    /// [`ProjectError::Io`] when a worktree's discovery ceiling cannot be encoded.
     pub fn discover(start: &Path) -> Result<Self, ProjectError> {
         let project = Self::for_repository(start)?;
         if project.is_initialized() {
@@ -132,7 +150,7 @@ impl Project {
     /// `.expl/worktrees/` — node and scratch worktrees.
     #[must_use]
     pub fn worktrees_dir(&self) -> PathBuf {
-        self.state_dir().join("worktrees")
+        self.state_dir().join(Self::WORKTREES_DIR)
     }
 
     /// `.expl/git.lock` — serialises git operations that touch shared
