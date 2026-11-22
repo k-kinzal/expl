@@ -319,33 +319,6 @@ mod tests {
         Git::new(dir).run(args).expect("git")
     }
 
-    /// A counterexample follower policy: treat trunk positions whose tree
-    /// matches the active origin's as the same position, and skip them.
-    /// Every other move is left to [`Trunk::follow`].
-    struct CoalesceIdenticalTrees<'a>(&'a Trunk);
-
-    impl CoalesceIdenticalTrees<'_> {
-        fn follow(&self, graph: &mut Graph) -> Result<Option<Advance>, TrunkError> {
-            let trunk = self.0;
-            let current = graph.origin()?;
-            let Some(branch) = trunk
-                .branch
-                .clone()
-                .or_else(|| current.branch.clone())
-                .filter(|b| !b.is_empty())
-            else {
-                return Ok(None);
-            };
-            let tree = |rev: &str| trunk.git.run(&["rev-parse", &format!("{rev}^{{tree}}")]);
-            if let Some(previous) = current.head_commit.as_deref()
-                && tree(&format!("refs/heads/{branch}"))? == tree(previous)?
-            {
-                return Ok(None);
-            }
-            trunk.follow(graph)
-        }
-    }
-
     /// A repository on `main` with one commit, an initialised graph, and a
     /// helper that realises a step as a commit on its own branch.
     struct Fixture {
@@ -722,10 +695,9 @@ mod tests {
     }
 
     #[test]
-    fn coalescing_identical_trees_drops_a_trunk_position_and_its_evaluation() {
+    fn an_empty_commit_is_a_new_origin_and_is_evaluated() {
         let mut fx = Fixture::new();
         let trunk = Trunk::new(&fx.project, Some("main"));
-        let coalescing = CoalesceIdenticalTrees(&trunk);
         let kinds = Role::Evaluation.reactions();
         let mut evaluator = Inbox::open(&fx.project.database_path(), "evaluator").expect("inbox");
         while let Some(delivery) = evaluator
@@ -737,47 +709,23 @@ mod tests {
         let before = fx.graph.origin().expect("origin");
         let epochs = fx.graph.lineage().expect("lineage").epochs.len();
 
-        // The owner moves the trunk without changing a file.
+        // The owner moves the trunk without changing a file: a new position
+        // all the same, recorded and judged like any other.
         git(
             &fx.root,
             &["commit", "-q", "--allow-empty", "-m", "empty commit"],
         );
         let tip = git(&fx.root, &["rev-parse", "main"]);
-        assert_ne!(before.head_commit.as_deref(), Some(tip.as_str()));
-        assert_eq!(
-            git(&fx.root, &["rev-parse", "main^{tree}"]),
-            git(&fx.root, &["rev-parse", "main~1^{tree}"]),
-            "same tree, new trunk position"
-        );
-
-        // The policy skips it: the active origin no longer matches the trunk,
-        // the lineage has no entry for the tip, and evaluation hears nothing.
-        assert_eq!(coalescing.follow(&mut fx.graph).expect("coalesce"), None);
-        let lineage = fx.graph.lineage().expect("lineage");
-        assert_eq!(lineage.epochs.len(), epochs, "lineage entry dropped");
-        assert_eq!(lineage.current, Some(before.id));
-        assert_eq!(
-            fx.graph.origin().expect("origin").head_commit,
-            before.head_commit,
-            "the graph lags the trunk"
-        );
-        assert!(
-            evaluator
-                .lease(kinds, ProcessId(1), false, crate::process::MAX_ATTEMPTS)
-                .expect("lease")
-                .is_none(),
-            "origin.advanced delivery dropped"
-        );
-
-        // `Trunk::follow` records the same position and delivers it.
         let advance = trunk.follow(&mut fx.graph).expect("follow").expect("moved");
         assert_eq!(advance.commit, tip);
         assert_eq!(advance.previous, before.id);
         assert!(advance.descends && advance.adopted.is_empty());
         let lineage = fx.graph.lineage().expect("lineage");
         assert_eq!(lineage.epochs.len(), epochs + 1);
-        let epoch = lineage.epoch(advance.origin).expect("epoch");
-        assert_eq!(epoch.previous, Some(before.id));
+        assert_eq!(
+            lineage.epoch(advance.origin).expect("epoch").previous,
+            Some(before.id)
+        );
         assert!(fx.advanced_to(advance.origin));
         let delivery = evaluator
             .lease(kinds, ProcessId(1), false, crate::process::MAX_ATTEMPTS)
@@ -785,14 +733,5 @@ mod tests {
             .expect("origin.advanced delivered to evaluation");
         assert_eq!(delivery.event.kind, EventKind::OriginAdvanced);
         assert_eq!(delivery.event.node, Some(advance.origin));
-
-        // The policy is not merely inert: a tree change still moves it.
-        std::fs::write(fx.root.join("README"), "edited\n").expect("write");
-        git(&fx.root, &["commit", "-q", "-am", "edit readme"]);
-        let moved = coalescing
-            .follow(&mut fx.graph)
-            .expect("coalesce")
-            .expect("moved");
-        assert_eq!(moved.previous, advance.origin);
     }
 }
