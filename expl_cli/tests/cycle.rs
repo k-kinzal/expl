@@ -18,9 +18,16 @@ use std::time::{Duration, Instant};
 /// its worktree, writes `stray.txt` there while `@DIR@/eval-writes` exists
 /// and commits `sneaky.txt` while `@DIR@/eval-commits` exists. An
 /// investigation answers `no` (whether `hello.txt` exists), and its findings
-/// are judged to settle the goal. Every prompt is kept in `@DIR@/prompts/`
-/// for inspection.
+/// are judged to settle the goal. Prompts are kept in `@DIR@/prompts/`
+/// for inspection. While `@DIR@/fast-revisits` exists, the fake explorer
+/// records the first revisit prompt and immediately returns no proposals.
 const AGENT: &str = r#"#!/bin/sh
+if [ "$EXPL_ROLE" = exploration ] && [ "$EXPL_EVENT" = node.revisited ] && [ -f "@DIR@/fast-revisits" ]; then
+  prompt="@DIR@/prompts/exploration-revisit.txt"
+  if [ ! -f "$prompt" ]; then cat > "$prompt"; fi
+  echo '{"nodes":[]}'
+  exit 0
+fi
 mkdir -p "@DIR@/prompts"
 cat > "@DIR@/prompts/$EXPL_ROLE-$$.txt"
 case "$EXPL_ROLE" in
@@ -175,12 +182,28 @@ fn node(repo: &Path, id: &str) -> serde_json::Value {
     json(&ok(repo, &["node", "inspect", id]))
 }
 
-/// Poll `condition` for up to 60 seconds.
-fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(60);
+/// Poll `condition` for up to 120 seconds, scaled by a positive
+/// `EXPL_TEST_TIMEOUT_SCALE` (default 1).
+fn wait_until(repo: &Path, what: &str, mut condition: impl FnMut() -> bool) {
+    const BASE_TIMEOUT: Duration = Duration::from_secs(120);
+    let timeout = std::env::var("EXPL_TEST_TIMEOUT_SCALE")
+        .ok()
+        .and_then(|scale| scale.parse::<f64>().ok())
+        .and_then(|scale| Duration::try_from_secs_f64(BASE_TIMEOUT.as_secs_f64() * scale).ok())
+        .filter(|timeout| !timeout.is_zero())
+        .unwrap_or(BASE_TIMEOUT);
+    let start = Instant::now();
     while !condition() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(200));
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            let events = expl(repo, &["event", "ls"]);
+            panic!(
+                "timed out after {elapsed:.2?} waiting for {what}\nRecent events:\n{}{}",
+                String::from_utf8_lossy(&events.stdout),
+                String::from_utf8_lossy(&events.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200).min(timeout.saturating_sub(elapsed)));
     }
 }
 
@@ -670,7 +693,7 @@ fn planning_settles_only_the_proposals_it_was_shown() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("planner");
-    wait_until("the planner's agent to start", || {
+    wait_until(repo, "the planner's agent to start", || {
         planning_prompts()
             .first()
             .is_some_and(|p| p.contains("## Response"))
@@ -777,7 +800,7 @@ fn an_invalid_plan_falls_over_to_the_alternative_cli() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("planner");
-    wait_until("the valid planner to start", valid_started);
+    wait_until(repo, "the valid planner to start", valid_started);
     let later = ok(repo, &["node", "add", "Later", "--before", &goal]);
     std::fs::write(
         dir.join("plan.json"),
@@ -847,7 +870,7 @@ fn up_runs_every_agent_until_down() {
 
     // Adding a goal is all it takes: the running processes react.
     ok(repo, &["goal", "add", "Say hello"]);
-    wait_until("a candidate", || {
+    wait_until(repo, "a candidate", || {
         ok(repo, &["candidate", "ls", "-q"]) == "3"
     });
 
@@ -936,7 +959,7 @@ fn an_abandoned_start_gives_its_replica_slot_back() {
     assert_eq!(record["exit_reason"], reason.as_str(), "{record}");
 
     // Nor can a second child adopt a record that is already running.
-    wait_until("both replicas to run", || {
+    wait_until(repo, "both replicas to run", || {
         executors().iter().all(|p| p["state"] == "running")
     });
     let running = executors()[0]["id"].to_string();
@@ -955,7 +978,7 @@ fn stopping_mid_execution_gives_the_event_back() {
     let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
     sandbox.slow(true);
     let name = ok(repo, &["run", "executor", "-d"]);
-    wait_until("the step to start", || {
+    wait_until(repo, "the step to start", || {
         node(repo, &a)["node"]["status"] == "running"
     });
 
@@ -1017,7 +1040,7 @@ fn losing_the_lease_interrupts_the_reaction() {
     let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
     sandbox.slow(true);
     let name = ok(repo, &["run", "executor", "-d"]);
-    wait_until("the step to start", || {
+    wait_until(repo, "the step to start", || {
         node(repo, &a)["node"]["status"] == "running"
     });
 
@@ -1036,7 +1059,7 @@ fn losing_the_lease_interrupts_the_reaction() {
         .expect("take over");
     assert_eq!(taken, 1);
 
-    wait_until("the loss to be reported", || {
+    wait_until(repo, "the loss to be reported", || {
         ok(repo, &["logs", &name]).contains("lost the lease")
     });
     let step = node(repo, &a);
@@ -1216,9 +1239,13 @@ fn idle_exploration_revisits_random_starting_points() {
 
     // A long-running one keeps exploring from random starting points (the
     // origin, or the counter-exploration goal), the same ones again and
-    // again, and tells the agent what already exists there.
+    // again, and tells the agent what already exists there. The fake agent
+    // answers revisits immediately so the wait measures event production.
+    sandbox.marker("fast-revisits", true);
     ok(repo, &["run", "explorer", "-d"]);
-    wait_until("several revisits", || revisits(repo).len() >= 4);
+    wait_until(repo, "four node.revisited events", || {
+        revisits(repo).len() >= 4
+    });
     ok(repo, &["down", "--time", "5"]);
     let nodes: std::collections::BTreeSet<i64> = revisits(repo)
         .iter()
@@ -1228,12 +1255,13 @@ fn idle_exploration_revisits_random_starting_points() {
         !nodes.is_empty() && nodes.iter().all(|n| [1, 2].contains(n)),
         "revisited {nodes:?}"
     );
-    let prompts = sandbox.dir.path().join("prompts");
-    let told = std::fs::read_dir(&prompts)
-        .expect("prompts")
-        .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("prompt"))
-        .any(|text| text.contains("## Already proposed") && text.contains("- Write hello"));
-    assert!(told, "no exploration prompt listed the existing steps");
+    let prompt =
+        std::fs::read_to_string(sandbox.dir.path().join("prompts/exploration-revisit.txt"))
+            .expect("revisit prompt");
+    assert!(
+        prompt.contains("## Already proposed") && prompt.contains("- Write hello"),
+        "the revisit prompt did not list the existing steps"
+    );
 }
 
 #[test]
@@ -1355,12 +1383,12 @@ fn weighted_assignments_hold_across_declarations_and_restarts() {
     favor("explorer");
     let explorer = ok(repo, &["run", "explorer", "-d"]);
     let running = |name: &str| json(&ok(repo, &["process", "inspect", name]))["state"] == "running";
-    wait_until("the explorer to start", || running(&explorer));
+    wait_until(repo, "the explorer to start", || running(&explorer));
     favor("contrarian");
     let contrarian = ok(repo, &["run", "contrarian", "-d"]);
-    wait_until("the contrarian to start", || running(&contrarian));
+    wait_until(repo, "the contrarian to start", || running(&contrarian));
     add_goals("Overlap");
-    wait_until("both agents to settle every goal", || {
+    wait_until(repo, "both agents to settle every goal", || {
         settled("explorer", 4) && settled("contrarian", 4)
     });
     ok(repo, &["down", "--time", "5"]);
@@ -1609,7 +1637,7 @@ fn speculative_exploration_grows_past_steps_not_carried_out() {
             .map(|n| node(repo, &n["id"].to_string()))
             .find(|n| n["predecessors"] == serde_json::json!([open_id]))
     };
-    wait_until("an exploration ahead of the open step", || {
+    wait_until(repo, "an exploration ahead of the open step", || {
         ahead().is_some()
     });
     ok(repo, &["down", "--time", "5"]);
