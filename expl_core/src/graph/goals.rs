@@ -171,6 +171,7 @@ mod tests {
             counter_exploration: false,
             investigation: false,
             answer: None,
+            derived_from: None,
             branch: None,
             head_commit: None,
             outcome: None,

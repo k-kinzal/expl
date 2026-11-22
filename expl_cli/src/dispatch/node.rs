@@ -103,6 +103,7 @@ fn describe(graph: &Graph, id: expl_core::NodeId) -> Result<serde_json::Value, C
         "node": node,
         "predecessors": ids(graph.predecessors(id)?),
         "successors": ids(graph.successors(id)?),
+        "grown_from_failure": ids(graph.derived_from(id)?),
         "explored_from": lineage.explored_from(id),
         "adopted_into": lineage.absorbed_by(id),
         "evaluations": graph.evaluations_of(id)?,
@@ -123,6 +124,7 @@ fn add(start: &Path, args: &NodeAddArgs) -> Result<(), CliError> {
         &objective,
         &after,
         &args.before,
+        args.derived_from,
     )?;
     if let Some(priority) = args.priority {
         graph.plan_step(id, priority)?;

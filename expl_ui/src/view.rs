@@ -17,7 +17,8 @@
 //!   has moved past fade, unless they are still candidates.
 //! - **Edges are hairlines.** Edges into goals are drawn only once a step
 //!   satisfies the goal (or the step is selected), so the picture shows
-//!   reached goals rather than intentions.
+//!   reached goals rather than intentions. A faint red line joins a failed
+//!   step to each new hypothesis grown from its failure.
 //! - **Goals** are listed top right, with where the trunk stands on each
 //!   and the best candidate not adopted yet, subgoals indented under the
 //!   goals they serve (and joined to them by a faint line in the graph).
@@ -444,6 +445,32 @@ impl ExplView {
                 comet: target.status == NodeStatus::Running,
             });
         }
+        // A new hypothesis and the failure it was grown from: not an edge
+        // (the failure is not built on), so a faint line in the failure's
+        // colour.
+        for derived in &self.snapshot.nodes {
+            let Some(failed) = derived.derived_from.and_then(|id| by_id.get(&id)) else {
+                continue;
+            };
+            let (Some(from), Some(to)) = (
+                self.centre(failed.id, viewport),
+                self.centre(derived.id, viewport),
+            ) else {
+                continue;
+            };
+            let selected = lens.selected == Some(failed.id) || lens.selected == Some(derived.id);
+            let mut color = theme::alpha(theme::failure(), if selected { 0.6 } else { 0.22 });
+            if !(lens.in_focus(failed.id) && lens.in_focus(derived.id)) {
+                color = color.opacity(OUT_OF_FOCUS);
+            }
+            lines.push(Line {
+                from: from + point(px(radius(failed) + 4.0), px(0.0)),
+                to: to - point(px(radius(derived) + 4.0), px(0.0)),
+                color,
+                width: 1.0,
+                comet: false,
+            });
+        }
         lines
     }
 
@@ -733,6 +760,19 @@ impl ExplView {
                 });
                 if let Some(worker) = worker {
                     header.push(worker);
+                }
+                if let Some(failed) = node.derived_from {
+                    header.push(format!("grown from the failure of {failed}"));
+                }
+                let grown: Vec<String> = self
+                    .snapshot
+                    .nodes
+                    .iter()
+                    .filter(|n| n.derived_from == Some(node.id))
+                    .map(|n| n.id.to_string())
+                    .collect();
+                if !grown.is_empty() {
+                    header.push(format!("grew {}", grown.join(" ")));
                 }
                 context = match (lineage.absorbed_by(node.id), lineage.explored_from(node.id)) {
                     (Some(origin), _) => Some(format!("in the trunk since {origin}")),

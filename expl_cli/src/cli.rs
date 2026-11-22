@@ -254,6 +254,10 @@ pub(crate) struct NodeAddArgs {
     /// nothing, rather than a change committed on its own branch.
     #[arg(long)]
     pub(crate) investigation: bool,
+    /// The failed step this one is a new hypothesis grown from (recorded
+    /// on the node; not an edge, since the failed step is not built on).
+    #[arg(long, value_parser = parse_node)]
+    pub(crate) derived_from: Option<NodeId>,
 }
 
 /// A command targeting one node.

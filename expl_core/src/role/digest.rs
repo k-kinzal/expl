@@ -172,6 +172,9 @@ pub(crate) fn graph(snapshot: &Snapshot) -> String {
                 ids(before.get(&node.id))
             );
         }
+        if let Some(failed) = node.derived_from {
+            let _ = writeln!(out, "    grown from the failure of: {failed}");
+        }
         if let Some(answer) = node.answer {
             let _ = writeln!(out, "    finding: {answer}");
         }

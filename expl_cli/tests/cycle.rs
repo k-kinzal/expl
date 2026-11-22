@@ -1430,12 +1430,21 @@ fn a_failed_step_grows_new_hypotheses_in_its_place() {
         .iter()
         .find(|n| n["title"] == "Write hello in smaller steps")
         .unwrap_or_else(|| panic!("no hypothesis past the failure: {steps:?}"));
-    let derived = node(repo, &derived["id"].to_string());
+    let derived_id = derived["id"].clone();
+    let derived = node(repo, &derived_id.to_string());
     assert_eq!(derived["predecessors"], serde_json::json!([1]));
     assert_eq!(derived["successors"], serde_json::json!([2]));
+    // It records the failure it was grown from — not as an edge, since the
+    // failed step is not built on — and the failed step lists what grew.
+    assert_eq!(derived["node"]["derived_from"], 3, "{derived}");
+    let failed = node(repo, "3");
+    assert_eq!(
+        failed["grown_from_failure"],
+        serde_json::json!([derived_id]),
+        "{failed}"
+    );
     // The exploration is journaled on the failed step, and was told what
     // went wrong.
-    let failed = node(repo, "3");
     assert!(
         failed["agent_runs"]
             .as_array()
@@ -1450,6 +1459,39 @@ fn a_failed_step_grows_new_hypotheses_in_its_place() {
         .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("prompt"))
         .any(|text| text.contains("## Failed step") && text.contains("could not compile hello.rs"));
     assert!(told, "no exploration prompt described the failure");
+
+    // A human can grow one too, from the CLI.
+    let by_hand = ok(
+        repo,
+        &["node", "add", "Write hello by hand", "--derived-from", "3"],
+    );
+    assert_eq!(node(repo, by_hand.trim())["node"]["derived_from"], 3);
+    let from_goal = expl(
+        repo,
+        &["node", "add", "Not from a step", "--derived-from", "2"],
+    );
+    assert!(!from_goal.status.success(), "grown from a goal");
+
+    // Failing again, the next exploration is told what already grew from
+    // this failure, so it looks for other causes.
+    ok(repo, &["node", "retry", "3"]);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    assert_eq!(node(repo, "3")["node"]["status"], "failed");
+    std::fs::remove_dir_all(&prompts).expect("clear prompts");
+    ok(repo, &["run", "explorer", "--exit-when-idle"]);
+    let told = std::fs::read_dir(&prompts)
+        .expect("prompts")
+        .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("prompt"))
+        .find(|text| text.contains("## Failed step"))
+        .expect("an exploration past the second failure");
+    let grown = told
+        .split("## Hypotheses already grown from this failure")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no hypotheses listed: {told}"));
+    assert!(
+        grown.contains("Write hello in smaller steps") && grown.contains("Write hello by hand"),
+        "{grown}"
+    );
 }
 
 #[test]

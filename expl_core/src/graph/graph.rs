@@ -17,7 +17,7 @@ use crate::store::{self, NOW};
 
 const NODE_COLUMNS: &str = "id, kind, status, title, objective, priority, counter_exploration, \
                             branch, head_commit, outcome, created_at, updated_at, investigation, \
-                            answer";
+                            answer, derived_from";
 const EVALUATION_COLUMNS: &str = "id, node_id, goal_id, satisfied, score, reason, created_at";
 /// SQL condition on a predecessor `p`: it has no commit to build on yet.
 /// Every origin, current or superseded, is realised.
@@ -62,6 +62,7 @@ fn node_from_row(row: &Row<'_>) -> rusqlite::Result<Node> {
         updated_at: row.get(11)?,
         investigation: row.get(12)?,
         answer: row.get::<_, Option<String>>(13)?.map(decode).transpose()?,
+        derived_from: row.get::<_, Option<i64>>(14)?.map(NodeId),
     })
 }
 
@@ -453,7 +454,7 @@ impl Graph {
         after: &[NodeId],
         before: &[NodeId],
     ) -> Result<NodeId, GraphError> {
-        self.propose(false, title, objective, after, before)
+        self.propose(false, title, objective, after, before, None)
     }
 
     /// Propose an investigation step: a question to answer about the code or
@@ -469,14 +470,17 @@ impl Graph {
         after: &[NodeId],
         before: &[NodeId],
     ) -> Result<NodeId, GraphError> {
-        self.propose(true, title, objective, after, before)
+        self.propose(true, title, objective, after, before, None)
     }
 
     /// Propose a change step or, with `investigation`, an investigation.
+    /// `derived_from` is the failed step it is a new hypothesis grown from,
+    /// if any ([`Node::derived_from`]).
     ///
     /// # Errors
     ///
-    /// As [`propose_step`](Self::propose_step).
+    /// As [`propose_step`](Self::propose_step); also
+    /// [`GraphError::NotInStatus`] when `derived_from` is not a step.
     pub fn propose(
         &mut self,
         investigation: bool,
@@ -484,7 +488,16 @@ impl Graph {
         objective: &str,
         after: &[NodeId],
         before: &[NodeId],
+        derived_from: Option<NodeId>,
     ) -> Result<NodeId, GraphError> {
+        if let Some(failed) = derived_from
+            && self.node(failed)?.kind != NodeKind::Step
+        {
+            return Err(GraphError::NotInStatus {
+                node: failed,
+                expected: "a step to derive a new hypothesis from",
+            });
+        }
         let tx = self.write()?;
         let id = Self::insert_node(
             &tx,
@@ -496,6 +509,12 @@ impl Graph {
         )?;
         if investigation {
             tx.execute("UPDATE nodes SET investigation = 1 WHERE id = ?1", [id.0])?;
+        }
+        if let Some(failed) = derived_from {
+            tx.execute(
+                "UPDATE nodes SET derived_from = ?2 WHERE id = ?1",
+                [id.0, failed.0],
+            )?;
         }
         for source in after {
             connect_in(&tx, *source, id)?;
@@ -1154,6 +1173,16 @@ impl Graph {
             "id IN (SELECT source_id FROM edges WHERE target_id = ?1)",
             id,
         )
+    }
+
+    /// The steps proposed as new hypotheses grown from the failed step
+    /// `id` ([`Node::derived_from`]).
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError`] on SQLite failure.
+    pub fn derived_from(&self, id: NodeId) -> Result<Vec<Node>, GraphError> {
+        nodes_where(&self.conn, "derived_from = ?1", id)
     }
 
     /// Direct successors of `id`.

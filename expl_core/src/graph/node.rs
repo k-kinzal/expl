@@ -157,6 +157,10 @@ pub struct Node {
     /// Completed investigations: the answer found (its evidence is the
     /// `outcome`).
     pub answer: Option<Answer>,
+    /// Steps only: the failed step this one was proposed in place of, when
+    /// it is a new hypothesis grown from that failure. Not an edge — the
+    /// failed step is not built on.
+    pub derived_from: Option<NodeId>,
     /// Git branch holding this node's work (origin and change steps).
     pub branch: Option<String>,
     /// Commit at the tip of the branch once executed (origin: base commit;

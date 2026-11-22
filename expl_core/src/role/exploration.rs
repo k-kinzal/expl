@@ -485,7 +485,8 @@ fn realised_base(lineage: &Lineage, origin: &Node, nodes: &[&Node]) -> Vec<NodeI
     base
 }
 
-/// Add one proposal to the graph, noting it in `report`.
+/// Add one proposal to the graph, noting it in `report`. A proposal of an
+/// exploration past a failure records the failed step it was grown from.
 fn record(
     graph: &mut Graph,
     report: &mut ExplorationReport,
@@ -496,7 +497,15 @@ fn record(
     before: &[NodeId],
 ) {
     let investigation = kind == StepKind::Investigation;
-    match graph.propose(investigation, title.trim(), objective.trim(), after, before) {
+    let derived_from = (report.direction == Direction::Failure).then_some(report.from);
+    match graph.propose(
+        investigation,
+        title.trim(),
+        objective.trim(),
+        after,
+        before,
+        derived_from,
+    ) {
         Ok(id) => report.proposed.push(id),
         Err(error) => report.rejected.push(Rejection {
             title: title.to_owned(),
@@ -671,6 +680,19 @@ fn explore_failure(
              `git log` / `git diff` against it)."
         );
     }
+    let mut grown = String::new();
+    for step in graph.derived_from(failed.id)? {
+        let _ = writeln!(grown, "- {}", digest::headline(&step));
+        if let Some(outcome) = &step.outcome {
+            let _ = writeln!(grown, "  Outcome: {}", digest::excerpt(outcome));
+        }
+    }
+    if !grown.is_empty() {
+        grown = format!(
+            "## Hypotheses already grown from this failure\n\n{grown}\nPropose others: \
+             different causes, different ways around them.\n\n"
+        );
+    }
     let task = format!(
         "## Task\n\n\
          A step toward the goal{s} below was attempted and could not be carried out. A failure \
@@ -682,6 +704,7 @@ fn explore_failure(
          working directory holds that starting point; read it to ground your proposals. Do not \
          modify files.\n\n\
          ## Failed step\n\n{attempt}\n\
+         {grown}\
          ## Goal{s}\n\n{goals}",
         s = if aim.goals.len() == 1 { "" } else { "s" },
         goals = aim.describe(graph)?,

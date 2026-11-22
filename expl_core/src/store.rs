@@ -186,6 +186,12 @@ CREATE TABLE assignments (
 ALTER TABLE nodes ADD COLUMN investigation INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE nodes ADD COLUMN answer TEXT CHECK (answer IN ('yes', 'no', 'unknown'));
 ",
+    r"
+-- A step proposed as a new hypothesis grown from a failed step records that
+-- step, so the graph shows which failure each alternative came from. It is
+-- not an edge: the failed step is not built on.
+ALTER TABLE nodes ADD COLUMN derived_from INTEGER REFERENCES nodes (id);
+",
 ];
 
 /// Open the database at `path`, creating and migrating it as needed.
