@@ -264,7 +264,12 @@ impl<'a> Process<'a> {
                     }
                 }
             }
-            give_up_abandoned(role, &inbox, &mut graph, observer)?;
+            let weighted = self
+                .context
+                .declaration()
+                .shares_with(self.agent.name(), self.agent.name());
+            let owner = weighted.then(|| self.agent.name());
+            give_up_abandoned(role, owner, &inbox, &mut graph, observer)?;
             let Some(delivery) =
                 inbox.lease(role.reactions(), self.id, role.is_exclusive(), MAX_ATTEMPTS)?
             else {
@@ -425,9 +430,13 @@ impl<'a> Process<'a> {
 }
 
 /// Give up every delivery of `role` whose holder died on its last attempt,
-/// failing first what its reaction left `running`.
+/// failing first what its reaction left `running`. An agent sharing its role
+/// by weight (`weighted_as`, its name) fails only what it was assigned: an
+/// event assigned to another agent is that agent's to carry out, whatever
+/// became of this agent's delivery of it.
 fn give_up_abandoned(
     role: Role,
+    weighted_as: Option<&str>,
     inbox: &Inbox,
     graph: &mut Graph,
     observer: &dyn ProcessObserver,
@@ -437,7 +446,15 @@ fn give_up_abandoned(
             "abandoned: the process reacting to {} died on attempt {} of {MAX_ATTEMPTS}",
             delivery.event, delivery.attempts
         );
-        let failed = role.abandon(&delivery.event, graph, &why)?;
+        let ours = match weighted_as {
+            None => true,
+            Some(agent) => inbox.assignment(role, delivery.event.id)?.as_deref() == Some(agent),
+        };
+        let failed = if ours {
+            role.abandon(&delivery.event, graph, &why)?
+        } else {
+            None
+        };
         if inbox.give_up_abandoned(&delivery)? {
             observer.observe(&ProcessActivity::Abandoned {
                 delivery: &delivery,
@@ -532,7 +549,7 @@ mod tests {
                 )
                 .expect("expire");
             let recorder = Recorder::default();
-            give_up_abandoned(role, &inbox, &mut graph, &recorder).expect("give up");
+            give_up_abandoned(role, None, &inbox, &mut graph, &recorder).expect("give up");
             let abandoned = recorder.0.into_inner().expect("lock");
             if attempt < MAX_ATTEMPTS {
                 assert!(abandoned.is_empty(), "attempts are left");
@@ -558,6 +575,47 @@ mod tests {
                 .is_none(),
             "neither the given-up event nor anything else is delivered"
         );
+    }
+
+    #[test]
+    fn a_routed_away_delivery_abandoned_leaves_the_owners_step_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("expl.db");
+        let mut graph = Graph::open(&db).expect("graph");
+        let origin = graph
+            .create_origin("o", Some("main"), "abc")
+            .expect("origin");
+        let goal = graph.add_goal("g", "g", false, &[]).expect("goal");
+        let step = graph
+            .propose_step("s", "s", &[origin], &[goal])
+            .expect("step");
+        graph.plan_step(step, 1).expect("plan"); // node.ready
+        let role = Role::Execution;
+        // The owner, `fast`, is carrying the step out.
+        assert!(graph.claim(step, false).expect("claim"));
+        let mut slow = Inbox::open(&db, "slow").expect("inbox");
+        for attempt in 1..=MAX_ATTEMPTS {
+            let delivery = slow
+                .lease(role.reactions(), ProcessId(attempt), false, MAX_ATTEMPTS)
+                .expect("lease")
+                .expect("node.ready");
+            slow.assign(role, delivery.event.id, "fast")
+                .expect("assign");
+            // `slow`'s holders keep dying before acknowledging it as routed.
+            store::open(&db)
+                .expect("db")
+                .execute(
+                    &format!("UPDATE deliveries SET leased_until = {EPOCH} - 1"),
+                    [],
+                )
+                .expect("expire");
+        }
+        let recorder = Recorder::default();
+        give_up_abandoned(role, Some("slow"), &slow, &mut graph, &recorder).expect("give up");
+        let abandoned = recorder.0.into_inner().expect("lock");
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].1, None, "nothing of `fast`'s was failed");
+        assert_eq!(graph.node(step).expect("step").status, NodeStatus::Running);
     }
 
     #[test]
