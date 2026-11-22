@@ -11,7 +11,7 @@ use crate::agent::Agent;
 use crate::event::{Delivery, Inbox, InboxError};
 use crate::graph::{Graph, GraphError, NodeId};
 use crate::process::{HEARTBEAT_SECONDS, Interrupt, ProcessId, ProcessRecord, Processes};
-use crate::role::{Context, Reaction, Report, Role, RoleError};
+use crate::role::{Abandonment, Context, Reaction, Report, Role, RoleError};
 use crate::store::StoreError;
 use crate::trunk::{Advance, Trunk};
 
@@ -400,24 +400,41 @@ impl<'a> Process<'a> {
                     }
                     thread::sleep(POLL * 4);
                 }
+                // The step was settled elsewhere meanwhile: there is
+                // nothing left to do, and retrying would change nothing.
+                Err(RoleError::Graph(error))
+                    if delivery.event.node.is_some_and(|id| error.is_settled(id)) =>
+                {
+                    if !acknowledge_settled(&inbox, &delivery, observer)? {
+                        lost();
+                    }
+                }
                 // Any other failure, a graph error included (often a race
-                // with another process, such as a step it just settled), is
-                // counted and retried; the last attempt fails the step.
+                // with another process), is counted and retried; the last
+                // attempt fails the step.
                 Err(error) => {
                     let why = error.to_string();
                     // The last attempt: clean up before the delivery is
                     // settled, so dying in between leaves it to be retried
                     // or abandoned rather than lost.
-                    if delivery.attempts >= MAX_ATTEMPTS {
-                        role.abandon(&delivery, &mut graph, &why)?;
-                    }
-                    match holding(inbox.fail(&delivery, &why, MAX_ATTEMPTS))? {
-                        Some(retry) => observer.observe(&ProcessActivity::Failed {
-                            delivery: &delivery,
-                            error: &error,
-                            retry,
-                        }),
-                        None => lost(),
+                    let abandoned = if delivery.attempts >= MAX_ATTEMPTS {
+                        role.abandon(&delivery, &mut graph, &why)?
+                    } else {
+                        Abandonment::Nothing
+                    };
+                    if let Abandonment::Settled(_) = abandoned {
+                        if !acknowledge_settled(&inbox, &delivery, observer)? {
+                            lost();
+                        }
+                    } else {
+                        match holding(inbox.fail(&delivery, &why, MAX_ATTEMPTS))? {
+                            Some(retry) => observer.observe(&ProcessActivity::Failed {
+                                delivery: &delivery,
+                                error: &error,
+                                retry,
+                            }),
+                            None => lost(),
+                        }
                     }
                 }
             }
@@ -431,10 +448,12 @@ impl<'a> Process<'a> {
 }
 
 /// Give up every delivery of `role` whose holder died on its last attempt,
-/// failing first what its reaction left `running`. An agent sharing its role
-/// by weight (`weighted_as`, its name) fails only what it was assigned: an
-/// event assigned to another agent is that agent's to carry out, whatever
-/// became of this agent's delivery of it.
+/// failing first what its reaction left `running`. A delivery whose step was
+/// settled elsewhere meanwhile is acknowledged as ignored instead: nothing
+/// of it was left hanging. An agent sharing its role by weight
+/// (`weighted_as`, its name) fails only what it was assigned: an event
+/// assigned to another agent is that agent's to carry out, whatever became
+/// of this agent's delivery of it.
 fn give_up_abandoned(
     role: Role,
     weighted_as: Option<&str>,
@@ -451,19 +470,49 @@ fn give_up_abandoned(
             None => true,
             Some(agent) => inbox.assignment(role, delivery.event.id)?.as_deref() == Some(agent),
         };
-        let failed = if ours {
+        let abandoned = if ours {
             role.abandon(&delivery, graph, &why)?
         } else {
-            None
+            Abandonment::Nothing
         };
+        if let Abandonment::Settled(_) = abandoned
+            && acknowledge_settled(inbox, &delivery, observer)?
+        {
+            continue;
+        }
         if inbox.give_up_abandoned(&delivery)? {
             observer.observe(&ProcessActivity::Abandoned {
                 delivery: &delivery,
-                failed,
+                failed: abandoned.failed(),
             });
         }
     }
     Ok(())
+}
+
+/// Acknowledge `delivery` with an [ignored](Report::Ignored) report: its
+/// step was settled elsewhere, so no reaction is left to make. `false` when
+/// the delivery's lease is no longer held.
+fn acknowledge_settled(
+    inbox: &Inbox,
+    delivery: &Delivery,
+    observer: &dyn ProcessObserver,
+) -> Result<bool, ProcessError> {
+    let step = delivery
+        .event
+        .node
+        .map_or_else(|| "its step".to_owned(), |id| id.to_string());
+    let report = Report::Ignored {
+        reason: format!("{step} was settled elsewhere"),
+    };
+    if holding(inbox.ack(delivery, Some(&report.summary())))?.is_none() {
+        return Ok(false);
+    }
+    observer.observe(&ProcessActivity::Reacted {
+        delivery,
+        report: &report,
+    });
+    Ok(true)
 }
 
 /// Record `node.revisited` for a random starting point (steps not carried
@@ -496,7 +545,7 @@ fn random_below(bound: usize) -> usize {
 mod tests {
     use super::*;
     use crate::event::{EventId, EventKind};
-    use crate::graph::NodeStatus;
+    use crate::graph::{Answer, NodeStatus};
     use crate::store::{self, EPOCH};
 
     /// Remembers which deliveries were abandoned.
@@ -576,6 +625,81 @@ mod tests {
                 .is_none(),
             "neither the given-up event nor anything else is delivered"
         );
+    }
+
+    /// Remembers the deliveries acknowledged, with their reports, and the
+    /// ones abandoned (with no report).
+    #[derive(Default)]
+    struct Acks(Mutex<Vec<(EventId, Option<String>)>>);
+
+    impl ProcessObserver for Acks {
+        fn observe(&self, activity: &ProcessActivity<'_>) {
+            let seen = if let ProcessActivity::Reacted { delivery, report } = activity {
+                (delivery.event.id, Some(report.summary()))
+            } else if let ProcessActivity::Abandoned { delivery, .. } = activity {
+                (delivery.event.id, None)
+            } else {
+                return;
+            };
+            self.0.lock().expect("lock").push(seen);
+        }
+    }
+
+    #[test]
+    fn an_abandoned_delivery_whose_step_was_settled_is_acknowledged_as_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("expl.db");
+        let mut graph = Graph::open(&db).expect("graph");
+        let origin = graph
+            .create_origin("o", Some("main"), "abc")
+            .expect("origin");
+        let goal = graph.add_goal("g", "g", false, &[]).expect("goal");
+        let question = graph
+            .propose_investigation("q", "is it so?", &[origin], &[goal])
+            .expect("investigation");
+        graph.plan_step(question, 1).expect("plan"); // node.ready
+        let role = Role::Execution;
+        let mut inbox = Inbox::open(&db, "executor").expect("inbox");
+        let mut last = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let delivery = inbox
+                .lease(role.reactions(), ProcessId(attempt), false, MAX_ATTEMPTS)
+                .expect("lease")
+                .expect("node.ready");
+            if attempt == MAX_ATTEMPTS {
+                // The last holder records its finding, then dies before
+                // acknowledging the event.
+                assert!(graph.claim(question, &delivery.token).expect("claim"));
+                graph
+                    .record_finding(question, &delivery.token, "abc", Answer::Yes, "seen it")
+                    .expect("finding");
+            }
+            store::open(&db)
+                .expect("db")
+                .execute(
+                    &format!("UPDATE deliveries SET leased_until = {EPOCH} - 1"),
+                    [],
+                )
+                .expect("expire");
+            last = Some(delivery);
+        }
+        let last = last.expect("leased");
+        let answered = graph.node(question).expect("node");
+        let before = graph.last_event().expect("last");
+
+        let acks = Acks::default();
+        give_up_abandoned(role, None, &inbox, &mut graph, &acks).expect("give up");
+        let seen = acks.0.into_inner().expect("lock");
+        assert_eq!(seen.len(), 1, "acknowledged once, nothing given up");
+        assert_eq!(seen[0].0, last.event.id);
+        let report = seen[0].1.as_deref().expect("acknowledged, not given up");
+        assert!(report.starts_with("ignored: "), "{report}");
+        assert_eq!(
+            inbox.status_of(last.event.id).expect("status"),
+            Some("done".into())
+        );
+        assert_eq!(graph.node(question).expect("node"), answered);
+        assert_eq!(graph.last_event().expect("last"), before, "no node.failed");
     }
 
     #[test]

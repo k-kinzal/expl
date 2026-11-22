@@ -44,7 +44,7 @@ use crate::graph::{
     NodeStatus,
 };
 use crate::prompt::Prompt;
-use crate::role::{Reaction, Report, RoleError};
+use crate::role::{Abandonment, Reaction, Report, RoleError};
 use crate::trunk::Trunk;
 use crate::workspace::{Workspace, WorkspaceError};
 
@@ -123,12 +123,27 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
             blocking.id, blocking.status
         )));
     }
-    let token = reaction.token();
-    if !graph.claim(id, token)? {
+    if !graph.claim(id, reaction.token())? {
         return Ok(Reaction::ignore(format!(
             "{id} was claimed by another process, or gained a predecessor that is not completed"
         )));
     }
+    // A step settled elsewhere meanwhile (#1775) refused this attempt's
+    // settlement and kept what it holds: there is nothing left to do, so
+    // the event is acknowledged, not retried.
+    match realise(reaction, graph, &node) {
+        Err(RoleError::Graph(error)) if error.is_settled(id) => Ok(Reaction::ignore(format!(
+            "{id} was settled elsewhere: {error}"
+        ))),
+        result => result,
+    }
+}
+
+/// Realise the step `node` this reaction has just claimed: investigate it,
+/// or carry its change out on a branch of its own.
+fn realise(reaction: &Reaction<'_>, graph: &mut Graph, node: &Node) -> Result<Report, RoleError> {
+    let id = node.id;
+    let token = reaction.token();
     // Read after the claim: a claimed step can no longer be joined, so these
     // are the predecessors its branch starts from.
     let mut predecessors = graph.predecessors(id)?;
@@ -137,7 +152,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     }
     let continued = continuations(graph, id)?;
     if node.investigation {
-        return investigate(reaction, graph, &node, &predecessors, &continued);
+        return investigate(reaction, graph, node, &predecessors, &continued);
     }
 
     // Each attempt gets its own path and a fresh branch, and touches no
@@ -162,7 +177,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
             left.head_commit = Some(commit);
             let mut start = vec![left];
             start.extend(predecessors.iter().cloned());
-            match workspaces.create(&node, token, &start, &trunk) {
+            match workspaces.create(node, token, &start, &trunk) {
                 Ok(workspace) => Some(workspace),
                 Err(WorkspaceError::AttemptExists(_)) => None,
                 Err(_) => {
@@ -176,11 +191,11 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     let carried_on = resumed.is_some();
     let created = match resumed {
         Some(workspace) => Ok(workspace),
-        None => workspaces.create(&node, token, &predecessors, &trunk),
+        None => workspaces.create(node, token, &predecessors, &trunk),
     };
     let mut workspace = match created {
         Ok(workspace) => workspace,
-        Err(error) => return fail(graph, token, &node, "", None, error.to_string()),
+        Err(error) => return fail(graph, token, node, "", None, error.to_string()),
     };
     let branch = workspace.branch().to_owned();
     let attempt = Attempt {
@@ -190,7 +205,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     let result = graph
         .set_branch(id, token, &branch)
         .map_err(RoleError::from)
-        .and_then(|()| carry_out(reaction, graph, &node, &attempt, &branch, &mut workspace));
+        .and_then(|()| carry_out(reaction, graph, node, &attempt, &branch, &mut workspace));
     // This attempt releases its own worktree, and only that; both are best
     // effort, and `expl doctor --fix` removes a leftover once the step
     // settles. Settled: the branch holds what there is, and the worktree
@@ -511,17 +526,19 @@ fn invoke(
 }
 
 /// The reaction to `delivery` ended for good: a step it still holds fails.
+/// A step settled elsewhere already is left as it is.
 pub(crate) fn abandon(
     delivery: &Delivery,
     graph: &mut Graph,
     why: &str,
-) -> Result<Option<NodeId>, GraphError> {
+) -> Result<Abandonment, GraphError> {
     let Some(id) = delivery.event.node else {
-        return Ok(None);
+        return Ok(Abandonment::Nothing);
     };
     match graph.fail(id, &delivery.token, why) {
-        Ok(()) => Ok(Some(id)),
-        Err(GraphError::LeaseLost(_)) => Ok(None),
+        Ok(()) => Ok(Abandonment::Failed(id)),
+        Err(error) if error.is_settled(id) => Ok(Abandonment::Settled(id)),
+        Err(GraphError::LeaseLost(_)) => Ok(Abandonment::Nothing),
         Err(error) => Err(error),
     }
 }
@@ -920,7 +937,7 @@ mod tests {
             Role::Execution
                 .abandon(&held.delivery, &mut held.graph, "late abandonment")
                 .expect("abandon"),
-            None
+            Abandonment::Nothing
         );
         assert_eq!(held.graph.node(held.step).expect("step"), takeover.node);
         let events = held.graph.events(None, 100).expect("events");
@@ -1195,6 +1212,67 @@ mod tests {
     }
 
     #[test]
+    fn a_finding_recorded_elsewhere_first_is_kept_and_the_late_one_ignored() {
+        let mut held = held_step(true);
+        let (db, step, taker) = (held.db.clone(), held.step, held.taker);
+        let _hook = Hooked::install(move |window| {
+            if window != Window::Finding {
+                return;
+            }
+            // Another agent takes the step over once the first holder's
+            // lease expires, and settles it first.
+            let delivery = Inbox::open(&db, "replacement")
+                .expect("inbox")
+                .lease(Role::Execution.reactions(), taker, false, MAX_ATTEMPTS)
+                .expect("lease")
+                .expect("replacement agent's delivery");
+            store::open(&db)
+                .expect("db")
+                .execute(
+                    &format!(
+                        "UPDATE deliveries SET leased_until = {EPOCH} - 1 WHERE agent = 'executor'"
+                    ),
+                    [],
+                )
+                .expect("expire first holder's delivery");
+            let mut graph = Graph::open(&db).expect("graph");
+            assert!(graph.claim(step, &delivery.token).expect("take over"));
+            graph
+                .record_finding(step, &delivery.token, "abc", Answer::No, "replacement")
+                .expect("the replacement's finding");
+        });
+        let agent = held.context.agent("executor").expect("agent");
+        let reaction = Reaction::new(
+            &held.context,
+            &agent,
+            held.holder,
+            &held.delivery,
+            &held.interrupt,
+        );
+        let report = react(&reaction, &mut held.graph).expect("reaction");
+        assert!(
+            matches!(&report, Report::Ignored { reason } if reason.contains("settled elsewhere")),
+            "{report:?}"
+        );
+        let node = held.graph.node(held.step).expect("step");
+        assert_eq!(node.status, NodeStatus::Completed);
+        assert_eq!(node.answer, Some(Answer::No));
+        assert_eq!(node.outcome.as_deref(), Some("replacement"));
+        let events = held.graph.events(None, 100).expect("events");
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.kind == EventKind::NodeFailed && e.node == Some(held.step)),
+            "no node.failed"
+        );
+        let last = events.last().expect("an event");
+        assert_eq!(
+            (last.kind, last.node),
+            (EventKind::NodeCompleted, Some(held.step))
+        );
+    }
+
+    #[test]
     fn a_lease_lost_after_the_commit_publishes_nothing_of_the_attempt() {
         let mut held = held_step(false);
         let (_hook, takeover) = take_over_at(&held, Window::Publish);
@@ -1404,7 +1482,7 @@ mod tests {
             Role::Planning
                 .abandon(&claimed, &mut graph, "gone")
                 .expect("abandon"),
-            None
+            Abandonment::Nothing
         );
         assert_eq!(
             graph.node(running).expect("node").status,
@@ -1415,7 +1493,7 @@ mod tests {
             Role::Execution
                 .abandon(&claimed, &mut graph, "its holder died")
                 .expect("abandon"),
-            Some(running)
+            Abandonment::Failed(running)
         );
         assert_eq!(
             graph.node(running).expect("node").status,
@@ -1430,14 +1508,21 @@ mod tests {
 
         // A step that is not running, or already failed, is left alone.
         let before = graph.last_event().expect("last");
-        for delivery in [&unclaimed, &claimed] {
+        for (delivery, abandonment) in [
+            (&unclaimed, Abandonment::Nothing),
+            (&claimed, Abandonment::Settled(running)),
+        ] {
             assert_eq!(
                 Role::Execution
                     .abandon(delivery, &mut graph, "again")
                     .expect("abandon"),
-                None
+                abandonment
             );
         }
+        assert_eq!(
+            graph.node(running).expect("node").outcome.as_deref(),
+            Some("its holder died")
+        );
         assert_eq!(
             graph.node(planned).expect("node").status,
             NodeStatus::Planned

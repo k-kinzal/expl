@@ -74,6 +74,23 @@ pub enum GraphError {
 }
 
 impl GraphError {
+    /// What [`NotInStatus`](Self::NotInStatus) names as expected when a
+    /// step was to be settled — completed, failed, or given its finding —
+    /// but is settled already: it completed, failed or was pruned
+    /// elsewhere.
+    pub const RUNNING: &'static str = "a running step";
+
+    /// Whether this refuses to settle step `id` because it was settled
+    /// already (see [`RUNNING`](Self::RUNNING)): whoever wanted to settle
+    /// it has nothing left to do.
+    #[must_use]
+    pub fn is_settled(&self, id: NodeId) -> bool {
+        matches!(
+            self,
+            Self::NotInStatus { node, expected } if *node == id && *expected == Self::RUNNING
+        )
+    }
+
     /// Whether the database was only busy: another process held its lock
     /// past the busy timeout. Trying again later can succeed.
     #[must_use]
@@ -107,5 +124,23 @@ mod tests {
         assert!(sqlite(rusqlite::ffi::SQLITE_LOCKED).is_busy());
         assert!(!sqlite(rusqlite::ffi::SQLITE_CORRUPT).is_busy());
         assert!(!GraphError::NoOrigin.is_busy());
+    }
+
+    #[test]
+    fn only_a_refusal_to_settle_that_step_reads_as_settled() {
+        let settled = GraphError::NotInStatus {
+            node: NodeId(1),
+            expected: GraphError::RUNNING,
+        };
+        assert!(settled.is_settled(NodeId(1)));
+        assert!(!settled.is_settled(NodeId(2)));
+        assert!(
+            !GraphError::NotInStatus {
+                node: NodeId(1),
+                expected: "a failed step",
+            }
+            .is_settled(NodeId(1))
+        );
+        assert!(!GraphError::LeaseLost(NodeId(1)).is_settled(NodeId(1)));
     }
 }
