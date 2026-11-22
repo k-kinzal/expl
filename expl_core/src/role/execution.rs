@@ -130,27 +130,47 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
         Err(error) => return fail(graph, &node, &branch, None, error.to_string()),
     };
     graph.set_branch(id, &branch, None)?;
+    let result = carry_out(reaction, graph, &node, &branch, &mut workspace);
+    // Settled either way: the branch holds what there is, and the worktree
+    // goes. Not when the lease was lost or the run interrupted: the step may
+    // be another process's now, working in the same place.
+    if matches!(result, Ok(Report::Execution(_))) && !reaction.lease_lost() {
+        // Best effort: `expl doctor --fix` removes a leftover.
+        reaction.context().workspaces().release(workspace).ok();
+    }
+    result
+}
 
+/// Join the claimed change step `node`'s predecessors in `workspace`, have
+/// the agent do the step, and commit and settle it.
+fn carry_out(
+    reaction: &Reaction<'_>,
+    graph: &mut Graph,
+    node: &Node,
+    branch: &str,
+    workspace: &mut Workspace,
+) -> Result<Report, RoleError> {
+    let id = node.id;
     let schema = schema();
     while !workspace.is_joined() {
-        let prompt = resolution_prompt(reaction, &node, &workspace, &schema);
-        let (resolved, summary) = invoke(reaction, graph, id, &workspace, &prompt, &schema)?;
+        let prompt = resolution_prompt(reaction, node, workspace, &schema);
+        let (resolved, summary) = invoke(reaction, graph, id, workspace, &prompt, &schema)?;
         if !resolved {
             return fail(
                 graph,
-                &node,
-                &branch,
+                node,
+                branch,
                 None,
                 format!("merge conflicts were not resolved: {summary}"),
             );
         }
         if let Err(error) = workspace.resume() {
-            return fail(graph, &node, &branch, None, format!("{summary}\n\n{error}"));
+            return fail(graph, node, branch, None, format!("{summary}\n\n{error}"));
         }
     }
 
-    let prompt = prompt(reaction, &node, &schema);
-    let (succeeded, summary) = invoke(reaction, graph, id, &workspace, &prompt, &schema)?;
+    let prompt = prompt(reaction, node, &schema);
+    let (succeeded, summary) = invoke(reaction, graph, id, workspace, &prompt, &schema)?;
     // The lease is the right to write this step. Lost while the agent ran,
     // the step may already be another process's: touch nothing of it.
     if reaction.lease_lost() {
@@ -159,17 +179,17 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     let message = format!("{}\n\n{}", node.title, summary);
     let head = match workspace.commit(&message) {
         Ok(head) => head,
-        Err(error) => return fail(graph, &node, &branch, None, format!("{summary}\n\n{error}")),
+        Err(error) => return fail(graph, node, branch, None, format!("{summary}\n\n{error}")),
     };
-    graph.set_branch(id, &branch, Some(&head))?;
+    graph.set_branch(id, branch, Some(&head))?;
     if !succeeded {
-        return fail(graph, &node, &branch, Some(head), summary);
+        return fail(graph, node, branch, Some(head), summary);
     }
     if let Err(error) = workspace.verify_predecessors(&head) {
         return fail(
             graph,
-            &node,
-            &branch,
+            node,
+            branch,
             Some(head),
             format!("{summary}\n\n{error}"),
         );
@@ -181,7 +201,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     Ok(Report::Execution(ExecutionReport {
         node: id,
         status: NodeStatus::Completed,
-        branch,
+        branch: branch.to_owned(),
         answer: None,
         head_commit: Some(head),
         summary,

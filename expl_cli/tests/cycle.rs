@@ -283,12 +283,14 @@ fn events_flow_through_every_role() {
     assert_eq!(exited.len(), 6);
     assert!(exited.iter().all(|p| p["state"] == "exited"), "{exited:?}");
 
-    // Read-only roles' scratch worktrees are gone; the project stays clean.
+    // Read-only roles' scratch worktrees are gone, and so is the settled
+    // step's (its branch holds the work); the project stays clean.
     let worktrees: Vec<String> = std::fs::read_dir(repo.join(".expl/worktrees"))
         .expect("worktrees")
         .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(worktrees, ["node-3"]);
+    assert_eq!(worktrees, Vec::<String>::new());
+    assert!(git(repo, &["branch", "--list", "expl/node-3"]).contains("expl/node-3"));
     assert_eq!(
         git(repo, &["status", "--porcelain", "--untracked-files=all"]),
         "?? expl.toml"
@@ -1277,7 +1279,14 @@ fn discovery_stops_at_node_worktrees() {
     ok(repo, &["goal", "add", "g"]);
     let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
     ok(repo, &["run", "executor", "--exit-when-idle"]);
+    // A settled step's worktree is gone; check out its branch where one
+    // would be while it runs.
     let worktree = repo.join(".expl/worktrees").join(format!("node-{a}"));
+    let path = worktree.display().to_string();
+    git(
+        repo,
+        &["worktree", "add", "-q", &path, &format!("expl/node-{a}")],
+    );
     let out = expl(&worktree, &["node", "ls"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no expl project"));
@@ -1874,7 +1883,7 @@ fn assert_nothing_recorded(repo: &Path, step: &serde_json::Value) {
         .expect("worktrees")
         .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(worktrees, ["node-3"]);
+    assert_eq!(worktrees, Vec::<String>::new());
 }
 
 #[test]

@@ -291,6 +291,22 @@ impl Workspaces {
         Ok(())
     }
 
+    /// Remove the worktree of a step whose work is settled, keeping its
+    /// branch: the branch holds the result; the worktree was only where the
+    /// work happened.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Git`] when git fails.
+    pub fn release(&self, workspace: Workspace) -> Result<(), WorkspaceError> {
+        let _guard = lock(&self.lock)?;
+        let path = workspace.path.display().to_string();
+        self.repository
+            .run(&["worktree", "remove", "--force", &path])?;
+        self.repository.run(&["worktree", "prune"])?;
+        Ok(())
+    }
+
     /// Remove `node`'s worktree and branch, if present.
     ///
     /// # Errors
