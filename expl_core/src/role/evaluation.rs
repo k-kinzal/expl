@@ -175,6 +175,9 @@ fn prompt(
 
 /// The prompt for an investigation: the goals, the question it answered,
 /// and the findings on its path — the evidence to judge.
+///
+/// The findings before it are digests; its own comes last and complete
+/// (see [`findings`]).
 fn investigation_prompt(
     reaction: &Reaction<'_>,
     node: &Node,
@@ -197,9 +200,81 @@ fn investigation_prompt(
          ## Findings\n\n{findings}\n## Goals\n\n{goals}{instructions}{response}",
         id = node.id,
         title = node.title,
-        findings = digest::findings(path),
+        findings = findings(node, path),
         goals = digest::numbered_goals(goals, tree),
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),
     ))
+}
+
+/// The findings on `path` as the evaluator sees them: those before `node`
+/// digested, `node`'s own last and complete — the evidence under judgment
+/// is never cut, so a decisive file reference or command result past the
+/// digest's length reaches the evaluator as recorded.
+fn findings(node: &Node, path: &[Node]) -> String {
+    let earlier: Vec<Node> = path.iter().filter(|n| n.id != node.id).cloned().collect();
+    let mut out = digest::findings(&earlier);
+    out.push_str(&digest::finding_in_full(node));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::Answer;
+
+    fn investigation(id: i64, title: &str, evidence: &str) -> Node {
+        Node {
+            id: NodeId(id),
+            kind: NodeKind::Step,
+            status: NodeStatus::Completed,
+            title: title.to_owned(),
+            objective: String::new(),
+            priority: 0,
+            counter_exploration: false,
+            investigation: true,
+            answer: Some(Answer::Yes),
+            derived_from: None,
+            proposed_by: None,
+            branch: None,
+            head_commit: None,
+            outcome: Some(evidence.to_owned()),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_finding_under_judgment_is_shown_complete() {
+        let padding = "Checked every caller of the parser in turn. ".repeat(30);
+        let evidence = format!(
+            "{padding}\n\nDecisive:\nsrc/parse.rs:412: `unwrap()` on user input\n\
+             $ cargo test parse::overflow\n  test result: FAILED. 0 passed; 1 failed\n"
+        );
+        assert!(evidence.chars().count() > 2 * 600);
+        let earlier = investigation(3, "Earlier", &format!("{padding}EARLIER-TAIL"));
+        let node = investigation(5, "Is the parser affected?", &evidence);
+        let path = [earlier, node.clone()];
+
+        let shown = findings(&node, &path);
+
+        // Its own evidence, every line in its original form, after the cutoff.
+        for line in [
+            "Decisive:",
+            "src/parse.rs:412: `unwrap()` on user input",
+            "$ cargo test parse::overflow",
+            "  test result: FAILED. 0 passed; 1 failed",
+        ] {
+            assert!(
+                shown.lines().any(|l| l == format!("    {line}")),
+                "missing {line:?} in:\n{shown}"
+            );
+        }
+        assert!(shown.contains(padding.trim_end()), "{shown}");
+        // Shown once, last; earlier findings stay digests.
+        assert_eq!(shown.matches("Is the parser affected?").count(), 1);
+        assert!(shown.trim_end().ends_with("0 passed; 1 failed"), "{shown}");
+        assert!(shown.starts_with("- #3 — Earlier: yes\n  evidence: "));
+        assert!(!shown.contains("EARLIER-TAIL"), "{shown}");
+    }
 }
