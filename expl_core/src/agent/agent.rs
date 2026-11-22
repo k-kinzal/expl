@@ -552,6 +552,15 @@ fn tee(pipe: impl Read + Send + 'static, log: Arc<Mutex<File>>, prefix: &'static
 mod tests {
     use super::*;
     use crate::declaration::Declaration;
+    use crate::testing::scaled;
+
+    /// The longest a CLI with a `timeout` of 1s may take to be stopped
+    /// when it goes on the first TERM: its timeout, plus the
+    /// [`TERMINATION_GRACE`] it must not wait out. A stop that does wait it
+    /// out fails this at scale 1; the scale only widens the slack.
+    fn stopped_within() -> Duration {
+        Duration::from_secs(1) + scaled(TERMINATION_GRACE)
+    }
 
     fn agent(text: &str) -> Agent {
         let declaration = Declaration::parse(text).expect("declaration");
@@ -660,7 +669,7 @@ timeout = 1
                 .expect("kill")
                 .success()
         };
-        let gone_by = Instant::now() + Duration::from_secs(3);
+        let gone_by = Instant::now() + scaled(Duration::from_secs(3));
         while alive() && Instant::now() < gone_by {
             thread::sleep(Duration::from_millis(50));
         }
@@ -747,8 +756,10 @@ timeout = 1
             "{error:?}"
         );
         assert!(error.to_string().contains("timed out after 1s"), "{error}");
+        // Stopped as the timeout passed, not after `sleep 30`, and without
+        // waiting out the TERM grace once the group went.
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < stopped_within(),
             "{:?}",
             started.elapsed()
         );
@@ -769,7 +780,7 @@ timeout = 1
                 .expect("kill")
                 .success()
         };
-        let gone_by = Instant::now() + Duration::from_secs(3);
+        let gone_by = Instant::now() + scaled(Duration::from_secs(3));
         while alive() && Instant::now() < gone_by {
             thread::sleep(Duration::from_millis(50));
         }
@@ -797,7 +808,7 @@ timeout = 1
             let run = invoke(&routed, &log).expect("run");
             assert_eq!(run.response["cli"], 2);
             assert!(
-                started.elapsed() < Duration::from_secs(5),
+                started.elapsed() < stopped_within(),
                 "{:?}",
                 started.elapsed()
             );
@@ -826,8 +837,10 @@ replicas = 1
         let started = Instant::now();
         let run = invoke(&agent(&text), &log).expect("run");
         assert_eq!(run.response["ok"], true);
+        // The child holding the pipes was reaped before the output was
+        // drained, so the drain grace was not waited out.
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < scaled(DRAIN_GRACE),
             "{:?}",
             started.elapsed()
         );
@@ -846,7 +859,7 @@ replicas = 1
                 .expect("kill")
                 .success()
         };
-        let gone_by = Instant::now() + Duration::from_secs(3);
+        let gone_by = Instant::now() + scaled(Duration::from_secs(3));
         while alive() && Instant::now() < gone_by {
             thread::sleep(Duration::from_millis(50));
         }
@@ -960,16 +973,16 @@ replicas = 1
             let interrupt = interrupt.clone();
             let member = member.clone();
             thread::spawn(move || {
-                let by = Instant::now() + Duration::from_secs(10);
+                let by = Instant::now() + scaled(Duration::from_secs(10));
                 while !member.exists() && Instant::now() < by {
                     thread::sleep(Duration::from_millis(20));
                 }
                 interrupt.raise();
+                Instant::now()
             })
         };
         let prompt = Prompt::from("p");
         let schema = serde_json::json!({});
-        let started = Instant::now();
         let error = agent
             .invoke::<serde_json::Value>(&Invocation {
                 directory: dir.path(),
@@ -981,7 +994,8 @@ replicas = 1
                 restore: None,
             })
             .expect_err("interrupted");
-        raiser.join().expect("raiser");
+        let returned = Instant::now();
+        let interrupted_at = raiser.join().expect("raiser");
         assert!(matches!(error, AgentError::Interrupted), "{error:?}");
         // Gone by the time the invocation returns, not some time after:
         // whoever takes the work over may start on the directory at once.
@@ -993,11 +1007,13 @@ replicas = 1
             "process group {group} outlived the invocation"
         );
         // The member held stdout, yet the output was not waited on for
-        // the drain grace.
+        // the drain grace: from the interrupt, only the leftover grace the
+        // member spent ignoring TERM was. Draining before the member is
+        // gone waits out both, and fails this at scale 1.
+        let took = returned.duration_since(interrupted_at);
         assert!(
-            started.elapsed() < Duration::from_secs(8),
-            "{:?}",
-            started.elapsed()
+            took < LEFTOVER_GRACE + scaled(DRAIN_GRACE),
+            "{took:?} from the interrupt"
         );
         let text = std::fs::read_to_string(&log).expect("log");
         assert!(text.contains("=== interrupted ==="), "{text}");

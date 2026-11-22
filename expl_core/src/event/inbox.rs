@@ -10,15 +10,13 @@ use crate::process::ProcessId;
 use crate::role::Role;
 use crate::store::{self, EPOCH, NOW, StoreError};
 
-/// How long a delivery stays leased without renewal. A process renews the
+/// How long before a lease expires without renewal. A process renews the
 /// lease it holds on every heartbeat.
 pub const LEASE_SECONDS: i64 = 60;
 
-/// Proof of one lease: unique to it, so a process whose lease was taken over
-/// cannot touch the replacement. Expiry alone does not end a lease: until
-/// another process takes the event over (which replaces the token), the
-/// holder can still renew and settle it — a heartbeat delayed by a busy
-/// database or a sleeping machine does not throw the work away.
+/// Proof of one lease, required to renew or settle it. An expired lease
+/// still holds its token until the event is leased again, a conflicting
+/// event is leased, or the delivery is settled.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LeaseToken(String);
 
@@ -56,7 +54,7 @@ pub struct Delivery {
 /// An operation on a held lease could not be performed.
 #[derive(Debug, thiserror::Error)]
 pub enum InboxError {
-    /// The delivery is no longer held under this lease.
+    /// The token no longer identifies a held lease.
     #[error("agent `{agent}` no longer holds the lease on event {event}")]
     LeaseLost {
         /// The agent whose inbox it is.
@@ -69,9 +67,10 @@ pub enum InboxError {
     Sqlite(#[from] rusqlite::Error),
 }
 
-/// The delivery row of `event_id = ?2` still holds token `?3`. An expired
-/// lease remains valid until its delivery is taken over or settled.
-pub(crate) const HELD_LEASE: &str = "status = 'leased' AND lease_token = ?3";
+/// The delivery row of `event_id = ?2` is still leased under token `?3`. An
+/// expired lease remains valid until its token is replaced by a takeover,
+/// revoked by a conflicting lease, or settled.
+const HELD_LEASE: &str = "status = 'leased' AND lease_token = ?3";
 
 /// The deliveries of one agent. See the [module docs](crate::event).
 pub struct Inbox {
@@ -145,9 +144,11 @@ impl Inbox {
     /// process whose lease expired before its `max_attempts`-th attempt.
     /// Every lease counts as an attempt, so a delivery whose holders keep
     /// dying is [abandoned](Self::abandoned) rather than leased forever.
-    /// Events about a node another process of this agent is handling wait.
-    /// With `exclusive`, nothing is leased while any process of this agent
-    /// holds a lease (single-flight roles).
+    /// For this agent, an unexpired lease blocks other events about its node.
+    /// With `exclusive`, an unexpired lease blocks every event (single-flight
+    /// roles). Leasing an event replaces its previous token and revokes any
+    /// expired tokens that would conflict, preserving those deliveries for
+    /// retry or abandonment.
     ///
     /// # Errors
     ///
@@ -213,6 +214,17 @@ impl Inbox {
         let Some((id, kind, node, created_at, attempts)) = candidate else {
             return Ok(None);
         };
+        if exclusive || node.is_some() {
+            // The checks above ruled out unexpired conflicts. Revoke the
+            // expired ones before granting the lease in this transaction.
+            tx.execute(
+                "UPDATE deliveries SET lease_token = NULL \
+                 WHERE agent = ?1 AND status = 'leased' AND lease_token IS NOT NULL \
+                 AND event_id <> ?2 AND (?3 OR EXISTS ( \
+                     SELECT 1 FROM events e WHERE e.id = deliveries.event_id AND e.node_id = ?4))",
+                params![self.agent, id, exclusive, node],
+            )?;
+        }
         let token: String = tx.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
         tx.execute(
             &format!(
@@ -269,8 +281,8 @@ impl Inbox {
     /// While holding `delivery`, acknowledge every not-yet-handled event of
     /// `kinds` up to `through` as covered by its reaction (roles that
     /// consider the whole graph, like planning, need not react once per
-    /// event). Events leased by other processes are left alone. Returns how
-    /// many were covered.
+    /// event). Leased deliveries are left alone. Returns how many were
+    /// covered.
     ///
     /// # Errors
     ///
@@ -414,8 +426,8 @@ impl Inbox {
             return Ok(Vec::new());
         }
         let mut statement = self.conn.prepare(&format!(
-            // A lease taken before leases had tokens (schema 3) has none: it
-            // reads as the empty token, which `give_up_abandoned` matches.
+            // Revoked leases and leases from before tokens existed read as
+            // the empty token, which `give_up_abandoned` matches.
             "SELECT e.id, e.kind, e.node_id, e.created_at, d.attempts, \
              COALESCE(d.lease_token, '') \
              FROM deliveries d JOIN events e ON e.id = d.event_id \
@@ -466,8 +478,8 @@ impl Inbox {
         Ok(changed == 1)
     }
 
-    /// Extend the lease of `delivery` — also one that expired, as long as no
-    /// other process has taken it over.
+    /// Extend the lease of `delivery` while its token is current, even
+    /// after expiry.
     ///
     /// # Errors
     ///
@@ -842,6 +854,9 @@ mod tests {
             .expect("e2 again");
         assert_eq!((last.event.id, last.attempts), (EventId(2), 2));
         expire(&f.db, "planner", last.event.id);
+        let abandoned = inbox.abandoned(PROPOSED, 2).expect("abandoned");
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].token, last.token);
 
         // Its last holder died: e2 is skipped, and the next event is leased.
         let next = inbox
@@ -849,6 +864,8 @@ mod tests {
             .expect("lease")
             .expect("e3");
         assert_eq!(next.event.id, EventId(3));
+        assert_lost(other.renew(&last), last.event.id);
+        assert!(!other.give_up_abandoned(&abandoned[0]).expect("stale token"));
         inbox.ack(&next, None).expect("ack");
         assert!(
             inbox
@@ -859,7 +876,7 @@ mod tests {
 
         let abandoned = inbox.abandoned(PROPOSED, 2).expect("abandoned");
         assert_eq!(abandoned.len(), 1);
-        assert_eq!(abandoned[0].token, last.token);
+        assert_eq!(abandoned[0].event.id, last.event.id);
         assert!(inbox.give_up_abandoned(&abandoned[0]).expect("give up"));
         assert!(
             !other.give_up_abandoned(&abandoned[0]).expect("give up"),
@@ -994,6 +1011,40 @@ mod tests {
     }
 
     #[test]
+    fn exclusive_lease_revokes_an_expired_lease_on_another_node() {
+        let mut f = fixture();
+        let a = NodeId(3);
+        let b = NodeId(4);
+        let ready = &[EventKind::NodeReady];
+        f.graph.plan_step(a, 1).expect("plan a");
+        let mut first = Inbox::open(&f.db, "planner").expect("inbox");
+        let mut second = Inbox::open(&f.db, "planner").expect("inbox");
+        let stale = first
+            .lease(ready, ProcessId(1), true, 3)
+            .expect("lease")
+            .expect("a is ready");
+        assert_eq!(stale.event.node, Some(a));
+        expire(&f.db, "planner", stale.event.id);
+
+        f.graph.plan_step(b, 2).expect("plan b at higher priority");
+        let next = second
+            .lease(ready, ProcessId(2), true, 3)
+            .expect("lease")
+            .expect("b is ready");
+        assert_eq!(next.event.node, Some(b));
+        assert_lost(first.renew(&stale), stale.event.id);
+        second.renew(&next).expect("renew b");
+        second.ack(&next, None).expect("ack b");
+
+        let retry = second
+            .lease(ready, ProcessId(2), true, 3)
+            .expect("lease")
+            .expect("a is retried");
+        assert_eq!((retry.event.id, retry.attempts), (stale.event.id, 2));
+        assert_ne!(retry.token, stale.token);
+    }
+
+    #[test]
     fn the_first_assignment_of_an_event_stands() {
         let f = fixture();
         let event = EventId(1);
@@ -1105,5 +1156,32 @@ mod tests {
                 .map(|d| d.event.id),
             Some(EventId(4))
         );
+        two.renew(&second)
+            .expect("renew the lease on the other node");
+    }
+
+    #[test]
+    fn leasing_another_event_about_a_node_revokes_its_expired_lease() {
+        let mut f = fixture();
+        let a = NodeId(3);
+        f.graph.plan_step(a, 1).expect("plan a");
+        let mut first = Inbox::open(&f.db, "watcher").expect("inbox");
+        let mut second = Inbox::open(&f.db, "watcher").expect("inbox");
+        let stale = first
+            .lease(&[EventKind::NodeReady], ProcessId(1), false, 3)
+            .expect("lease")
+            .expect("a is ready");
+        assert!(f.graph.claim(a, &stale.token).expect("record node.started"));
+        expire(&f.db, "watcher", stale.event.id);
+        let next = second
+            .lease(&[EventKind::NodeStarted], ProcessId(2), false, 3)
+            .expect("lease")
+            .expect("a has started");
+        assert_eq!(stale.event.node, Some(a));
+        assert_eq!(next.event.node, stale.event.node);
+        assert_ne!(next.event.id, stale.event.id);
+        assert_lost(first.renew(&stale), stale.event.id);
+        assert_lost(first.ack(&stale, None), stale.event.id);
+        second.renew(&next).expect("renew node.started");
     }
 }

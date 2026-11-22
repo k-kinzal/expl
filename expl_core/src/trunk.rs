@@ -411,12 +411,21 @@ mod tests {
             }
             let head = git(&path, &["rev-parse", "HEAD"]);
             git(&self.root, &["worktree", "remove", "--force", &path_text]);
-            self.graph
-                .set_branch(id, &branch, Some(&head))
-                .expect("branch");
             self.graph.plan_step(id, 1).expect("plan");
-            assert!(self.graph.claim(id, false).expect("claim"));
-            self.graph.complete(id, "done").expect("complete");
+            let mut inbox = Inbox::open(&self.project.database_path(), "executor").expect("inbox");
+            let delivery = inbox
+                .lease(Role::Execution.reactions(), ProcessId(1), false, 3)
+                .expect("lease")
+                .expect("node.ready");
+            assert_eq!(delivery.event.node, Some(id));
+            assert!(self.graph.claim(id, &delivery.token).expect("claim"));
+            self.graph
+                .set_branch(id, &delivery.token, &branch, Some(&head))
+                .expect("branch");
+            self.graph
+                .complete(id, &delivery.token, "done")
+                .expect("complete");
+            inbox.ack(&delivery, None).expect("ack");
             id
         }
 
@@ -489,9 +498,13 @@ mod tests {
         let origin = fx.graph.origin().expect("origin").id;
         let step = fx.step(origin, Some("a.txt"));
         let gone = "0123456789abcdef0123456789abcdef01234567";
-        fx.graph
-            .set_branch(step, &Workspaces::branch_name(step), Some(gone))
-            .expect("branch");
+        crate::store::open(&fx.project.database_path())
+            .expect("db")
+            .execute(
+                "UPDATE nodes SET head_commit = ?1 WHERE id = ?2",
+                rusqlite::params![gone, step.0],
+            )
+            .expect("record a missing commit");
         std::fs::write(fx.root.join("README"), "edited\n").expect("write");
         git(&fx.root, &["commit", "-q", "-am", "edit"]);
 

@@ -7,13 +7,13 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::event::{Delivery, Event, EventId, EventKind, HELD_LEASE};
+use crate::event::{Event, EventId, EventKind, LeaseToken};
 use crate::graph::{
     AgentRunId, AgentRunRecord, AgentRunStatus, Answer, Edge, Evaluation, GoalTree, GraphError,
     Lineage, NewEvaluation, NewOrigin, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Plan,
     PlanId, PlannedPath, Snapshot,
 };
-use crate::store::{self, NOW};
+use crate::store::{self, EPOCH, NOW};
 
 const NODE_COLUMNS: &str = "id, kind, status, title, objective, priority, counter_exploration, \
                             branch, head_commit, outcome, created_at, updated_at, investigation, \
@@ -161,7 +161,8 @@ fn set_status_in(
 ) -> Result<(), GraphError> {
     let changed = conn.execute(
         &format!(
-            "UPDATE nodes SET status = ?2, outcome = COALESCE(?3, outcome), updated_at = {NOW} \
+            "UPDATE nodes SET status = ?2, outcome = COALESCE(?3, outcome), \
+             holder_token = NULL, updated_at = {NOW} \
              WHERE id = ?1"
         ),
         params![id.0, status.as_str(), outcome],
@@ -189,6 +190,35 @@ fn emit_if_ready(conn: &Connection, id: NodeId) -> Result<(), GraphError> {
         emit(conn, EventKind::NodeReady, Some(id))?;
     }
     Ok(())
+}
+
+fn emit_completion(conn: &Connection, id: NodeId) -> Result<(), GraphError> {
+    emit(conn, EventKind::NodeCompleted, Some(id))?;
+    for successor in nodes_where(
+        conn,
+        "id IN (SELECT target_id FROM edges WHERE source_id = ?1)",
+        id,
+    )? {
+        emit_if_ready(conn, successor.id)?;
+    }
+    Ok(())
+}
+
+/// Check the claim and the inbox token under the graph write transaction.
+/// A token can still settle its work after expiry until either the inbox
+/// revokes it or another delivery takes over the step.
+fn ensure_holder(conn: &Connection, id: NodeId, token: &LeaseToken) -> Result<(), GraphError> {
+    let held = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM nodes n JOIN deliveries d ON d.lease_token = n.holder_token \
+         WHERE n.id = ?1 AND n.status = 'running' AND n.holder_token = ?2 AND d.status = 'leased')",
+        params![id.0, token.as_str()],
+        |row| row.get(0),
+    )?;
+    if held {
+        Ok(())
+    } else {
+        Err(GraphError::LeaseLost(id))
+    }
 }
 
 /// SQL condition on a node `n`: a running step whose `node.ready` nobody
@@ -764,27 +794,42 @@ impl Graph {
         Ok(())
     }
 
-    /// Atomically move a planned step whose predecessors are all completed
-    /// to running (records `node.started`). With `reclaim`, a step already
-    /// `running` is taken over too — the previous holder's lease expired.
-    /// `false` when nothing was claimed, including when a [join](Self::join)
-    /// gave the step a predecessor that has not completed yet.
+    /// Claim a ready step for the delivery identified by `token` (records
+    /// `node.started`). A running step can be taken over only when its
+    /// holder's delivery is no longer live. Returns `false` if the step
+    /// cannot be claimed, including when a [join](Self::join) added an
+    /// unrealised predecessor.
     ///
     /// # Errors
     ///
-    /// [`GraphError`] on SQLite failure.
-    pub fn claim(&mut self, id: NodeId, reclaim: bool) -> Result<bool, GraphError> {
+    /// [`GraphError::LeaseLost`] when the token has no live `node.ready`
+    /// delivery for this step, or [`GraphError::Sqlite`] on SQLite failure.
+    pub fn claim(&mut self, id: NodeId, token: &LeaseToken) -> Result<bool, GraphError> {
         let tx = self.write()?;
+        let live: bool = tx.query_row(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM deliveries d JOIN events e ON e.id = d.event_id \
+                 WHERE d.lease_token = ?2 AND d.status = 'leased' AND d.leased_until >= {EPOCH} \
+                 AND e.kind = 'node.ready' AND e.node_id = ?1)"
+            ),
+            params![id.0, token.as_str()],
+            |row| row.get(0),
+        )?;
+        if !live {
+            return Err(GraphError::LeaseLost(id));
+        }
         let changed = tx.execute(
             &format!(
-                "UPDATE nodes SET status = 'running', updated_at = {NOW} \
+                "UPDATE nodes SET status = 'running', holder_token = ?2, updated_at = {NOW} \
                  WHERE id = ?1 AND kind = 'step' \
-                 AND (status = 'planned' OR (?2 AND status = 'running')) \
+                 AND (status = 'planned' OR (status = 'running' AND NOT EXISTS ( \
+                     SELECT 1 FROM deliveries d WHERE d.lease_token = nodes.holder_token \
+                     AND d.status = 'leased' AND d.leased_until >= {EPOCH}))) \
                  AND NOT EXISTS ( \
                      SELECT 1 FROM edges e JOIN nodes p ON p.id = e.source_id \
                      WHERE e.target_id = ?1 AND {UNREALIZED})"
             ),
-            params![id.0, reclaim],
+            params![id.0, token.as_str()],
         )?;
         if changed == 1 {
             emit(&tx, EventKind::NodeStarted, Some(id))?;
@@ -799,15 +844,13 @@ impl Graph {
     ///
     /// # Errors
     ///
-    /// [`GraphError`] on SQLite failure.
-    pub fn unclaim(&mut self, id: NodeId) -> Result<(), GraphError> {
-        self.conn.execute(
-            &format!(
-                "UPDATE nodes SET status = 'planned', updated_at = {NOW} \
-                 WHERE id = ?1 AND kind = 'step' AND status = 'running'"
-            ),
-            [id.0],
-        )?;
+    /// [`GraphError::LeaseLost`] when the delivery does not hold the step,
+    /// or [`GraphError::Sqlite`] on SQLite failure.
+    pub fn unclaim(&mut self, id: NodeId, token: &LeaseToken) -> Result<(), GraphError> {
+        let tx = self.write()?;
+        ensure_holder(&tx, id, token)?;
+        set_status_in(&tx, id, NodeStatus::Planned, None)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -839,7 +882,7 @@ impl Graph {
         let tx = self.write()?;
         let changed = tx.execute(
             &format!(
-                "UPDATE nodes AS n SET status = 'planned', updated_at = {NOW} \
+                "UPDATE nodes AS n SET status = 'planned', holder_token = NULL, updated_at = {NOW} \
                  WHERE n.id = ?1 AND {orphaned}",
                 orphaned = orphaned()
             ),
@@ -852,24 +895,29 @@ impl Graph {
         Ok(changed == 1)
     }
 
-    /// Record the branch (and, when known, the tip commit) holding a node.
+    /// Record the branch (and, when known, the tip commit) of a claimed step.
     ///
     /// # Errors
     ///
-    /// [`GraphError`] on SQLite failure.
+    /// [`GraphError::LeaseLost`] when the delivery does not hold the step,
+    /// or [`GraphError::Sqlite`] on SQLite failure.
     pub fn set_branch(
         &mut self,
         id: NodeId,
+        token: &LeaseToken,
         branch: &str,
         head_commit: Option<&str>,
     ) -> Result<(), GraphError> {
-        self.conn.execute(
+        let tx = self.write()?;
+        ensure_holder(&tx, id, token)?;
+        tx.execute(
             &format!(
                 "UPDATE nodes SET branch = ?2, head_commit = COALESCE(?3, head_commit), \
                  updated_at = {NOW} WHERE id = ?1"
             ),
             params![id.0, branch, head_commit],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -878,87 +926,58 @@ impl Graph {
     ///
     /// # Errors
     ///
-    /// [`GraphError`] on SQLite failure.
-    pub fn complete(&mut self, id: NodeId, outcome: &str) -> Result<(), GraphError> {
+    /// [`GraphError::LeaseLost`] when the delivery does not hold the step,
+    /// or [`GraphError::Sqlite`] on SQLite failure.
+    pub fn complete(
+        &mut self,
+        id: NodeId,
+        token: &LeaseToken,
+        outcome: &str,
+    ) -> Result<(), GraphError> {
         let tx = self.write()?;
+        ensure_holder(&tx, id, token)?;
         set_status_in(&tx, id, NodeStatus::Completed, Some(outcome))?;
-        emit(&tx, EventKind::NodeCompleted, Some(id))?;
-        for successor in nodes_where(
-            &tx,
-            "id IN (SELECT target_id FROM edges WHERE source_id = ?1)",
-            id,
-        )? {
-            emit_if_ready(&tx, successor.id)?;
-        }
+        emit_completion(&tx, id)?;
         tx.commit()?;
         Ok(())
     }
 
     /// A running investigation found its answer: it completes at `code` —
     /// the commit it was about, which its successors build on — with no
-    /// branch, and `evidence` as its outcome. Validates the agent's lease on
-    /// the step's `node.ready` delivery and records `node.completed` and any
+    /// branch, and `evidence` as its outcome. Validates the delivery's claim
+    /// on the step and records `node.completed` and any
     /// successors' `node.ready` events in the same transaction.
     ///
     /// # Errors
     ///
-    /// [`GraphError::LeaseLost`] when the delivery does not hold the lease
-    /// for this step, or [`GraphError::NotInStatus`] when it is not a running
-    /// investigation. SQLite failures are returned as [`GraphError::Sqlite`].
+    /// [`GraphError::LeaseLost`] when the delivery does not hold the step,
+    /// or [`GraphError::NotInStatus`] when the held step is not an investigation.
+    /// SQLite failures are returned as [`GraphError::Sqlite`].
     pub fn record_finding(
         &mut self,
         id: NodeId,
-        agent: &str,
-        delivery: &Delivery,
+        token: &LeaseToken,
         code: &str,
         answer: Answer,
         evidence: &str,
     ) -> Result<(), GraphError> {
         let tx = self.write()?;
-        let held: bool = tx.query_row(
-            &format!(
-                "SELECT EXISTS (SELECT 1 FROM deliveries JOIN events e ON e.id = event_id \
-                 WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE} \
-                 AND e.kind = ?4 AND e.node_id = ?5)"
-            ),
-            params![
-                agent,
-                delivery.event.id.0,
-                delivery.token.as_str(),
-                EventKind::NodeReady.as_str(),
-                id.0
-            ],
-            |row| row.get(0),
-        )?;
-        if !held {
-            return Err(GraphError::LeaseLost {
-                agent: agent.to_owned(),
-                event: delivery.event.id,
-            });
-        }
+        ensure_holder(&tx, id, token)?;
         let changed = tx.execute(
             &format!(
                 "UPDATE nodes SET status = 'completed', answer = ?2, outcome = ?3, \
-                 head_commit = ?4, branch = NULL, updated_at = {NOW} \
+                 head_commit = ?4, branch = NULL, holder_token = NULL, updated_at = {NOW} \
                  WHERE id = ?1 AND kind = 'step' AND investigation = 1 AND status = 'running'"
             ),
             params![id.0, answer.as_str(), evidence, code],
         )?;
         if changed == 0 {
-            node_in(&tx, id)?;
             return Err(GraphError::NotInStatus {
                 node: id,
                 expected: "a running investigation",
             });
         }
-        emit(&tx, EventKind::NodeCompleted, Some(id))?;
-        for successor in nodes_where(
-            &tx,
-            "id IN (SELECT target_id FROM edges WHERE source_id = ?1)",
-            id,
-        )? {
-            emit_if_ready(&tx, successor.id)?;
-        }
+        emit_completion(&tx, id)?;
         tx.commit()?;
         Ok(())
     }
@@ -967,9 +986,16 @@ impl Graph {
     ///
     /// # Errors
     ///
-    /// [`GraphError`] on SQLite failure.
-    pub fn fail(&mut self, id: NodeId, outcome: &str) -> Result<(), GraphError> {
+    /// [`GraphError::LeaseLost`] when the delivery does not hold the step,
+    /// or [`GraphError::Sqlite`] on SQLite failure.
+    pub fn fail(
+        &mut self,
+        id: NodeId,
+        token: &LeaseToken,
+        outcome: &str,
+    ) -> Result<(), GraphError> {
         let tx = self.write()?;
+        ensure_holder(&tx, id, token)?;
         set_status_in(&tx, id, NodeStatus::Failed, Some(outcome))?;
         emit(&tx, EventKind::NodeFailed, Some(id))?;
         tx.commit()?;
@@ -1536,13 +1562,21 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::Inbox;
+    use crate::event::{Delivery, Inbox};
     use crate::process::ProcessId;
 
     const EXECUTOR: &str = "executor";
 
     fn seeded() -> (Graph, NodeId, NodeId) {
         seed(Graph::in_memory().expect("graph"))
+    }
+
+    fn seeded_with_inbox() -> (tempfile::TempDir, Graph, NodeId, NodeId, Inbox) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("expl.db");
+        let (graph, origin, goal) = seed(Graph::open(&db).expect("graph"));
+        let inbox = Inbox::open(&db, EXECUTOR).expect("inbox");
+        (dir, graph, origin, goal, inbox)
     }
 
     fn seed(mut graph: Graph) -> (Graph, NodeId, NodeId) {
@@ -1590,10 +1624,10 @@ mod tests {
         let first = lease_ready(&mut inbox, 1, question);
         let code = "abc";
         assert!(matches!(
-            graph.record_finding(question, EXECUTOR, &first, code, Answer::Yes, "seen"),
-            Err(GraphError::NotInStatus { .. })
+            graph.record_finding(question, &first.token, code, Answer::Yes, "seen"),
+            Err(GraphError::LeaseLost(node)) if node == question
         ));
-        assert!(graph.claim(question, false).expect("claim"));
+        assert!(graph.claim(question, &first.token).expect("claim"));
 
         // The first replica stops renewing and the second takes its delivery.
         let expired = graph
@@ -1609,37 +1643,33 @@ mod tests {
         assert_eq!(replacement.event.id, first.event.id);
         assert_eq!(replacement.attempts, 2);
         let mut replacement_graph = Graph::open(&db).expect("replacement graph");
-        assert!(replacement_graph.claim(question, true).expect("reclaim"));
+        assert!(
+            replacement_graph
+                .claim(question, &replacement.token)
+                .expect("reclaim")
+        );
         let running = graph.node(question).expect("running investigation");
         let before = graph.last_event().expect("last event");
 
         assert!(matches!(
-            graph.record_finding(question, EXECUTOR, &first, code, Answer::No, "stale"),
-            Err(GraphError::LeaseLost { event, .. }) if event == first.event.id
+            graph.record_finding(question, &first.token, code, Answer::No, "stale"),
+            Err(GraphError::LeaseLost(node)) if node == question
         ));
         assert_eq!(graph.node(question).expect("node"), running);
         assert_eq!(graph.last_event().expect("last event"), before);
 
         replacement_graph
-            .record_finding(
-                question,
-                EXECUTOR,
-                &replacement,
-                code,
-                Answer::Yes,
-                "seen it",
-            )
+            .record_finding(question, &replacement.token, code, Answer::Yes, "seen it")
             .expect("finding");
         assert!(matches!(
             replacement_graph.record_finding(
                 question,
-                EXECUTOR,
-                &replacement,
+                &replacement.token,
                 code,
                 Answer::No,
                 "duplicate"
             ),
-            Err(GraphError::NotInStatus { .. })
+            Err(GraphError::LeaseLost(node)) if node == question
         ));
         let answered = graph.node(question).expect("node");
         assert_eq!(answered.status, NodeStatus::Completed);
@@ -1664,9 +1694,9 @@ mod tests {
 
         // A change step cannot record a finding.
         let delivery = lease_ready(&mut replacement_inbox, 2, next);
-        assert!(graph.claim(next, false).expect("claim"));
+        assert!(graph.claim(next, &delivery.token).expect("claim"));
         assert!(matches!(
-            graph.record_finding(next, EXECUTOR, &delivery, code, Answer::No, "x"),
+            graph.record_finding(next, &delivery.token, code, Answer::No, "x"),
             Err(GraphError::NotInStatus { .. })
         ));
     }
@@ -1694,14 +1724,16 @@ mod tests {
             graph.plan_step(step, 1).expect("plan");
         }
         let delivery = lease_ready(&mut inbox, 1, change);
-        assert!(graph.claim(change, false).expect("claim"));
-        graph.complete(change, "done").expect("complete");
+        assert!(graph.claim(change, &delivery.token).expect("claim"));
+        graph
+            .complete(change, &delivery.token, "done")
+            .expect("complete");
         inbox.ack(&delivery, None).expect("ack");
         for step in [question, on_change] {
             let delivery = lease_ready(&mut inbox, 1, step);
-            assert!(graph.claim(step, false).expect("claim"));
+            assert!(graph.claim(step, &delivery.token).expect("claim"));
             graph
-                .record_finding(step, EXECUTOR, &delivery, "abc", Answer::No, "seen")
+                .record_finding(step, &delivery.token, "abc", Answer::No, "seen")
                 .expect("finding");
             inbox.ack(&delivery, None).expect("ack");
         }
@@ -1773,7 +1805,10 @@ mod tests {
 
     #[test]
     fn starting_points_are_realised_or_failed_steps_and_counter_goals() {
-        let mut graph = Graph::in_memory().expect("graph");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("expl.db");
+        let mut graph = Graph::open(&db).expect("graph");
+        let mut inbox = Inbox::open(&db, EXECUTOR).expect("inbox");
         let origin = graph
             .create_origin("origin", Some("main"), "abc")
             .expect("origin");
@@ -1785,15 +1820,22 @@ mod tests {
         let a = graph.propose_step("a", "a", &[origin], &[goal]).expect("a");
         let b = graph.propose_step("b", "b", &[origin], &[goal]).expect("b");
         graph.plan_step(a, 1).expect("plan");
-        assert!(graph.claim(a, false).expect("claim"));
+        let delivery = lease_ready(&mut inbox, 1, a);
+        assert!(graph.claim(a, &delivery.token).expect("claim"));
         graph
-            .set_branch(a, "expl/node-a", Some("def"))
+            .set_branch(a, &delivery.token, "expl/node-a", Some("def"))
             .expect("branch");
-        graph.complete(a, "done").expect("complete");
+        graph
+            .complete(a, &delivery.token, "done")
+            .expect("complete");
+        inbox.ack(&delivery, None).expect("ack");
         let c = graph.propose_step("c", "c", &[origin], &[goal]).expect("c");
         graph.plan_step(c, 1).expect("plan");
-        assert!(graph.claim(c, false).expect("claim"));
-        graph.fail(c, "did not compile").expect("fail");
+        let delivery = lease_ready(&mut inbox, 1, c);
+        assert!(graph.claim(c, &delivery.token).expect("claim"));
+        graph
+            .fail(c, &delivery.token, "did not compile")
+            .expect("fail");
 
         let ids: Vec<NodeId> = graph
             .starting_points(false)
@@ -1878,15 +1920,18 @@ mod tests {
 
     #[test]
     fn mutations_record_events_and_readiness() {
-        let (mut graph, origin, goal) = seeded();
+        let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
         let a = graph.propose_step("a", "a", &[origin], &[]).expect("a");
         let b = graph.propose_step("b", "b", &[a], &[goal]).expect("b");
         graph.plan_step(a, 1).expect("plan a");
         graph.plan_step(b, 9).expect("plan b");
-        assert!(graph.claim(a, false).expect("claim"));
-        assert!(!graph.claim(a, false).expect("second claim"));
-        assert!(graph.claim(a, true).expect("reclaim"));
-        graph.complete(a, "done").expect("complete");
+        let first = lease_ready(&mut inbox, 1, a);
+        assert!(graph.claim(a, &first.token).expect("claim"));
+        assert!(!graph.claim(a, &first.token).expect("second claim"));
+        inbox.release(&first).expect("release");
+        let second = lease_ready(&mut inbox, 2, a);
+        assert!(graph.claim(a, &second.token).expect("reclaim"));
+        graph.complete(a, &second.token, "done").expect("complete");
         let (g, a, b) = (goal.0, a.0, b.0);
         assert_eq!(
             kinds(&graph),
@@ -1916,10 +1961,50 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_claims_from_different_agents_start_the_step_once() {
+        let (dir, mut graph, origin, goal, mut first_inbox) = seeded_with_inbox();
+        let db = dir.path().join("expl.db");
+        let mut second_inbox = Inbox::open(&db, "another-executor").expect("inbox");
+        let step = graph
+            .propose_step("s", "s", &[origin], &[goal])
+            .expect("step");
+        graph.plan_step(step, 1).expect("plan");
+        let first = lease_ready(&mut first_inbox, 1, step);
+        let second = lease_ready(&mut second_inbox, 2, step);
+        assert_eq!(first.event.id, second.event.id);
+
+        let start = std::sync::Barrier::new(2);
+        let claimed = std::thread::scope(|scope| {
+            let contenders = [&first.token, &second.token].map(|token| {
+                let mut graph = Graph::open(&db).expect("graph");
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    graph.claim(step, token).expect("claim")
+                })
+            });
+            contenders.map(|thread| thread.join().expect("contender"))
+        });
+        assert_ne!(claimed[0], claimed[1]);
+        assert_eq!(
+            kinds(&graph)
+                .into_iter()
+                .filter(|event| *event == (EventKind::NodeStarted, Some(step.0)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn candidates_use_latest_verdict() {
-        let (mut graph, origin, goal) = seeded();
+        let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
         let a = graph.propose_step("a", "a", &[origin], &[goal]).expect("a");
-        graph.complete(a, "done").expect("complete");
+        graph.plan_step(a, 1).expect("plan");
+        let delivery = lease_ready(&mut inbox, 1, a);
+        assert!(graph.claim(a, &delivery.token).expect("claim"));
+        graph
+            .complete(a, &delivery.token, "done")
+            .expect("complete");
         let verdict = |satisfied| NewEvaluation {
             goal,
             satisfied,
@@ -1936,13 +2021,16 @@ mod tests {
 
     #[test]
     fn prune_and_replan_guard_statuses() {
-        let (mut graph, origin, goal) = seeded();
+        let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
         let a = graph.propose_step("a", "a", &[origin], &[goal]).expect("a");
         assert!(matches!(
             graph.replan(a),
             Err(GraphError::NotInStatus { .. })
         ));
-        graph.fail(a, "x").expect("fail");
+        graph.plan_step(a, 1).expect("plan");
+        let delivery = lease_ready(&mut inbox, 1, a);
+        assert!(graph.claim(a, &delivery.token).expect("claim"));
+        graph.fail(a, &delivery.token, "x").expect("fail");
         graph.replan(a).expect("replan");
         assert_eq!(graph.node(a).expect("a").status, NodeStatus::Planned);
         graph.prune(goal, "done").expect("retire");
@@ -1955,7 +2043,7 @@ mod tests {
 
     #[test]
     fn join_combines_open_steps_and_holds_back_their_claim() {
-        let (mut graph, origin, goal) = seeded();
+        let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
         let propose = |graph: &mut Graph, title: &str, after: &[NodeId]| {
             graph
                 .propose_step(title, title, after, &[goal])
@@ -1977,14 +2065,23 @@ mod tests {
         for step in [left, right, joined] {
             graph.plan_step(step, 1).expect("plan");
         }
+        let delivery = lease_ready(&mut inbox, 1, left);
+        assert!(graph.claim(left, &delivery.token).expect("claim"));
+        graph.complete(left, &delivery.token, "done").expect("a");
+        inbox.ack(&delivery, None).expect("ack");
+        let right_delivery = lease_ready(&mut inbox, 2, right);
+        let joined_delivery = lease_ready(&mut inbox, 1, joined);
         graph.join(joined, &[right]).expect("join");
         assert_eq!(ids(&graph, joined), [left, right]);
 
         // A joined step is claimed only once every predecessor completed.
-        graph.complete(left, "done").expect("a");
-        assert!(!graph.claim(joined, false).expect("claim"));
-        graph.complete(right, "done").expect("b");
-        assert!(graph.claim(joined, false).expect("claim"));
+        assert!(!graph.claim(joined, &joined_delivery.token).expect("claim"));
+        assert!(graph.claim(right, &right_delivery.token).expect("claim"));
+        graph
+            .complete(right, &right_delivery.token, "done")
+            .expect("b");
+        inbox.ack(&right_delivery, None).expect("ack");
+        assert!(graph.claim(joined, &joined_delivery.token).expect("claim"));
         // Once claimed, its base is fixed.
         assert!(matches!(
             graph.join(joined, &[origin]),
@@ -2000,7 +2097,10 @@ mod tests {
             Err(GraphError::Cycle { .. })
         ));
         let failed = propose(&mut graph, "failed", &[origin]);
-        graph.fail(failed, "x").expect("fail");
+        graph.plan_step(failed, 1).expect("plan");
+        let delivery = lease_ready(&mut inbox, 2, failed);
+        assert!(graph.claim(failed, &delivery.token).expect("claim"));
+        graph.fail(failed, &delivery.token, "x").expect("fail");
         assert!(matches!(
             graph.join(second, &[right, failed]),
             Err(GraphError::NotInStatus { .. })
@@ -2020,7 +2120,7 @@ mod tests {
 
     #[test]
     fn advancing_supersedes_the_origin_and_planning_rebases_open_steps() {
-        let (mut graph, first, goal) = seeded();
+        let (_dir, mut graph, first, goal, mut inbox) = seeded_with_inbox();
         let adopted = graph.propose_step("a", "a", &[first], &[goal]).expect("a");
         let left = graph.propose_step("b", "b", &[first], &[goal]).expect("b");
         let open = graph.propose_step("c", "c", &[first], &[goal]).expect("c");
@@ -2029,8 +2129,12 @@ mod tests {
             graph.plan_step(step, 1).expect("plan");
         }
         for step in [adopted, left] {
-            assert!(graph.claim(step, false).expect("claim"));
-            graph.complete(step, "done").expect("complete");
+            let delivery = lease_ready(&mut inbox, 1, step);
+            assert!(graph.claim(step, &delivery.token).expect("claim"));
+            graph
+                .complete(step, &delivery.token, "done")
+                .expect("complete");
+            inbox.ack(&delivery, None).expect("ack");
         }
         assert!(matches!(
             graph.advance_origin(&new_origin(first, "def", &[open])),
@@ -2089,7 +2193,12 @@ mod tests {
 
         // Every origin is realised: steps on it can run, and a superseded
         // origin cannot be joined onto.
-        assert!(graph.claim(open, false).expect("claim on the new origin"));
+        let delivery = lease_ready(&mut inbox, 1, open);
+        assert!(
+            graph
+                .claim(open, &delivery.token)
+                .expect("claim on the new origin")
+        );
         assert!(matches!(
             graph.join(later, &[first]),
             Err(GraphError::NotInStatus { .. })
