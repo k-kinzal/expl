@@ -533,6 +533,31 @@ impl Inbox {
         )
     }
 
+    /// Move `event` of `role` from `from`, an agent that will never handle it
+    /// (no longer declared for the role), to `to`, unless another process
+    /// already moved it; the agent it is assigned to afterwards.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failure.
+    pub fn reassign(
+        &self,
+        role: Role,
+        event: EventId,
+        from: &str,
+        to: &str,
+    ) -> Result<String, rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE assignments SET agent = ?4 WHERE role = ?1 AND event_id = ?2 AND agent = ?3",
+            params![role.as_str(), event.0, from, to],
+        )?;
+        self.conn.query_row(
+            "SELECT agent FROM assignments WHERE role = ?1 AND event_id = ?2",
+            params![role.as_str(), event.0],
+            |r| r.get(0),
+        )
+    }
+
     /// The agent of `role` that `event` was assigned to, if it was.
     ///
     /// # Errors
@@ -965,6 +990,22 @@ mod tests {
         });
         let first = owners[0].clone();
         assert!(owners.iter().all(|o| *o == first), "{owners:?}");
+
+        // An assignment to an agent that is gone moves once, to whichever
+        // recipient asks first.
+        let gone = Inbox::open(&f.db, "explorer").expect("inbox");
+        gone.assign(Role::Exploration, EventId(2), "removed")
+            .expect("assign");
+        assert_eq!(
+            gone.reassign(Role::Exploration, EventId(2), "removed", "explorer")
+                .expect("reassign"),
+            "explorer"
+        );
+        assert_eq!(
+            gone.reassign(Role::Exploration, EventId(2), "removed", "contrarian")
+                .expect("reassign"),
+            "explorer"
+        );
 
         // After a restart, with yet other weights, the record still stands.
         let reopened = Inbox::open(&f.db, "explorer").expect("inbox");

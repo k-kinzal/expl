@@ -437,6 +437,17 @@ replicas = 1
         None
     }
 
+    /// Whether `other` shares `agent`'s role by weight in this declaration:
+    /// an assignment to an agent that does not (one since removed, or no
+    /// longer weighted) would never be handled.
+    #[must_use]
+    pub fn shares_with(&self, agent: &str, other: &str) -> bool {
+        match (self.agent.get(agent), self.agent.get(other)) {
+            (Some(agent), Some(other)) => agent.role == other.role && other.weight.is_some(),
+            _ => false,
+        }
+    }
+
     /// The agent named `name`.
     ///
     /// # Errors
@@ -508,6 +519,9 @@ mod tests {
         assert!((800..1200).contains(&counts["contrarian"]), "{counts:?}");
         // Unweighted agents react to everything of their role.
         assert_eq!(declaration.route("planner", EventId(1)), None);
+        assert!(declaration.shares_with("explorer", "contrarian"));
+        assert!(!declaration.shares_with("explorer", "removed"));
+        assert!(!declaration.shares_with("explorer", "planner"));
 
         let zero = Declaration::TEMPLATE.replace("breadth = 3\n", "breadth = 3\nweight = 0\n");
         let error = Declaration::parse(&zero).expect_err("zero weight");

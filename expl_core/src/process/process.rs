@@ -300,12 +300,19 @@ impl<'a> Process<'a> {
             // assigned to them; the others are theirs to acknowledge. The
             // assignment is recorded before either, so processes that
             // loaded different weights still agree on the one recipient.
-            let owner = match self
-                .context
-                .declaration()
-                .route(self.agent.name(), delivery.event.id)
-            {
-                Some(proposed) => Some(inbox.assign(role, delivery.event.id, proposed)?),
+            let declaration = self.context.declaration();
+            let owner = match declaration.route(self.agent.name(), delivery.event.id) {
+                Some(proposed) => {
+                    let owner = inbox.assign(role, delivery.event.id, proposed)?;
+                    // Assigned to an agent no longer declared for the role
+                    // (by a process that loaded an older declaration): it
+                    // would never be handled, so move it.
+                    if owner != proposed && !declaration.shares_with(self.agent.name(), &owner) {
+                        Some(inbox.reassign(role, delivery.event.id, &owner, proposed)?)
+                    } else {
+                        Some(owner)
+                    }
+                }
                 None => None,
             };
             if let Some(owner) = owner.filter(|owner| owner != self.agent.name()) {
