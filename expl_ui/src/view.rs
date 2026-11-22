@@ -73,6 +73,12 @@ const DOT_BOX: f32 = 16.0;
 const LABEL_W: f32 = 172.0;
 /// One trip of the comet along an edge into a running step.
 const COMET: Duration = Duration::from_millis(1400);
+/// Time between frames while comets move: smooth enough for a slow comet,
+/// without redrawing every edge at the display's rate.
+const COMET_FRAME: Duration = Duration::from_millis(66);
+/// How far outside the window something may lie and still be drawn, so
+/// labels and edges entering the window are never cut.
+const OVERSCAN: f32 = 240.0;
 /// Movement beyond this is a drag, not a click.
 const CLICK_SLOP: f32 = 4.0;
 /// Corner panels.
@@ -116,6 +122,8 @@ pub(crate) struct ExplView {
     /// The press came from a panel: bring the node into view on select.
     reveal: bool,
     epoch: Instant,
+    /// The next frame of moving comets, while one is pending.
+    ticking: Option<Task<()>>,
     _poll: Task<()>,
 }
 
@@ -173,6 +181,7 @@ impl ExplView {
             drag: None,
             pressed: None,
             reveal: false,
+            ticking: None,
             epoch: Instant::now(),
             _poll: poll,
         }
@@ -482,13 +491,16 @@ impl ExplView {
             if !focused {
                 color = color.opacity(OUT_OF_FOCUS);
             }
-            lines.push(Line {
+            let line = Line {
                 from: from + point(px(radius(source) + 4.0), px(0.0)),
                 to: to - point(px(radius(target) + 4.0), px(0.0)),
                 color,
                 width,
                 comet: target.status == NodeStatus::Running,
-            });
+            };
+            if line.visible(viewport) {
+                lines.push(line);
+            }
         }
         // A new hypothesis and the failure it was grown from: not an edge
         // (the failure is not built on), so a faint line in the failure's
@@ -508,13 +520,16 @@ impl ExplView {
             if !(lens.in_focus(failed.id) && lens.in_focus(derived.id)) {
                 color = color.opacity(OUT_OF_FOCUS);
             }
-            lines.push(Line {
+            let line = Line {
                 from: from + point(px(radius(failed) + 4.0), px(0.0)),
                 to: to - point(px(radius(derived) + 4.0), px(0.0)),
                 color,
                 width: 1.0,
                 comet: false,
-            });
+            };
+            if line.visible(viewport) {
+                lines.push(line);
+            }
         }
         lines
     }
@@ -1138,8 +1153,26 @@ impl Render for ExplView {
             .snapshot
             .nodes
             .iter()
-            .filter_map(|node| Some(self.node(node, self.centre(node.id, viewport)?, &lens, cx)))
+            .filter_map(|node| {
+                let centre = self.centre(node.id, viewport)?;
+                let x = f32::from(centre.x);
+                let y = f32::from(centre.y);
+                let shown = (-OVERSCAN..=f32::from(viewport.width) + OVERSCAN).contains(&x)
+                    && (-OVERSCAN..=f32::from(viewport.height) + OVERSCAN).contains(&y);
+                shown.then(|| self.node(node, centre, &lens, cx))
+            })
             .collect();
+        // Moving comets redraw at their own pace, not the display's.
+        if lines.iter().any(|line| line.comet) && self.ticking.is_none() {
+            self.ticking = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(COMET_FRAME).await;
+                this.update(cx, |view, cx| {
+                    view.ticking = None;
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
         let empty = self.loaded && !self.snapshot.nodes.iter().any(|n| n.kind == NodeKind::Goal);
 
         div()
@@ -1159,16 +1192,11 @@ impl Render for ExplView {
                 canvas(
                     |_, _, _| {},
                     move |bounds, (), window, _| {
-                        let mut moving = false;
                         for line in &lines {
                             line.paint(bounds.origin, window);
                             if line.comet {
-                                moving = true;
                                 line.paint_comet(bounds.origin, phase, window);
                             }
-                        }
-                        if moving {
-                            window.request_animation_frame();
                         }
                     },
                 )
@@ -1376,6 +1404,24 @@ struct Line {
 }
 
 impl Line {
+    /// Whether any of the curve can show in `viewport`: it lies within the
+    /// box of its end and control points.
+    fn visible(&self, viewport: Size<Pixels>) -> bool {
+        let (first, second) = self.controls();
+        let xs = [self.from.x, self.to.x, first.x, second.x].map(f32::from);
+        let ys = [self.from.y, self.to.y].map(f32::from);
+        let (left, right) = xs
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(*x), hi.max(*x)));
+        let (top, bottom) = ys
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), y| (lo.min(*y), hi.max(*y)));
+        right >= -OVERSCAN
+            && left <= f32::from(viewport.width) + OVERSCAN
+            && bottom >= -OVERSCAN
+            && top <= f32::from(viewport.height) + OVERSCAN
+    }
+
     /// Control points of the horizontal S-curve.
     fn controls(&self) -> (Point<Pixels>, Point<Pixels>) {
         let reach = ((self.to.x - self.from.x) * 0.5).max(px(24.0));
