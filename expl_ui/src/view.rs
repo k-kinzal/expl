@@ -50,12 +50,11 @@ use gpui::{
     Point, Render, Rgba, ScrollWheelEvent, Size, Task, Window, canvas, div, point, prelude::*, px,
 };
 
-use crate::layout::Layout;
+use crate::layout::{Layout, Streams};
 use crate::snapshot::{Snapshot, SnapshotError};
 use crate::theme;
 
 /// Distance between columns and rows, dot centre to dot centre.
-const COLUMN_STRIDE: f32 = 200.0;
 const ROW_STRIDE: f32 = 56.0;
 /// Smallest left margin of the first column.
 const MARGIN: f32 = 120.0;
@@ -177,8 +176,18 @@ impl ExplView {
         match result {
             Ok(snapshot) => {
                 let changed = !self.loaded || self.error.is_some() || snapshot != self.snapshot;
-                if snapshot.nodes != self.snapshot.nodes || snapshot.edges != self.snapshot.edges {
-                    self.layout = Layout::of(&snapshot.nodes, &snapshot.edges);
+                if snapshot.nodes != self.snapshot.nodes
+                    || snapshot.edges != self.snapshot.edges
+                    || snapshot.agents != self.snapshot.agents
+                {
+                    let explorers: Vec<(&str, u32)> = snapshot
+                        .agents
+                        .iter()
+                        .filter(|a| a.role == "exploration")
+                        .map(|a| (a.name.as_str(), a.weight))
+                        .collect();
+                    self.layout =
+                        Layout::of(&snapshot.nodes, &snapshot.edges, &Streams::of(&explorers));
                 }
                 self.snapshot = snapshot;
                 self.loaded = true;
@@ -213,7 +222,7 @@ impl ExplView {
     /// before panning: centred while the graph fits, else right-aligned so
     /// the present and the goals stay in view.
     fn anchor(&self, zoom: f32, viewport: Size<Pixels>) -> Point<Pixels> {
-        let span = self.layout.width * COLUMN_STRIDE * zoom;
+        let span = self.layout.width * ROW_STRIDE * zoom;
         let width = f32::from(viewport.width);
         let left = if span + 2.0 * MARGIN <= width {
             (width - span) / 2.0
@@ -227,7 +236,7 @@ impl ExplView {
     fn centre(&self, id: NodeId, viewport: Size<Pixels>) -> Option<Point<Pixels>> {
         let slot = self.layout.slots.get(&id)?;
         let offset = point(
-            px(slot.x * COLUMN_STRIDE * self.zoom),
+            px(slot.x * ROW_STRIDE * self.zoom),
             px(slot.row * ROW_STRIDE * self.zoom),
         );
         Some(self.anchor(self.zoom, viewport) + offset + self.pan)
@@ -246,7 +255,7 @@ impl ExplView {
     fn fit(&mut self, viewport: Size<Pixels>) {
         let rows = self.layout.slots.values().map(|slot| slot.row);
         let (top, bottom) = rows.fold((0.0_f32, 0.0_f32), |(lo, hi), r| (lo.min(r), hi.max(r)));
-        let span_x = self.layout.width * COLUMN_STRIDE;
+        let span_x = self.layout.width * ROW_STRIDE;
         let span_y = (bottom - top) * ROW_STRIDE;
         let room_x = (f32::from(viewport.width) - 2.0 * FIT_INSET_X).max(1.0);
         let room_y = (f32::from(viewport.height) - 2.0 * FIT_INSET_Y).max(1.0);

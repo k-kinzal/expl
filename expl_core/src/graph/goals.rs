@@ -172,6 +172,7 @@ mod tests {
             investigation: false,
             answer: None,
             derived_from: None,
+            proposed_by: None,
             branch: None,
             head_commit: None,
             outcome: None,

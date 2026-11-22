@@ -161,6 +161,9 @@ pub struct Node {
     /// it is a new hypothesis grown from that failure. Not an edge — the
     /// failed step is not built on.
     pub derived_from: Option<NodeId>,
+    /// Steps only: the exploration agent that proposed it; `None` when a
+    /// human added it (or it is not known).
+    pub proposed_by: Option<String>,
     /// Git branch holding this node's work (origin and change steps).
     pub branch: Option<String>,
     /// Commit at the tip of the branch once executed (origin: base commit;

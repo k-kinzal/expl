@@ -40,6 +40,8 @@ pub(crate) struct DeclaredAgent {
     pub(crate) role: String,
     /// How many processes `expl up` keeps.
     pub(crate) replicas: usize,
+    /// Its share when its role's events are routed between agents.
+    pub(crate) weight: u32,
 }
 
 /// One consistent view of the project.
@@ -106,6 +108,7 @@ impl Snapshot {
                         name,
                         role: agent.role.as_str().to_owned(),
                         replicas: agent.replicas,
+                        weight: agent.weight.unwrap_or(1),
                     })
                     .collect()
             })

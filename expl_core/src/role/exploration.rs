@@ -52,7 +52,7 @@ use serde_json::json;
 use crate::declaration::Scope;
 use crate::event::EventKind;
 use crate::graph::{
-    Evaluation, Graph, Lineage, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Snapshot,
+    Evaluation, Graph, Lineage, NewStep, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Snapshot,
 };
 use crate::prompt::Prompt;
 use crate::role::{Direction, Reaction, Report, RoleError, digest};
@@ -504,6 +504,8 @@ struct Draft<'a> {
     objective: &'a str,
     kind: StepKind,
     derived_from: Option<NodeId>,
+    /// The exploration agent proposing it.
+    proposer: &'a str,
 }
 
 /// Add one proposal to the graph, noting it in `report`.
@@ -514,14 +516,15 @@ fn record(
     after: &[NodeId],
     before: &[NodeId],
 ) {
-    match graph.propose(
-        draft.kind == StepKind::Investigation,
-        draft.title.trim(),
-        draft.objective.trim(),
+    match graph.propose(&NewStep {
+        investigation: draft.kind == StepKind::Investigation,
+        title: draft.title.trim(),
+        objective: draft.objective.trim(),
         after,
         before,
-        draft.derived_from,
-    ) {
+        derived_from: draft.derived_from,
+        proposed_by: Some(draft.proposer),
+    }) {
         Ok(id) => report.proposed.push(id),
         Err(error) => report.rejected.push(Rejection {
             title: draft.title.to_owned(),
@@ -606,6 +609,7 @@ fn explore(
                 objective: &proposal.objective,
                 kind: proposal.kind,
                 derived_from: None,
+                proposer: reaction.agent().name(),
             },
             &after,
             &before,
@@ -750,6 +754,7 @@ fn explore_failure(
                 objective: &proposal.objective,
                 kind: proposal.kind,
                 derived_from: Some(failed.id),
+                proposer: reaction.agent().name(),
             },
             &base,
             &aim.resolve(&proposal.before),
@@ -843,6 +848,7 @@ fn explore_ahead(
                 objective: &proposal.objective,
                 kind: proposal.kind,
                 derived_from: None,
+                proposer: reaction.agent().name(),
             },
             &[start.id],
             &aim.resolve(&proposal.before),
@@ -959,6 +965,7 @@ fn survey(
                 objective: &proposal.objective,
                 kind: proposal.kind,
                 derived_from: derived_from(&snapshot, proposal.derived_from),
+                proposer: reaction.agent().name(),
             },
             &after,
             &before,

@@ -1500,6 +1500,7 @@ fn a_failed_step_grows_new_hypotheses_in_its_place() {
     // It records the failure it was grown from — not as an edge, since the
     // failed step is not built on — and the failed step lists what grew.
     assert_eq!(derived["node"]["derived_from"], 3, "{derived}");
+    assert_eq!(derived["node"]["proposed_by"], "explorer", "{derived}");
     let failed = node(repo, "3");
     assert_eq!(
         failed["grown_from_failure"],
@@ -1528,7 +1529,9 @@ fn a_failed_step_grows_new_hypotheses_in_its_place() {
         repo,
         &["node", "add", "Write hello by hand", "--derived-from", "3"],
     );
-    assert_eq!(node(repo, by_hand.trim())["node"]["derived_from"], 3);
+    let by_hand = node(repo, by_hand.trim());
+    assert_eq!(by_hand["node"]["derived_from"], 3);
+    assert!(by_hand["node"]["proposed_by"].is_null(), "{by_hand}");
     let from_goal = expl(
         repo,
         &["node", "add", "Not from a step", "--derived-from", "2"],

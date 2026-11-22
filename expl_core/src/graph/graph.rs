@@ -17,8 +17,28 @@ use crate::store::{self, NOW};
 
 const NODE_COLUMNS: &str = "id, kind, status, title, objective, priority, counter_exploration, \
                             branch, head_commit, outcome, created_at, updated_at, investigation, \
-                            answer, derived_from";
+                            answer, derived_from, proposed_by";
 const EVALUATION_COLUMNS: &str = "id, node_id, goal_id, satisfied, score, reason, created_at";
+/// A step about to be proposed ([`Graph::propose`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NewStep<'a> {
+    /// An investigation rather than a change.
+    pub investigation: bool,
+    /// Short name.
+    pub title: &'a str,
+    /// What it must achieve, or the question it answers.
+    pub objective: &'a str,
+    /// Nodes it builds on.
+    pub after: &'a [NodeId],
+    /// Goals it heads toward.
+    pub before: &'a [NodeId],
+    /// The failed step it is a new hypothesis grown from
+    /// ([`Node::derived_from`]).
+    pub derived_from: Option<NodeId>,
+    /// The exploration agent proposing it; `None` for a human.
+    pub proposed_by: Option<&'a str>,
+}
+
 /// SQL condition on a predecessor `p`: it has no commit to build on yet.
 /// Every origin, current or superseded, is realised.
 const UNREALIZED: &str = "p.kind <> 'origin' AND p.status <> 'completed'";
@@ -63,6 +83,7 @@ fn node_from_row(row: &Row<'_>) -> rusqlite::Result<Node> {
         investigation: row.get(12)?,
         answer: row.get::<_, Option<String>>(13)?.map(decode).transpose()?,
         derived_from: row.get::<_, Option<i64>>(14)?.map(NodeId),
+        proposed_by: row.get(15)?,
     })
 }
 
@@ -454,7 +475,13 @@ impl Graph {
         after: &[NodeId],
         before: &[NodeId],
     ) -> Result<NodeId, GraphError> {
-        self.propose(false, title, objective, after, before, None)
+        self.propose(&NewStep {
+            title,
+            objective,
+            after,
+            before,
+            ..NewStep::default()
+        })
     }
 
     /// Propose an investigation step: a question to answer about the code or
@@ -470,26 +497,32 @@ impl Graph {
         after: &[NodeId],
         before: &[NodeId],
     ) -> Result<NodeId, GraphError> {
-        self.propose(true, title, objective, after, before, None)
+        self.propose(&NewStep {
+            investigation: true,
+            title,
+            objective,
+            after,
+            before,
+            ..NewStep::default()
+        })
     }
 
-    /// Propose a change step or, with `investigation`, an investigation.
-    /// `derived_from` is the failed step it is a new hypothesis grown from,
-    /// if any ([`Node::derived_from`]).
+    /// Propose `step` with its edges, atomically. Records `node.proposed`.
     ///
     /// # Errors
     ///
     /// As [`propose_step`](Self::propose_step); also
     /// [`GraphError::NotInStatus`] when `derived_from` is not a step.
-    pub fn propose(
-        &mut self,
-        investigation: bool,
-        title: &str,
-        objective: &str,
-        after: &[NodeId],
-        before: &[NodeId],
-        derived_from: Option<NodeId>,
-    ) -> Result<NodeId, GraphError> {
+    pub fn propose(&mut self, step: &NewStep<'_>) -> Result<NodeId, GraphError> {
+        let NewStep {
+            investigation,
+            title,
+            objective,
+            after,
+            before,
+            derived_from,
+            proposed_by,
+        } = *step;
         if let Some(failed) = derived_from
             && self.node(failed)?.kind != NodeKind::Step
         {
@@ -514,6 +547,12 @@ impl Graph {
             tx.execute(
                 "UPDATE nodes SET derived_from = ?2 WHERE id = ?1",
                 [id.0, failed.0],
+            )?;
+        }
+        if let Some(agent) = proposed_by {
+            tx.execute(
+                "UPDATE nodes SET proposed_by = ?2 WHERE id = ?1",
+                params![id.0, agent],
             )?;
         }
         for source in after {

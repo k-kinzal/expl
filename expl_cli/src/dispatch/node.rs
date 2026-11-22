@@ -118,14 +118,15 @@ fn add(start: &Path, args: &NodeAddArgs) -> Result<(), CliError> {
         after.push(graph.origin()?.id);
     }
     let objective = args.objective.clone().unwrap_or_else(|| args.title.clone());
-    let id = graph.propose(
-        args.investigation,
-        &args.title,
-        &objective,
-        &after,
-        &args.before,
-        args.derived_from,
-    )?;
+    let id = graph.propose(&expl_core::NewStep {
+        investigation: args.investigation,
+        title: &args.title,
+        objective: &objective,
+        after: &after,
+        before: &args.before,
+        derived_from: args.derived_from,
+        proposed_by: None,
+    })?;
     if let Some(priority) = args.priority {
         graph.plan_step(id, priority)?;
     }
