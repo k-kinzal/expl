@@ -1241,6 +1241,79 @@ fn the_origin_follows_the_trunk() {
 }
 
 #[test]
+fn a_step_whose_branch_is_the_trunk_fails_and_leaves_the_trunk_alone() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    ok(repo, &["goal", "add", "Say hello"]);
+    let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
+
+    // The trunk is a branch that is not checked out and is named like the
+    // step's own branch.
+    let trunk = format!("expl/node-{a}");
+    git(repo, &["checkout", "-q", "-b", &trunk]);
+    std::fs::write(repo.join("trunk.txt"), "trunk\n").expect("write");
+    git(repo, &["add", "trunk.txt"]);
+    git(repo, &["commit", "-q", "-m", "Trunk work"]);
+    git(repo, &["checkout", "-q", "main"]);
+    let tip = git(repo, &["rev-parse", &format!("refs/heads/{trunk}")]);
+    let path = repo.join("expl.toml");
+    let declaration = std::fs::read_to_string(&path).expect("declaration");
+    assert!(declaration.contains("trunk = \"main\""), "{declaration}");
+    let declaration = declaration.replacen("trunk = \"main\"", &format!("trunk = \"{trunk}\""), 1);
+    std::fs::write(&path, declaration).expect("declaration");
+
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    let step = node(repo, &a);
+    assert_eq!(step["node"]["status"], "failed", "{step}");
+    let outcome = step["node"]["outcome"].as_str().unwrap_or_default();
+    assert!(
+        outcome.contains(&format!("branch `{trunk}` is the trunk")),
+        "{step}"
+    );
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("refs/heads/{trunk}")]),
+        tip
+    );
+    assert!(!repo.join(format!(".expl/worktrees/node-{a}")).exists());
+    let completed = ok(
+        repo,
+        &[
+            "event",
+            "ls",
+            "--kind",
+            "node.completed",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(completed, "", "{completed}");
+
+    // A normal step still starts over on its own branch when retried.
+    let b = ok(repo, &["node", "add", "B", "--priority", "1"]);
+    sandbox.marker("fail", true);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    assert_eq!(node(repo, &b)["node"]["status"], "failed");
+    let branch = format!("expl/node-{b}");
+    assert!(git(repo, &["branch", "--list", &branch]).contains(&branch));
+    sandbox.marker("fail", false);
+    ok(repo, &["node", "retry", &b]);
+    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    let step = node(repo, &b);
+    assert_eq!(step["node"]["status"], "completed", "{step}");
+    assert_eq!(step["node"]["branch"], branch.as_str(), "{step}");
+    assert_eq!(
+        git(repo, &["show", &format!("{branch}:node-{b}.txt")]),
+        format!("node {b}")
+    );
+    // The trunk never moved; A stays failed.
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("refs/heads/{trunk}")]),
+        tip
+    );
+    assert_eq!(node(repo, &a)["node"]["status"], "failed");
+}
+
+#[test]
 fn idle_exploration_revisits_random_starting_points() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
@@ -1500,6 +1573,7 @@ fn a_failed_step_grows_new_hypotheses_in_its_place() {
     // It records the failure it was grown from — not as an edge, since the
     // failed step is not built on — and the failed step lists what grew.
     assert_eq!(derived["node"]["derived_from"], 3, "{derived}");
+    assert_eq!(derived["node"]["proposed_by"], "explorer", "{derived}");
     let failed = node(repo, "3");
     assert_eq!(
         failed["grown_from_failure"],
@@ -1528,7 +1602,9 @@ fn a_failed_step_grows_new_hypotheses_in_its_place() {
         repo,
         &["node", "add", "Write hello by hand", "--derived-from", "3"],
     );
-    assert_eq!(node(repo, by_hand.trim())["node"]["derived_from"], 3);
+    let by_hand = node(repo, by_hand.trim());
+    assert_eq!(by_hand["node"]["derived_from"], 3);
+    assert!(by_hand["node"]["proposed_by"].is_null(), "{by_hand}");
     let from_goal = expl(
         repo,
         &["node", "add", "Not from a step", "--derived-from", "2"],

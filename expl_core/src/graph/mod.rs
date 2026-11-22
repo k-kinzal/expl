@@ -50,7 +50,7 @@ pub use edge::Edge;
 pub use error::GraphError;
 pub use evaluation::{Evaluation, NewEvaluation};
 pub use goals::GoalTree;
-pub use graph::Graph;
+pub use graph::{Graph, NewStep};
 pub use lineage::{Epoch, Lineage, NewOrigin};
 pub use node::{Answer, Node, NodeFilter, NodeId, NodeKind, NodeStatus};
 pub use plan::{Plan, PlanId, PlannedPath};

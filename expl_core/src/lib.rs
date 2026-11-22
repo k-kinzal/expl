@@ -51,7 +51,7 @@ pub use doctor::{Doctor, DoctorError, Inconsistency, Repair};
 pub use event::{Delivery, Event, EventId, EventKind, Inbox, InboxError, LeaseToken};
 pub use graph::{
     AgentRunId, AgentRunRecord, AgentRunStatus, Edge, Epoch, Evaluation, GoalTree, Graph,
-    GraphError, Lineage, NewOrigin, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Plan,
+    GraphError, Lineage, NewOrigin, NewStep, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Plan,
     PlannedPath,
 };
 pub use process::{

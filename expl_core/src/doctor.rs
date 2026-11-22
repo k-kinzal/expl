@@ -557,7 +557,9 @@ mod tests {
             assert!(self.graph.claim(id, false).expect("claim"));
             let node = self.graph.node(id).expect("node");
             let origin = self.graph.origin().expect("origin");
-            self.workspaces().create(&node, &[origin]).expect("create");
+            self.workspaces()
+                .create(&node, &[origin], &[])
+                .expect("create");
             id
         }
 
@@ -567,7 +569,10 @@ mod tests {
             let id = self.running();
             let node = self.graph.node(id).expect("node");
             let origin = self.graph.origin().expect("origin");
-            let workspace = self.workspaces().create(&node, &[origin]).expect("create");
+            let workspace = self
+                .workspaces()
+                .create(&node, &[origin], &[])
+                .expect("create");
             std::fs::write(workspace.path().join(file), file).expect("write");
             let head = workspace.commit(file).expect("commit");
             self.graph

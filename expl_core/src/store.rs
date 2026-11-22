@@ -192,6 +192,20 @@ ALTER TABLE nodes ADD COLUMN answer TEXT CHECK (answer IN ('yes', 'no', 'unknown
 -- not an edge: the failed step is not built on.
 ALTER TABLE nodes ADD COLUMN derived_from INTEGER REFERENCES nodes (id);
 ",
+    r"
+-- The exploration agent that proposed a step (NULL: added by a human, or
+-- not known). Steps proposed before it was recorded are attributed to the
+-- exploration run that finished within the 5 seconds before them, since an
+-- exploration records its proposals as soon as its agent returns.
+ALTER TABLE nodes ADD COLUMN proposed_by TEXT;
+UPDATE nodes SET proposed_by = (
+    SELECT r.agent FROM agent_runs r
+    WHERE r.role = 'exploration' AND r.status = 'succeeded'
+      AND r.finished_at <= nodes.created_at
+      AND r.finished_at >= strftime('%Y-%m-%dT%H:%M:%fZ', nodes.created_at, '-5 seconds')
+    ORDER BY r.finished_at DESC LIMIT 1
+) WHERE kind = 'step';
+",
 ];
 
 /// Open the database at `path`, creating and migrating it as needed.
