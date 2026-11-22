@@ -153,6 +153,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
             start.extend(predecessors.iter().cloned());
             context.workspaces().create(&node, &start, &trunk).ok()
         });
+    let carried_on = resumed.is_some();
     let created = match resumed {
         Some(workspace) => Ok(workspace),
         None => context.workspaces().create(&node, &predecessors, &trunk),
@@ -163,7 +164,11 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     };
     let branch = workspace.branch().to_owned();
     graph.set_branch(id, &branch, None)?;
-    let result = carry_out(reaction, graph, &node, &continued, &branch, &mut workspace);
+    let attempt = Attempt {
+        continued: &continued,
+        carried_on,
+    };
+    let result = carry_out(reaction, graph, &node, &attempt, &branch, &mut workspace);
     // Settled either way: the branch holds what there is, and the worktree
     // goes. Not when the lease was lost or the run interrupted: the step may
     // be another process's now, working in the same place.
@@ -180,7 +185,7 @@ fn carry_out(
     reaction: &Reaction<'_>,
     graph: &mut Graph,
     node: &Node,
-    continued: &[Conclusion],
+    attempt: &Attempt<'_>,
     branch: &str,
     workspace: &mut Workspace,
 ) -> Result<Report, RoleError> {
@@ -203,7 +208,7 @@ fn carry_out(
         }
     }
 
-    let prompt = prompt(reaction, node, continued, &schema);
+    let prompt = prompt(reaction, node, attempt, &schema);
     let (succeeded, summary) = invoke(reaction, graph, id, workspace, &prompt, &schema)?;
     // The lease is the right to write this step. Lost while the agent ran,
     // the step may already be another process's: touch nothing of it.
@@ -512,15 +517,22 @@ fn resolution_prompt(
 /// The prompt: the step's own title and objective — nothing about the
 /// graph, the goals, or other steps.
 /// The conclusions that put this step back to run again, oldest first,
-/// when the latest conclusion about it is one: what this attempt carries on
-/// from. Empty for a step not being continued.
+/// while it is being carried on: since the last one, nothing concluded it
+/// done or abandoned (a continue not put back — another evaluation agent's,
+/// say — does not end it). Empty for a step not being continued.
 fn continuations(graph: &Graph, id: NodeId) -> Result<Vec<Conclusion>, RoleError> {
     let concluded = graph.conclusions_of(id)?;
-    let resumed = |c: &Conclusion| c.decision == Decision::Continue && c.reopened;
-    if !concluded.last().is_some_and(resumed) {
+    let reopened = |c: &Conclusion| c.decision == Decision::Continue && c.reopened;
+    let Some(last) = concluded.iter().rposition(reopened) else {
+        return Ok(Vec::new());
+    };
+    if concluded[last..]
+        .iter()
+        .any(|c| c.decision != Decision::Continue)
+    {
         return Ok(Vec::new());
     }
-    Ok(concluded.into_iter().filter(resumed).collect())
+    Ok(concluded.into_iter().filter(reopened).collect())
 }
 
 /// What earlier attempts of a continued step got done and what evaluation
@@ -556,13 +568,20 @@ fn continuation_section(continued: &[Conclusion], change: bool) -> String {
     out
 }
 
+/// What a change step's attempt carries on from.
+struct Attempt<'a> {
+    /// The conclusions that put it back to run ([`continuations`]).
+    continued: &'a [Conclusion],
+    /// Whether its worktree starts from what the last attempt left.
+    carried_on: bool,
+}
+
 fn prompt(
     reaction: &Reaction<'_>,
     node: &Node,
-    continued: &[Conclusion],
+    attempt: &Attempt<'_>,
     schema: &serde_json::Value,
 ) -> Prompt {
-    let resumed = continued.last().is_some_and(|c| c.resume_commit.is_some());
     Prompt::from(format!(
         "## Task\n\n{title}\n\n{objective}\n\n\
          Do the work in the working directory: edit files, run builds and tests, and verify the \
@@ -572,7 +591,7 @@ fn prompt(
          {response}",
         title = node.title,
         objective = node.objective.trim(),
-        continued = continuation_section(continued, resumed),
+        continued = continuation_section(attempt.continued, attempt.carried_on),
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),
     ))

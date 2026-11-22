@@ -132,39 +132,6 @@ pub(crate) enum Command {
     Rm(ProcessRmArgs),
 }
 
-impl Command {
-    /// Whether the command only reads: what an agent expl invoked may run.
-    pub(crate) fn is_read_only(&self) -> bool {
-        match self {
-            Self::Goal(command) => matches!(command, GoalCommand::Ls(_)),
-            Self::Node(command) => matches!(
-                command,
-                NodeCommand::Ls(_) | NodeCommand::Inspect(_) | NodeCommand::Logs(_)
-            ),
-            Self::Doctor(args) => !args.fix,
-            Self::Process(command) => matches!(
-                command,
-                ProcessCommand::Ls(_) | ProcessCommand::Inspect(_) | ProcessCommand::Logs(_)
-            ),
-            Self::Graph(_)
-            | Self::Path(_)
-            | Self::Candidate(_)
-            | Self::Origin(_)
-            | Self::Event(_)
-            | Self::Agent(_)
-            | Self::Ps(_)
-            | Self::Logs(_) => true,
-            Self::Init(_)
-            | Self::Run(_)
-            | Self::Up(_)
-            | Self::Down(_)
-            | Self::Stop(_)
-            | Self::Kill(_)
-            | Self::Rm(_) => false,
-        }
-    }
-}
-
 /// `expl init`.
 #[derive(Debug, Args)]
 pub(crate) struct InitArgs {

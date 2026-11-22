@@ -62,6 +62,8 @@ pub struct Conclusion {
     pub id: i64,
     /// The step concluded about.
     pub node: NodeId,
+    /// The evaluation agent that concluded.
+    pub agent: Option<String>,
     /// Done, abandoned, or continue.
     pub decision: Decision,
     /// The hypothesis the step stood for, as evaluation read it.
@@ -76,7 +78,8 @@ pub struct Conclusion {
     /// Continue, change steps: the commit the next attempt starts from.
     pub resume_commit: Option<String>,
     /// Continue: whether the step was put back to run again (not when
-    /// something already builds on it, or it was no longer settled).
+    /// something already builds on it or adopted it, or it was no longer
+    /// completed or failed).
     pub reopened: bool,
     /// Creation time.
     pub created_at: String,
@@ -85,6 +88,8 @@ pub struct Conclusion {
 /// A conclusion about to be recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewConclusion {
+    /// The evaluation agent concluding.
+    pub agent: String,
     /// Done, abandoned, or continue.
     pub decision: Decision,
     /// See [`Conclusion::hypothesis`].

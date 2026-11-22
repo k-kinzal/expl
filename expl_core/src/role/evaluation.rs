@@ -170,11 +170,17 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
         return judge_origin(reaction, graph, &node);
     }
     let earlier = graph.conclusions_of(id)?;
-    if let Some(last) = earlier.last()
+    let agent = reaction.agent().name();
+    // A redelivery after this agent already concluded (another evaluation
+    // agent's perspective is its own).
+    if let Some(last) = earlier
+        .iter()
+        .rev()
+        .find(|c| c.agent.as_deref() == Some(agent))
         && last.created_at > event.created_at
     {
         return Ok(Reaction::ignore(format!(
-            "{id} was concluded about at {}, after this event",
+            "{id} was concluded about by {agent} at {}, after this event",
             last.created_at
         )));
     }
@@ -230,21 +236,31 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     if decision == Decision::Continue && !may_continue {
         decision = Decision::Abandoned;
     }
-    // Verdicts on the goals are for work that stands: not a failure, nor
-    // an attempt to be carried on.
-    if failed || decision == Decision::Continue {
+    // Verdicts on the goals are for work that stands: not a failure. (Nor
+    // an attempt carried on, which `conclude` leaves out when it reopens.)
+    if failed {
         evaluations.clear();
     }
-    let reopened = graph.conclude(
+    let Some(reopened) = graph.conclude(
         id,
+        event.id,
         &NewConclusion {
+            agent: agent.to_owned(),
             decision,
             hypothesis: conclusion.hypothesis,
             finding: conclusion.finding,
             consequence: conclusion.consequence,
         },
         &evaluations,
-    )?;
+    )?
+    else {
+        return Ok(Reaction::ignore(format!(
+            "{id} was started again while it was being judged; the new attempt is judged on its own"
+        )));
+    };
+    if reopened {
+        evaluations.clear();
+    }
     Ok(report(id, Some(decision), reopened, &evaluations))
 }
 
@@ -381,8 +397,8 @@ impl StepUnderJudgment<'_> {
             );
         } else {
             out.push_str(
-                "Then, unless you decide `continue` (return no evaluations then), judge the goals \
-                 below.\n\n",
+                "Then judge the repository against the goals below, whatever you decided: the \
+                 verdicts are set aside if the step runs again.\n\n",
             );
         }
         out
@@ -436,8 +452,9 @@ fn investigation_prompt(
     Prompt::from(format!(
         "## Task\n\n\
          The step {id} was an investigation: it changed nothing, and set out to answer the \
-         question \"{title}\". Conclude about it first (below). Then, unless it failed or you decide `continue`, \
-         judge the findings on its path (below, its own last) against each goal below: how far they settle it. A goal that asks a question is \
+         question \"{title}\". Conclude about it first (below). Then, unless it \
+         failed, judge the findings on its path (below, its own last) against each goal below: \
+         how far they settle it. A goal that asks a question is \
          satisfied when the findings answer it with convincing evidence — whatever the answer; \
          a goal that asks for a change is not satisfied by findings alone, but they can move it \
          (by ruling routes in or out). Check the evidence against the working directory, which \

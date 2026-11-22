@@ -32,7 +32,7 @@ pub(crate) fn conclusion(conclusion: &Conclusion) -> String {
          {follows}: {consequence}\n",
         decision = conclusion.decision,
         reopened = if conclusion.decision == Decision::Continue && !conclusion.reopened {
-            " (not run again: work already builds on it)"
+            " (not run again)"
         } else {
             ""
         },

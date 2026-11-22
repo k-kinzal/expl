@@ -212,10 +212,11 @@ UPDATE nodes SET proposed_by = (
 -- hypothesis it stood for, what was found, and what that changes. A step
 -- continued is put back to run again, starting from `resume_commit` (what
 -- the attempt left, for a change step) with the conclusion as guidance;
--- `reopened` says whether it was.
+-- `reopened` says whether it was. `agent` is the evaluation agent.
 CREATE TABLE conclusions (
     id            INTEGER PRIMARY KEY,
     node_id       INTEGER NOT NULL REFERENCES nodes (id),
+    agent         TEXT,
     decision      TEXT NOT NULL CHECK (decision IN ('done', 'abandoned', 'continue')),
     hypothesis    TEXT NOT NULL,
     finding       TEXT NOT NULL,

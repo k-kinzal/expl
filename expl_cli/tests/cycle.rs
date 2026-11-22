@@ -36,6 +36,8 @@ if [ "$EXPL_ROLE" = exploration ] && [ "$EXPL_EVENT" = node.revisited ] && [ -f 
 fi
 mkdir -p "@DIR@/prompts"
 cat > "@DIR@/prompts/$EXPL_ROLE-$$.txt"
+map=$(sed -n 's/^`\(.*map\.json\)`$/\1/p' "@DIR@/prompts/$EXPL_ROLE-$$.txt" | head -n 1)
+if [ -n "$map" ]; then cp "$map" "@DIR@/map.json"; fi
 case "$EXPL_ROLE" in
 exploration)
   if grep -q '^## Map' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
@@ -2008,53 +2010,22 @@ fn evaluation_carries_on_a_step_that_stopped_short_from_where_it_stopped() {
         told,
         "exploration past the step was not told what it changes"
     );
-}
-
-#[test]
-fn an_agent_reads_the_graph_freely_but_cannot_change_it() {
-    let sandbox = sandbox();
-    let repo = &sandbox.repo;
-    ok(repo, &["goal", "add", "Say hello"]);
-    let as_agent = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_expl"))
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .env("EXPL_ROLE", "exploration")
-            .output()
-            .expect("expl")
-    };
-    for read in [
-        &["node", "inspect", "2"][..],
-        &["node", "ls", "--format", "json"],
-        &["graph", "show", "--format", "json"],
-        &["origin", "ls"],
-        &["path", "ls"],
-        &["candidate", "ls"],
-    ] {
-        let out = as_agent(read);
-        assert!(
-            out.status.success(),
-            "{read:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    for write in [
-        &["node", "add", "Sneak in a step"][..],
-        &["goal", "add", "Another goal"],
-        &["goal", "retire", "2", "--reason", "x"],
-        &["up"],
-    ] {
-        let out = as_agent(write);
-        assert!(!out.status.success(), "{write:?} ran as an agent");
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("may only read the graph"),
-            "{write:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    let nodes = json_lines(&ok(repo, &["node", "ls", "--format", "json"]));
-    assert!(!nodes.iter().any(|n| n["title"] == "Sneak in a step"));
+    // And it was handed the whole map, conclusions included, to analyse.
+    let map: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(sandbox.dir.path().join("map.json")).expect("map"),
+    )
+    .expect("json");
+    let concluded: Vec<&str> = map["conclusions"]
+        .as_array()
+        .expect("conclusions")
+        .iter()
+        .filter_map(|c| c["decision"].as_str())
+        .collect();
+    assert_eq!(concluded, ["continue", "done"], "{map}");
+    assert!(
+        map["nodes"].as_array().is_some_and(|n| n.len() >= 3),
+        "{map}"
+    );
 }
 
 #[test]
