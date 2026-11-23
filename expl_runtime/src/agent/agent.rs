@@ -349,8 +349,8 @@ impl Agent {
             // The daemon decides how many agents run at once. Waiting for
             // a slot is not part of the attempt: its timeout starts after.
             let slots =
-                control::acquire(cluster, self.pool.as_deref(), invocation.interrupt, || {
-                    writeln!(log, "=== waiting for an agent slot ===").ok();
+                control::acquire(cluster, self.pool.as_deref(), invocation.interrupt, |why| {
+                    writeln!(log, "=== {why} ===").ok();
                 });
             let _slots = match slots {
                 Ok(slots) => slots,
@@ -358,10 +358,9 @@ impl Agent {
                     writeln!(log, "=== interrupted ===")?;
                     return Err(AgentError::Interrupted);
                 }
-                Err(AcquireError::Io(error)) => return Err(AgentError::Io(error)),
-                Err(AcquireError::Control(error)) => {
-                    return Err(AgentError::Launch(format!("agent control: {error}")));
-                }
+                // The daemon's slots, like its members, are the transport's:
+                // an invocation that got no slot was never made.
+                Err(AcquireError::Io(error)) => return Err(AgentError::Transport(error)),
             };
             let spec = CommandSpec::capture(&command.process, invocation.directory);
             let mut stdout = RemoteLog::new(log.try_clone()?, "");

@@ -86,9 +86,6 @@ pub enum AcquireError {
     /// The process was asked to stop while it waited.
     #[error("interrupted while waiting for an agent slot")]
     Interrupted,
-    /// The limits could not be read.
-    #[error(transparent)]
-    Control(#[from] ControlError),
     /// A slot file could not be opened or locked.
     #[error("cannot use agent slots: {0}")]
     Io(#[from] io::Error),
@@ -314,30 +311,37 @@ impl Control {
 
 /// Wait until an agent invocation of an explorer of `pool` may run under
 /// `cluster`'s control, and take its slots. The control file is read again
-/// each time it looks, so a changed limit applies to whoever waits.
-/// `waiting` is called once, when no slot is free at first.
+/// each time it looks, so a changed limit applies to whoever waits. A
+/// control file that cannot be read is waited out as well: while its
+/// operator is putting it right no agent starts, and no invocation fails
+/// for it. `waiting` is told what is waited for, once each time that
+/// changes.
 ///
 /// # Errors
 ///
 /// [`AcquireError::Interrupted`] when `interrupt` is raised first;
-/// otherwise the control file or a slot file could not be used.
+/// otherwise a slot file could not be used.
 pub fn acquire(
     cluster: &Cluster,
     pool: Option<&str>,
     interrupt: &Interrupt,
-    mut waiting: impl FnMut(),
+    mut waiting: impl FnMut(&str),
 ) -> Result<AgentSlots, AcquireError> {
-    let mut waited = false;
+    let mut said = String::new();
     loop {
         if interrupt.is_raised() {
             return Err(AcquireError::Interrupted);
         }
-        if let Some(slots) = Control::load(cluster)?.try_acquire(cluster, pool)? {
-            return Ok(slots);
-        }
-        if !waited {
-            waited = true;
-            waiting();
+        let reason = match Control::load(cluster) {
+            Ok(control) => match control.try_acquire(cluster, pool)? {
+                Some(slots) => return Ok(slots),
+                None => "waiting for an agent slot".to_owned(),
+            },
+            Err(error) => format!("waiting for agent control: {error}"),
+        };
+        if reason != said {
+            waiting(&reason);
+            said = reason;
         }
         std::thread::sleep(POLL);
     }
@@ -469,16 +473,41 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_control_file_is_waited_out() {
+        let (_dir, cluster) = cluster();
+        // `agent` is not a field: the file is invalid until it is fixed.
+        write(&cluster, "[pool.semx]\nagent = 1\n");
+        let never = Interrupt::default();
+        let mut said = Vec::new();
+        let slots = std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                acquire(&cluster, Some("semx"), &never, |why| {
+                    said.push(why.to_owned());
+                })
+            });
+            std::thread::sleep(POLL * 2);
+            write(&cluster, "[pool.semx]\nagents = 1\n");
+            waiting.join().expect("thread").expect("slot")
+        });
+        drop(slots);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].starts_with("waiting for agent control:"),
+            "{said:?}"
+        );
+    }
+
+    #[test]
     fn a_waiting_invocation_stops_when_interrupted_and_sees_a_raised_limit() {
         let (_dir, cluster) = cluster();
         write(&cluster, "[agents]\nconcurrency = 1\n");
         let never = Interrupt::default();
-        let held = acquire(&cluster, None, &never, || panic!("a slot was free")).expect("slot");
+        let held = acquire(&cluster, None, &never, |_| panic!("a slot was free")).expect("slot");
 
         let interrupt = Interrupt::default();
         let mut waited = 0;
         let error = std::thread::scope(|scope| {
-            let waiting = scope.spawn(|| acquire(&cluster, None, &interrupt, || waited += 1));
+            let waiting = scope.spawn(|| acquire(&cluster, None, &interrupt, |_| waited += 1));
             std::thread::sleep(POLL * 2);
             interrupt.raise();
             waiting.join().expect("thread").expect_err("interrupted")
@@ -488,7 +517,7 @@ mod tests {
 
         // The operator raises the limit while an invocation waits.
         let second = std::thread::scope(|scope| {
-            let waiting = scope.spawn(|| acquire(&cluster, None, &never, || {}));
+            let waiting = scope.spawn(|| acquire(&cluster, None, &never, |_| {}));
             std::thread::sleep(POLL * 2);
             write(&cluster, "[agents]\nconcurrency = 2\n");
             waiting.join().expect("thread").expect("slot")

@@ -97,6 +97,22 @@ impl Lease<'_> {
         Ok(token)
     }
 
+    /// Whether this lease's token is current, without touching the lease.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failure.
+    pub fn is_current(self, conn: &Connection) -> rusqlite::Result<bool> {
+        conn.query_row(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM deliveries
+                      WHERE agent = ?1 AND event_id = ?2 AND {HELD})"
+            ),
+            params![self.consumer, self.event, self.token],
+            |row| row.get(0),
+        )
+    }
+
     /// Extend this lease if its token is current.
     ///
     /// # Errors

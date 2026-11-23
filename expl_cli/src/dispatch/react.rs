@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use expl_core::{Advance, Graph, Interrupt, Trunk};
-use expl_runtime::reaction::{self, Reaction};
+use expl_runtime::reaction::{self, Outcome, Reaction};
 use expl_runtime::telemetry;
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry::{Context, KeyValue};
@@ -22,9 +22,22 @@ use crate::telemetry::Telemetry;
 /// React, as `consumer`, to the delivery described in the environment.
 pub(crate) fn react(start: &Path, consumer: &str) -> Result<(), CliError> {
     let leased = Reaction::from_env().map_err(|error| CliError::Usage(error.to_string()))?;
-    let context = load(start)?;
+    // A declaration or agent control that cannot be read stands in the way
+    // of every reaction alike: the event is given back, not charged with a
+    // failed attempt, and is delivered once the file is put right.
+    let give_back = |error: &dyn std::fmt::Display| {
+        leased
+            .report(&Outcome::Release {
+                note: Some(error.to_string()),
+            })
+            .ok();
+    };
+    let context = load(start).inspect_err(|error| give_back(error))?;
     // The consumer's CLIs take turns across its worker's reactions.
-    let consumer = context.consumer(consumer)?.starting_at(leased.turn);
+    let consumer = context
+        .consumer(consumer)
+        .inspect_err(|error| give_back(error))?
+        .starting_at(leased.turn);
     let project = context.project();
     let _telemetry = Telemetry::start(project, context.declaration().telemetry.as_ref(), false);
     let interrupt = leased

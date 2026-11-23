@@ -188,13 +188,49 @@ pub(crate) fn stop(
     Ok(())
 }
 
-/// SIGKILL the process and record it as exited.
+/// SIGKILL the process, and the command it was running, and record it as
+/// exited.
 fn kill(table: &Processes, record: &ProcessRecord) -> Result<(), CliError> {
     if let Some(pid) = record.pid {
+        // A worker's command leads a process group of its own, which a
+        // killed worker can no longer stop: left alone it would work on
+        // while its event is delivered again.
+        let commands = children(pid);
         signal(pid, "-KILL");
+        for command in commands {
+            signal_group(command, "-KILL");
+        }
     }
     table.exit(record.id, "killed")?;
     Ok(())
+}
+
+/// The processes `pid` started that are still its children.
+fn children(pid: u32) -> Vec<u32> {
+    Command::new("pgrep")
+        .arg("-P")
+        .arg(pid.to_string())
+        .stderr(Stdio::null())
+        .output()
+        .map(|found| {
+            String::from_utf8_lossy(&found.stdout)
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn signal_group(leader: u32, signal: &str) {
+    // Best effort: the group may already be gone.
+    Command::new("kill")
+        .arg(signal)
+        .arg("--")
+        .arg(format!("-{leader}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok();
 }
 
 fn signal(pid: u32, signal: &str) {

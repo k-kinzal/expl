@@ -773,6 +773,12 @@ pub fn up(
         }
     }
     fs::create_dir_all(&explorer.logs)?;
+    // One launch at a time for an explorer: each counts the live workers
+    // before it starts the missing ones, and two counting at once would
+    // both start them.
+    fs::create_dir_all(&explorer.state)?;
+    let launching = cluster::lock_file(&explorer.state.join("up.lock"))?;
+    launching.lock()?;
     let mut table = explorer.processes()?;
     // A launch that never got adopted gives its slot back; its child, if
     // it ever arrives, can no longer adopt the record.

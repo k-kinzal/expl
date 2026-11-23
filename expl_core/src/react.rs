@@ -55,12 +55,17 @@ pub fn react(
             "abandoned: the process reacting to {} died on attempt {} of {}",
             delivery.event, delivery.attempts, leased.max_attempts
         );
-        return Ok(match handler.abandon(&delivery, &mut graph, &why)? {
-            Abandonment::Settled(_) => settled_elsewhere(&delivery),
-            abandoned @ (Abandonment::Nothing | Abandonment::Failed(_)) => Outcome::Retry {
+        return Ok(match handler.abandon(&delivery, &mut graph, &why) {
+            Ok(Abandonment::Settled(_)) => settled_elsewhere(&delivery),
+            Ok(abandoned @ (Abandonment::Nothing | Abandonment::Failed(_))) => Outcome::Retry {
                 note: abandoned
                     .failed()
                     .map_or_else(String::new, |node| format!("{node} failed")),
+            },
+            // The cleanup was not made: the worker asks for it again
+            // instead of giving the delivery up with its step left running.
+            Err(error) => Outcome::Release {
+                note: Some(error.to_string()),
             },
         });
     }

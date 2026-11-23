@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::Interrupt;
-use crate::delivery::{Delivery, Event, Inbox, InboxError, LeaseToken};
+use crate::delivery::{Delivery, Event, Inbox, LeaseToken};
 use crate::event::EventId;
 
 /// The consumer reacting.
@@ -285,9 +285,10 @@ impl Reaction {
             while !told.load(Ordering::SeqCst) && std::os::unix::process::parent_id() == parent {
                 thread::sleep(WATCH);
             }
-            let lost = Inbox::open(&database, &consumer).is_ok_and(|inbox| {
-                matches!(inbox.renew(&delivery), Err(InboxError::LeaseLost { .. }))
-            });
+            // Looked at, never renewed: a lease whose worker is gone must
+            // run out, so that the event can be delivered again.
+            let lost = Inbox::open(&database, &consumer)
+                .is_ok_and(|inbox| matches!(inbox.holds(&delivery), Ok(false)));
             if lost {
                 watched.lose_lease();
             } else {

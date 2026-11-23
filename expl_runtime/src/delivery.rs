@@ -613,6 +613,16 @@ impl Inbox {
         Ok(changed == 1)
     }
 
+    /// Whether `delivery` is still this holder's, without extending its
+    /// lease: what a command asks when it is told to stop.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failure.
+    pub fn holds(&self, delivery: &Delivery) -> Result<bool, rusqlite::Error> {
+        self.lease_identity(delivery).is_current(&self.conn)
+    }
+
     /// Extend the lease of `delivery` while its token is current, even
     /// after expiry.
     ///

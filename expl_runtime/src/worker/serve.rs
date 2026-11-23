@@ -18,6 +18,7 @@ use crate::Interrupt;
 use crate::agent::supervisor::{End, Reaped, Stop, TERMINATION_GRACE, reap_group, wait_stopping};
 use crate::capacity::Capacity;
 use crate::cluster::{self, Authority, CommandSpec};
+use crate::daemon;
 use crate::delivery::{Delivery, Inbox, InboxError, Lease};
 use crate::event::{EPOCH, EventId, EventLog};
 use crate::process::{HEARTBEAT_SECONDS, ProcessId, ProcessOptions, ProcessRecord, Processes};
@@ -38,7 +39,11 @@ pub const MAX_ATTEMPTS: i64 = 3;
 /// (SIGTERM, to the command alone). It has an agent of its own to stop
 /// first, which takes that agent's termination grace, the grace of what the
 /// agent left behind, and the time a killed process group takes to vanish.
-pub const REACTION_GRACE: Duration = Duration::from_secs(30);
+pub const REACTION_GRACE: Duration = Duration::from_secs(20);
+
+/// How long a worker waits before it asks again for a cleanup that could
+/// not be made.
+const CLEANUP_RETRY: Duration = Duration::from_secs(30);
 
 /// The name idle commands are logged under.
 const IDLE: &str = "idle";
@@ -144,8 +149,22 @@ enum Ended {
     Exited(ExitStatus),
     /// It was stopped because the worker, or the reaction, was interrupted.
     Interrupted,
-    /// It could not be run or supervised.
+    /// It ran, and something about how it ended is a failure of its own.
     Failed(String),
+    /// It could not be run at all: nothing was made of the event.
+    Unrunnable(String),
+}
+
+/// What became of the cleanup after a reaction that died on its last
+/// attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cleanup {
+    /// The command acknowledged the delivery instead, and it is settled so.
+    Acknowledged,
+    /// Nothing is left hanging: the delivery can be given up.
+    Done,
+    /// The cleanup could not be made now.
+    Unmade,
 }
 
 /// A command that was executed.
@@ -157,9 +176,9 @@ struct Ran {
 }
 
 impl Ran {
-    fn failed(reason: impl Into<String>) -> Self {
+    fn unrunnable(reason: impl Into<String>) -> Self {
         Self {
-            end: Ended::Failed(reason.into()),
+            end: Ended::Unrunnable(reason.into()),
             stdout: String::new(),
             stderr: String::new(),
         }
@@ -199,6 +218,12 @@ impl Ran {
             },
             Ended::Failed(reason) => Outcome::Retry {
                 note: reason.clone(),
+            },
+            // A command that never ran says nothing about its event: a
+            // missing program or an unreachable member is put right
+            // without the event paying for it.
+            Ended::Unrunnable(reason) => Outcome::Release {
+                note: Some(reason.clone()),
             },
         }
     }
@@ -340,6 +365,8 @@ impl Worker<'_> {
         // Starts the first cooldown: a fresh worker reacts to its backlog
         // before its idle command runs.
         let mut last_reaction = Instant::now();
+        // When the deliveries left abandoned are looked at next.
+        let mut next_cleanup = Instant::now();
         observer.state(Phase::WaitingForEvents);
         loop {
             if self.orphaned() {
@@ -357,7 +384,11 @@ impl Worker<'_> {
                 );
                 tasks.say(name, &ran, observer);
             }
-            self.give_up_abandoned(consumer, &inbox, &turn, observer)?;
+            if Instant::now() >= next_cleanup
+                && !self.give_up_abandoned(consumer, &inbox, &turn, observer)?
+            {
+                next_cleanup = Instant::now() + CLEANUP_RETRY;
+            }
             let (delivery, slots) = match inbox.lease_with(
                 &consumer.on,
                 self.id.0,
@@ -486,14 +517,34 @@ impl Worker<'_> {
                 // A command that reported the failure itself has cleaned up
                 // after its last attempt; for one that died, ask now.
                 Outcome::Retry { note } => {
-                    let settled = !reported
-                        && delivery.attempts >= MAX_ATTEMPTS
-                        && self.settle_abandoned(consumer, &inbox, &delivery, &turn, observer)?;
-                    if !settled {
-                        match holding(inbox.fail(&delivery, &note, MAX_ATTEMPTS))? {
-                            Some(retry) => failed(&note, retry),
-                            None => lost(),
+                    let cleanup = if !reported && delivery.attempts >= MAX_ATTEMPTS {
+                        // Still this worker's delivery: its lease is kept
+                        // alive while the command cleans up.
+                        held.react(delivery.clone(), &interrupt, || {
+                            self.settle_abandoned(consumer, &inbox, &delivery, &turn, observer)
+                        })?
+                    } else {
+                        Cleanup::Done
+                    };
+                    match cleanup {
+                        Cleanup::Acknowledged => {}
+                        Cleanup::Done => {
+                            match holding(inbox.fail(&delivery, &note, MAX_ATTEMPTS))? {
+                                Some(retry) => {
+                                    failed(&note, retry);
+                                    if retry {
+                                        // Not at once: a failure that would
+                                        // pass by itself gets the time to.
+                                        thread::sleep(POLL * 2);
+                                    }
+                                }
+                                None => lost(),
+                            }
                         }
+                        // The delivery is left as it is: once its lease runs
+                        // out it is abandoned, and the cleanup is asked for
+                        // again.
+                        Cleanup::Unmade => failed(&note, false),
                     }
                 }
             }
@@ -518,20 +569,26 @@ impl Worker<'_> {
     /// (run with [`Mode::Abandon`]; a retry it reports says what it cleaned
     /// up). A delivery the command acknowledges instead (its work was
     /// settled elsewhere meanwhile) is acknowledged: nothing of it was left
-    /// hanging.
+    /// hanging. A delivery whose cleanup could not be made (the command did
+    /// not run, was stopped, or gave the event back) stays abandoned;
+    /// `false` when there is one, so that it is asked for again later.
     fn give_up_abandoned(
         &self,
         consumer: &ConsumerRegistration,
         inbox: &Inbox,
         turn: &AtomicU64,
         observer: &dyn Observer,
-    ) -> Result<(), WorkerError> {
+    ) -> Result<bool, WorkerError> {
+        let mut all = true;
         for delivery in inbox.abandoned(&consumer.on, MAX_ATTEMPTS)? {
             if self.interrupt.is_raised() {
-                break;
+                return Ok(false);
             }
             let (reported, outcome) =
                 self.execute(consumer, &delivery, Mode::Abandon, turn, &self.interrupt);
+            if self.orphaned() || self.interrupt.is_raised() {
+                return Ok(false);
+            }
             let note = match outcome {
                 // Only a command that says so: one that merely exits with
                 // success has not looked at what was left behind.
@@ -547,10 +604,13 @@ impl Worker<'_> {
                     None
                 }
                 Outcome::Retry { note } if reported => Some(note),
-                Outcome::Acknowledge { .. }
-                | Outcome::Retry { .. }
-                | Outcome::Release { .. }
-                | Outcome::Lost => None,
+                Outcome::Release { .. } | Outcome::Lost => {
+                    all = false;
+                    continue;
+                }
+                // A command that exits without a word takes no notice of
+                // abandoned deliveries: there is nothing to wait for.
+                Outcome::Acknowledge { .. } | Outcome::Retry { .. } => None,
             };
             if inbox.give_up_abandoned(&delivery)? {
                 observer.observe(&Activity::Abandoned {
@@ -559,12 +619,11 @@ impl Worker<'_> {
                 });
             }
         }
-        Ok(())
+        Ok(all)
     }
 
     /// A reaction died on its last attempt without reporting: let the
-    /// command clean up after it. `true` when the command acknowledged the
-    /// delivery instead and it was settled so.
+    /// command clean up after it, and say what became of the cleanup.
     fn settle_abandoned(
         &self,
         consumer: &ConsumerRegistration,
@@ -572,21 +631,28 @@ impl Worker<'_> {
         delivery: &Delivery,
         turn: &AtomicU64,
         observer: &dyn Observer,
-    ) -> Result<bool, WorkerError> {
+    ) -> Result<Cleanup, WorkerError> {
         let (reported, outcome) =
             self.execute(consumer, delivery, Mode::Abandon, turn, &self.interrupt);
-        if reported
-            && let Outcome::Acknowledge { note, kind, .. } = outcome
-            && holding(inbox.ack(delivery, note.as_deref()))?.is_some()
-        {
-            observer.observe(&Activity::Reacted {
-                delivery,
-                note: note.as_deref(),
-                kind: kind.as_deref(),
-            });
-            return Ok(true);
+        if self.orphaned() || self.interrupt.is_raised() {
+            return Ok(Cleanup::Unmade);
         }
-        Ok(false)
+        Ok(match outcome {
+            Outcome::Acknowledge { note, kind, .. } if reported => {
+                if holding(inbox.ack(delivery, note.as_deref()))?.is_some() {
+                    observer.observe(&Activity::Reacted {
+                        delivery,
+                        note: note.as_deref(),
+                        kind: kind.as_deref(),
+                    });
+                    Cleanup::Acknowledged
+                } else {
+                    Cleanup::Done
+                }
+            }
+            Outcome::Release { .. } | Outcome::Lost => Cleanup::Unmade,
+            Outcome::Acknowledge { .. } | Outcome::Retry { .. } => Cleanup::Done,
+        })
     }
 
     /// Execute the consumer's command for `delivery`. Returns what it came
@@ -631,6 +697,21 @@ impl Worker<'_> {
         };
         let mut command = self.command(&consumer.run, &consumer.env);
         command.envs(reaction.environment());
+        if remote {
+            // A member's job inherits nothing of this worker: what binds a
+            // command to the daemon, its term and the explorer's pool is
+            // sent with it.
+            for name in [
+                daemon::CLUSTER,
+                daemon::PROJECT,
+                daemon::SESSION,
+                daemon::POOL,
+            ] {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+        }
         if reaction.delivery.event.subject.is_none() {
             command.env_remove(reaction::SUBJECT);
         }
@@ -691,12 +772,12 @@ impl Worker<'_> {
         interrupt: &Interrupt,
     ) -> Ran {
         if command.get_program().is_empty() {
-            return Ran::failed("no command to run");
+            return Ran::unrunnable("no command to run");
         }
         match self.authority.filter(|_| remote) {
             Some(authority) => run_on_member(authority, command, self.directory, stop, interrupt),
             None => run_locally(command, stop, interrupt).unwrap_or_else(|error| {
-                Ran::failed(format!(
+                Ran::unrunnable(format!(
                     "cannot run `{}`: {error}",
                     command.get_program().display()
                 ))
@@ -729,8 +810,10 @@ fn run_on_member(
             Ok(cluster::Outcome::Lingering { group }) => Ended::Failed(format!(
                 "the command's processes in group {group} survived SIGKILL"
             )),
-            Ok(cluster::Outcome::Failed(reason)) => Ended::Failed(reason),
-            Err(error) => Ended::Failed(format!("cluster transport failed: {error}")),
+            // The member could not start or supervise it, or could not be
+            // reached.
+            Ok(cluster::Outcome::Failed(reason)) => Ended::Unrunnable(reason),
+            Err(error) => Ended::Unrunnable(format!("cluster transport failed: {error}")),
         };
     Ran {
         end,
@@ -830,7 +913,9 @@ impl<'a> Tasks<'a> {
             Ended::Exited(status) if status.success() => ran.stdout.trim().to_owned(),
             Ended::Exited(status) => format!("`{name}` exited with {status}: {}", ran.tail()),
             Ended::Interrupted => return,
-            Ended::Failed(reason) => format!("`{name}` failed: {reason}"),
+            Ended::Failed(reason) | Ended::Unrunnable(reason) => {
+                format!("`{name}` failed: {reason}")
+            }
         };
         if self.said.get(name).is_some_and(|said| *said == output) {
             return;
@@ -1116,6 +1201,89 @@ mod tests {
             assert_eq!(explorer.until_idle(), [line, "exiting: idle"]);
             assert_eq!(explorer.status(event), status);
         }
+    }
+
+    #[test]
+    fn a_cleanup_that_could_not_be_made_is_asked_for_again() {
+        // The command cannot clean up yet and says so by giving the event
+        // back: the delivery is not given up with its work left hanging.
+        let unmade = r#"echo "$EXPL_REACTION $EXPL_ATTEMPTS" >> @DIR@/calls
+               printf '{"outcome":"release","note":"busy"}' > "$EXPL_OUTCOME""#;
+        let made = r#"echo "$EXPL_REACTION $EXPL_ATTEMPTS" >> @DIR@/calls
+               printf '{"outcome":"retry","note":"step 7 failed"}' > "$EXPL_OUTCOME""#;
+        let mut explorer = Explorer::new(unmade);
+        let event = explorer.publish(Some(7));
+        kill_every_holder(&explorer);
+        assert_eq!(explorer.until_idle(), ["exiting: idle"]);
+        assert_eq!(explorer.lines("calls"), ["abandon 3"]);
+        assert_eq!(explorer.status(event), "leased");
+
+        explorer.consumer().run = explorer.shell(made);
+        assert_eq!(
+            explorer.until_idle(),
+            ["abandoned e1: step 7 failed", "exiting: idle"]
+        );
+        assert_eq!(explorer.status(event), "failed");
+
+        // The same when the reaction itself died on its last attempt: the
+        // delivery stays this worker's until its lease runs out, and is
+        // then abandoned like any other.
+        let explorer = Explorer::new(
+            r#"echo "$EXPL_REACTION $EXPL_ATTEMPTS" >> @DIR@/calls
+               [ "$EXPL_REACTION" = abandon ] || exit 1
+               printf '{"outcome":"release"}' > "$EXPL_OUTCOME""#,
+        );
+        let event = explorer.publish(None);
+        let seen = explorer.until_idle();
+        assert_eq!(
+            explorer.lines("calls"),
+            ["react 1", "react 2", "react 3", "abandon 3"]
+        );
+        assert_eq!(explorer.delivery(event).0, "leased");
+        assert_eq!(seen.len(), 4, "{seen:?}");
+    }
+
+    #[test]
+    fn a_command_that_cannot_be_started_does_not_charge_its_event() {
+        let mut explorer = Explorer::new("");
+        let program = explorer.dir.path().join("program");
+        explorer.consumer().run = vec![program.display().to_string()];
+        let event = explorer.publish(None);
+        let options = ProcessOptions {
+            once: false,
+            exit_when_idle: true,
+        };
+        let (reason, seen) = thread::scope(|scope| {
+            let worker = scope.spawn(|| explorer.run(options, Interrupt::default(), None));
+            // The event was leased, found unrunnable and given back.
+            let deadline = Instant::now() + scaled(Duration::from_secs(20));
+            loop {
+                let given_back: bool = explorer
+                    .conn()
+                    .query_row(
+                        "SELECT EXISTS (SELECT 1 FROM deliveries WHERE status = 'pending')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("deliveries");
+                if given_back {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "the event was never given back");
+                thread::sleep(Duration::from_millis(20));
+            }
+            // The program appears: a shell that reads nothing and exits.
+            std::os::unix::fs::symlink("/bin/sh", &program).expect("program");
+            worker.join().expect("worker")
+        });
+        assert_eq!(reason, "idle");
+        let (status, attempts, _) = explorer.delivery(event);
+        assert_eq!((status.as_str(), attempts), ("done", 1));
+        assert!(
+            seen[0].starts_with("failed e1 (retry): cannot run"),
+            "{seen:?}"
+        );
+        assert_eq!(seen[seen.len() - 2..], ["reacted e1: -", "exiting: idle"]);
     }
 
     #[test]
