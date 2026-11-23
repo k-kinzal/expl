@@ -226,8 +226,17 @@ fn wait_until(repo: &Path, what: &str, mut condition: impl FnMut() -> bool) {
         let elapsed = start.elapsed();
         if elapsed >= timeout {
             let events = expl(repo, &["event", "ls"]);
+            let mut logs = String::new();
+            for entry in std::fs::read_dir(repo.join(".expl/proc"))
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                logs.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+            }
             panic!(
-                "timed out after {elapsed:.2?} waiting for {what}\nRecent events:\n{}{}",
+                "timed out after {elapsed:.2?} waiting for {what}\nRecent events:\n{}{}\n\
+                 Process logs:\n{logs}",
                 String::from_utf8_lossy(&events.stdout),
                 String::from_utf8_lossy(&events.stderr)
             );
@@ -2632,6 +2641,29 @@ fn clustered_workers_use_members_and_survive_a_leader_crash() {
             .any(|node| node.title == "distributed")
     );
     assert!(through(&["goal", "ls"]).contains("distributed"));
+    // The project is one explorer of the daemon, addressed by name from
+    // anywhere.
+    let named = expl(
+        sandbox.dir.path(),
+        &[
+            "--cluster",
+            path.to_str().expect("cluster directory"),
+            "--member",
+            "beta",
+            "--explorer",
+            "repo",
+            "goal",
+            "ls",
+        ],
+    );
+    assert!(
+        String::from_utf8_lossy(&named.stdout).contains("distributed"),
+        "{named:?}"
+    );
+    assert_eq!(
+        json(&through(&["cluster", "status"]))["explorers"],
+        serde_json::json!(["repo"])
+    );
 
     first.0.kill().expect("crash the leader");
     first.0.wait().expect("reap the leader");

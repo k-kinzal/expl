@@ -3,6 +3,7 @@
 mod consumer;
 mod doctor;
 mod event;
+pub(crate) mod explorer;
 mod goal;
 mod graph;
 mod hypothesis;
@@ -33,9 +34,20 @@ pub(crate) fn dispatch(cli: Cli) -> Result<(), CliError> {
         None => std::env::current_dir().map_err(|e| CliError::io("current directory", e))?,
     };
     match cli.command {
-        Command::Daemon | Command::Cluster(_) | Command::RuntimeJob { .. } => Err(CliError::Usage(
+        Command::Daemon
+        | Command::Join
+        | Command::Cluster(_)
+        | Command::Explorer(_)
+        | Command::RuntimeJob { .. }
+        | Command::RuntimeWorker(_) => Err(CliError::Usage(
             "daemon command must run at the client entry point".to_owned(),
         )),
+        Command::RuntimeRecover => {
+            // The workers of the last term are gone, and with them the
+            // agent runs they journaled as running.
+            let (_, mut graph) = open(&start)?;
+            Ok(graph.interrupt_agent_runs("leader changed")?)
+        }
 
         Command::RuntimeOverview => {
             let project = Project::discover(&start)?;

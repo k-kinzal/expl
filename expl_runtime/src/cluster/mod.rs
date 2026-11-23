@@ -77,7 +77,7 @@ impl Cluster {
     pub fn open(root: &Path) -> io::Result<Self> {
         fs::create_dir_all(root)?;
         let root = root.canonicalize()?;
-        for subdir in ["members", "sessions", "requests", "staging"] {
+        for subdir in ["members", "sessions", "requests", "staging", "explorers"] {
             fs::create_dir_all(root.join(subdir))?;
         }
         Ok(Self { root })
@@ -208,7 +208,34 @@ impl Cluster {
     }
 }
 
-fn check_name(name: &str) -> io::Result<()> {
+#[cfg(test)]
+impl Cluster {
+    /// An authority whose session is held by the returned file, without a
+    /// serving daemon: its term ends when the file is dropped.
+    pub(crate) fn test_term(&self, name: &str) -> (Authority, tempfile::NamedTempFile) {
+        let session = tempfile::Builder::new()
+            .prefix("peer-")
+            .tempfile_in(self.root.join("sessions"))
+            .expect("session");
+        session.as_file().lock().expect("hold the session");
+        let peer = Peer {
+            name: name.to_owned(),
+            session: session
+                .path()
+                .file_name()
+                .expect("session name")
+                .to_string_lossy()
+                .into_owned(),
+        };
+        let authority = Authority {
+            cluster: self.clone(),
+            peer,
+        };
+        (authority, session)
+    }
+}
+
+pub(crate) fn check_name(name: &str) -> io::Result<()> {
     if !name.is_empty()
         && name.len() <= 100
         && name
@@ -224,7 +251,7 @@ fn check_name(name: &str) -> io::Result<()> {
     }
 }
 
-fn lock_file(path: &Path) -> io::Result<File> {
+pub(crate) fn lock_file(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
         .write(true)
@@ -264,7 +291,7 @@ fn occupied(path: &Path) -> io::Result<bool> {
     }
 }
 
-fn read_optional<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+pub(crate) fn read_optional<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
@@ -272,7 +299,7 @@ fn read_optional<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     }
 }
 
-fn atomic_json(path: &Path, data: &impl Serialize) -> io::Result<()> {
+pub(crate) fn atomic_json(path: &Path, data: &impl Serialize) -> io::Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(path.parent().expect("file parent"))?;
     serde_json::to_writer(&mut temp, data)?;
     temp.persist(path)?;

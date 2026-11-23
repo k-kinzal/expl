@@ -81,7 +81,7 @@ impl<'a> From<&'a ProcessRecord> for ProcessOutput<'a> {
     }
 }
 
-fn ls(table: &Processes, args: &PsArgs) -> Result<(), CliError> {
+pub(crate) fn ls(table: &Processes, args: &PsArgs) -> Result<(), CliError> {
     let records = table.list(args.all)?;
     if args.listing.quiet {
         for record in &records {

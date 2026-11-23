@@ -9,8 +9,10 @@
 //! independent events run in parallel.
 
 mod heartbeat;
+mod log;
 mod serve;
 mod telemetry;
 
 pub use heartbeat::{Active, with_heartbeat};
+pub use log::ActivityLog;
 pub use serve::{Activity, MAX_ATTEMPTS, Observer, REACTION_GRACE, Worker, WorkerError};

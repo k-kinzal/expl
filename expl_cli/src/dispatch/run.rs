@@ -38,12 +38,25 @@ pub(crate) fn run(start: &Path, args: &RunArgs) -> Result<(), CliError> {
         exit_when_idle: args.exit_when_idle,
     };
     if args.detach {
-        let record = if context.authority().is_some() {
-            table.create_resumable(consumer.name(), args.name.as_deref(), options)?
+        let (record, spawned) = if let Some(authority) = context.authority() {
+            // Under a daemon the worker is the daemon's: it is started
+            // from what the project registers, and restarted after an
+            // election.
+            let explorer = crate::daemon::register(project, authority.cluster())?;
+            let exe =
+                std::env::current_exe().map_err(|e| CliError::io("locate the expl binary", e))?;
+            let record = table.create_resumable(consumer.name(), args.name.as_deref(), options)?;
+            let spawned =
+                expl_runtime::daemon::spawn_worker(&exe, authority, &explorer, &record, options)
+                    .map(drop)
+                    .map_err(|e| CliError::io("start detached process", e));
+            (record, spawned)
         } else {
-            table.create(consumer.name(), args.name.as_deref(), true)?
+            let record = table.create(consumer.name(), args.name.as_deref(), true)?;
+            let spawned = spawn_detached(project, &record, options).map(drop);
+            (record, spawned)
         };
-        if let Err(error) = spawn_detached(project, &record, options, None) {
+        if let Err(error) = spawned {
             table.exit(record.id, &format!("failed to start: {error}"))?;
             return Err(error);
         }
@@ -97,11 +110,10 @@ fn open_log(record: &ProcessRecord) -> Result<File, CliError> {
         .map_err(|e| CliError::io(format!("open {}", record.log_path), e))
 }
 
-pub(crate) fn spawn_detached(
+fn spawn_detached(
     project: &Project,
     record: &ProcessRecord,
     options: ProcessOptions,
-    authority: Option<&expl_runtime::cluster::Authority>,
 ) -> Result<std::process::Child, CliError> {
     let exe = std::env::current_exe().map_err(|e| CliError::io("locate the expl binary", e))?;
     let log = open_log(record)?;
@@ -118,9 +130,6 @@ pub(crate) fn spawn_detached(
         .stdout(log)
         .stderr(log_err)
         .process_group(0);
-    if let Some(authority) = authority {
-        crate::daemon::bind(&mut command, project.root(), authority)?;
-    }
     if options.once {
         command.arg("--once");
     }

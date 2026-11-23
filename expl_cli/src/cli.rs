@@ -59,6 +59,11 @@ pub(crate) struct Cli {
     #[arg(long, global = true, env = "EXPL_MEMBER", default_value = "local")]
     pub(crate) member: String,
 
+    /// The explorer an operation is about, when the daemon hosts several
+    /// and the command is not run inside one of them.
+    #[arg(long, global = true, env = "EXPL_EXPLORER", value_name = "NAME")]
+    pub(crate) explorer: Option<String>,
+
     /// Subcommand to dispatch.
     #[command(subcommand)]
     pub(crate) command: Command,
@@ -67,14 +72,39 @@ pub(crate) struct Cli {
 /// Top-level subcommands.
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Serve the project as leader or member. A single daemon elects itself.
+    /// Serve as leader or member. A single daemon elects itself.
+    #[command(
+        long_about = "Serve the daemon directory as leader or member. A single daemon elects \
+                      itself. Inside a project the project joins the daemon (its own \
+                      .expl/daemon unless --cluster names another). With --cluster outside a \
+                      project the daemon hosts whatever explorers are registered with it."
+    )]
     Daemon,
-    /// Show the selected daemon and the elected leader.
+    /// Join the project to the daemon named by --cluster, without starting one.
+    Join,
+    /// Show the selected daemon, the elected leader and the explorers it hosts.
     Cluster(ClusterArgs),
+    /// Manage the explorers a daemon hosts.
+    #[command(
+        subcommand,
+        long_about = "Manage the explorers registered with a daemon. An explorer is whatever \
+                      registers consumers: which events they react to, the command executed \
+                      for one event, and where it runs. A project made with `expl init` joins \
+                      by `expl daemon` or `expl join`; any other explorer is added from a \
+                      file. These commands need --cluster (or a project that joined)."
+    )]
+    Explorer(ExplorerCommand),
     #[command(hide = true)]
     RuntimeOverview,
     #[command(hide = true)]
     RuntimeJob { name: String, peer: String },
+    /// One worker of a registered consumer. What the daemon starts.
+    #[command(hide = true)]
+    RuntimeWorker(RuntimeWorkerArgs),
+    /// Put right what a lost leader left half done. What the daemon runs
+    /// for this project after an election.
+    #[command(hide = true)]
+    RuntimeRecover,
     /// React, as a consumer, to the event a worker leased (described in
     /// the environment). What a worker executes for one event.
     #[command(hide = true)]
@@ -165,6 +195,105 @@ pub(crate) struct ClusterArgs {
 pub(crate) enum ClusterCommand {
     /// Show the daemon role and the current leader as JSON.
     Status,
+}
+
+/// The worker the daemon starts for a registered consumer.
+#[derive(Debug, Args)]
+pub(crate) struct RuntimeWorkerArgs {
+    /// The registered explorer.
+    #[arg(long)]
+    pub(crate) explorer: String,
+    /// One of its consumers.
+    #[arg(long)]
+    pub(crate) consumer: String,
+    /// The process record to adopt.
+    #[arg(long)]
+    pub(crate) adopt: i64,
+    /// Exit after reacting to one event.
+    #[arg(long)]
+    pub(crate) once: bool,
+    /// Exit when there is no work to deliver.
+    #[arg(long)]
+    pub(crate) exit_when_idle: bool,
+}
+
+/// `expl explorer ...`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum ExplorerCommand {
+    /// List the registered explorers.
+    Ls(ListingArgs),
+    /// Register an explorer from a TOML (or `*.json`) file, creating the
+    /// framework's tables in its database when it has none.
+    Add(ExplorerAddArgs),
+    /// Remove an explorer from the daemon (its workers must be stopped).
+    Rm(ExplorerNameArgs),
+    /// Start workers until each of its consumers has `replicas` running.
+    Up(ExplorerUpArgs),
+    /// Stop every worker of an explorer.
+    Down(ExplorerDownArgs),
+    /// List an explorer's workers.
+    Ps(ExplorerPsArgs),
+    /// Append an event to an explorer's event log.
+    Publish(ExplorerPublishArgs),
+}
+
+/// `expl explorer add`.
+#[derive(Debug, Args)]
+pub(crate) struct ExplorerAddArgs {
+    /// The explorer's file: name, database, and its consumers, tasks and
+    /// routing. Paths in it are relative to the file.
+    pub(crate) file: PathBuf,
+}
+
+/// One registered explorer.
+#[derive(Debug, Args)]
+pub(crate) struct ExplorerNameArgs {
+    /// The explorer's registered name.
+    pub(crate) name: String,
+}
+
+/// `expl explorer up`.
+#[derive(Debug, Args)]
+pub(crate) struct ExplorerUpArgs {
+    /// The explorer's registered name.
+    pub(crate) name: String,
+    /// Only these consumers (default: all it registers).
+    pub(crate) consumers: Vec<String>,
+}
+
+/// `expl explorer down`.
+#[derive(Debug, Args)]
+pub(crate) struct ExplorerDownArgs {
+    /// The explorer's registered name.
+    pub(crate) name: String,
+    /// Grace period.
+    #[command(flatten)]
+    pub(crate) stop: StopArgs,
+}
+
+/// `expl explorer ps`.
+#[derive(Debug, Args)]
+pub(crate) struct ExplorerPsArgs {
+    /// The explorer's registered name.
+    pub(crate) name: String,
+    /// Which workers, and how to print them.
+    #[command(flatten)]
+    pub(crate) ps: PsArgs,
+}
+
+/// `expl explorer publish`.
+#[derive(Debug, Args)]
+pub(crate) struct ExplorerPublishArgs {
+    /// The explorer's registered name.
+    pub(crate) name: String,
+    /// The event's kind, in the explorer's own vocabulary.
+    pub(crate) kind: String,
+    /// What the event is about, as the explorer numbers it.
+    #[arg(long, value_name = "N")]
+    pub(crate) subject: Option<i64>,
+    /// Data carried with the event, as JSON.
+    #[arg(long, value_name = "JSON")]
+    pub(crate) payload: Option<String>,
 }
 
 /// `expl init`.

@@ -78,7 +78,6 @@ pub(crate) fn follow(start: &Path) -> Result<(), CliError> {
     let declaration = context.declaration();
     let interrupt =
         Interrupt::on_signals().map_err(|e| CliError::io("install signal handlers", e))?;
-    let _telemetry = Telemetry::start(project, declaration.telemetry.as_ref(), false);
     let mut graph = Graph::open(&project.database_path())?;
     let trunk = Trunk::new(project, declaration.trunk.as_deref()).with_remote(
         project,
@@ -89,6 +88,9 @@ pub(crate) fn follow(start: &Path) -> Result<(), CliError> {
         Ok(Some(advance)) => println(&moved(&advance)),
         Ok(None) => Ok(()),
         Err(error) => {
+            // This runs every few seconds: telemetry is started only when
+            // there is something to report.
+            let _telemetry = Telemetry::start(project, declaration.telemetry.as_ref(), false);
             let span = telemetry::span("expl.trunk.follow", Vec::new());
             telemetry::error(&span, "trunk");
             println(&format!("cannot follow the trunk: {error}"))

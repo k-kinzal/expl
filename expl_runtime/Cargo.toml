@@ -17,8 +17,6 @@ signal-hook.workspace = true
 humantime.workspace = true
 opentelemetry.workspace = true
 rusqlite.workspace = true
-
-[dev-dependencies]
 toml.workspace = true
 
 [lints]

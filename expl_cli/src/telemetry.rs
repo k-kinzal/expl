@@ -26,10 +26,24 @@ impl Telemetry {
         declaration: Option<&TelemetryDeclaration>,
         worker: bool,
     ) -> Self {
+        Self::start_named(
+            &project
+                .root()
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+            declaration.map(|config| config.endpoint.as_str()),
+            worker,
+        )
+    }
+
+    /// Export for the explorer called `name` to the OTLP receiver at
+    /// `endpoint`, unless the environment says otherwise.
+    pub(crate) fn start_named(name: &str, endpoint: Option<&str>, worker: bool) -> Self {
         if env::var("OTEL_SDK_DISABLED").is_ok_and(|value| value.eq_ignore_ascii_case("true")) {
             return Self::default();
         }
-        let endpoint = declaration.map(|config| config.endpoint.trim());
+        let endpoint = endpoint.map(str::trim);
         let traces = Signal::Traces.endpoint(endpoint);
         let metrics = worker.then(|| Signal::Metrics.endpoint(endpoint)).flatten();
         if traces.is_none() && metrics.is_none() {
@@ -47,15 +61,7 @@ impl Telemetry {
             KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
             KeyValue::new("service.instance.id", uuid::Uuid::new_v4().to_string()),
             KeyValue::new("process.pid", i64::from(std::process::id())),
-            KeyValue::new(
-                "expl.project",
-                project
-                    .root()
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
+            KeyValue::new("expl.project", name.to_owned()),
         ]);
         // Resource::builder reads the standard resource env vars. Supply
         // expl as the default service name when neither source set it.

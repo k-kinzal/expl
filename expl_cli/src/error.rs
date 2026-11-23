@@ -7,6 +7,7 @@ use expl_core::{
     DeclarationError, DoctorError, GraphError, HandlerError, ProjectError, StoreError,
     WorkspaceError,
 };
+use expl_runtime::daemon::DaemonError;
 use expl_runtime::worker::WorkerError;
 use thiserror::Error;
 
@@ -53,6 +54,9 @@ pub(crate) enum CliError {
     /// A worker.
     #[error(transparent)]
     Process(#[from] WorkerError),
+    /// The daemon and the explorers it hosts.
+    #[error(transparent)]
+    Daemon(#[from] DaemonError),
     /// One reaction, run for a worker.
     #[error(transparent)]
     React(#[from] ReactError),
@@ -99,6 +103,15 @@ impl CliError {
                 | GraphError::Cycle { .. },
             )
             | Self::Process(WorkerError::NotAdoptable(_))
+            | Self::Daemon(
+                DaemonError::InvalidName(_)
+                | DaemonError::NameTaken { .. }
+                | DaemonError::UnknownExplorer(_)
+                | DaemonError::UnknownConsumer { .. }
+                | DaemonError::Running { .. }
+                | DaemonError::Record { .. }
+                | DaemonError::Registration { .. },
+            )
             | Self::Inconsistent(_) => exit::USER,
             Self::Declaration(_) | Self::Handler(HandlerError::Declaration(_)) => exit::CONFIG,
             Self::Project(ProjectError::Io { .. })
@@ -109,6 +122,7 @@ impl CliError {
             | Self::Workspace(_)
             | Self::Handler(_)
             | Self::Process(_)
+            | Self::Daemon(_)
             | Self::React(_)
             | Self::Agent(_)
             | Self::Overview(_)

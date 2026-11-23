@@ -264,7 +264,7 @@ impl Worker<'_> {
         let result = with_heartbeat(
             Duration::from_secs(HEARTBEAT_SECONDS),
             move |held| {
-                if self.authority.is_some_and(|authority| !authority.is_live()) {
+                if self.orphaned() {
                     self.interrupt.raise();
                 }
                 if heartbeat.is_none() {
@@ -287,6 +287,12 @@ impl Worker<'_> {
             processes.exit(self.id, &reason)?;
         }
         result
+    }
+
+    /// Whether the daemon this worker was started under is gone: its term
+    /// ended, so whatever it started must stop.
+    fn orphaned(&self) -> bool {
+        self.authority.is_some_and(|authority| !authority.is_live())
     }
 
     /// Heartbeat: prove liveness, renew the held lease (interrupting the
@@ -336,6 +342,9 @@ impl Worker<'_> {
         let mut last_reaction = Instant::now();
         observer.state(Phase::WaitingForEvents);
         loop {
+            if self.orphaned() {
+                self.interrupt.raise();
+            }
             if self.interrupt.is_raised() {
                 return Ok("stopped".to_owned());
             }
@@ -414,6 +423,13 @@ impl Worker<'_> {
                     retry,
                 });
             };
+            // A command that failed because the daemon's term ended did not
+            // fail at its event: the worker stops and gives the event back,
+            // rather than spend the event's attempts before its heartbeat
+            // notices.
+            if self.orphaned() {
+                self.interrupt.raise();
+            }
             let stopping = self.interrupt.is_raised();
             match outcome {
                 _ if interrupt.lease_lost() => lost(),
@@ -1126,6 +1142,40 @@ mod tests {
                 "exiting: stopped"
             ]
         );
+    }
+
+    #[test]
+    fn a_worker_whose_daemon_is_gone_gives_its_event_back_and_stops() {
+        // The command fails as soon as it is let go, as one does that
+        // cannot enter a term that has ended.
+        let explorer = Explorer::new(concat!(
+            "echo started >> @DIR@/calls; ",
+            "while [ ! -f @DIR@/go ]; do sleep 0.02; done; exit 1",
+        ));
+        let event = explorer.publish(None);
+        let shared = tempfile::tempdir().expect("cluster");
+        let cluster = Cluster::open(shared.path()).expect("cluster");
+        let (authority, term) = cluster.test_term("alpha");
+        let (reason, seen) = thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                explorer.run(
+                    ProcessOptions::default(),
+                    Interrupt::default(),
+                    Some(&authority),
+                )
+            });
+            explorer.wait_for("calls");
+            drop(term);
+            std::fs::write(explorer.dir.path().join("go"), "").expect("let the command go");
+            worker.join().expect("worker")
+        });
+        assert_eq!(reason, "stopped");
+        // The failure was the daemon's, not the event's: no attempt is
+        // spent, and the command is not run again by this worker.
+        let (status, attempts, _) = explorer.delivery(event);
+        assert_eq!((status.as_str(), attempts), ("pending", 0));
+        assert_eq!(explorer.lines("calls").len(), 1);
+        assert_eq!(seen.last().map(String::as_str), Some("exiting: stopped"));
     }
 
     #[test]

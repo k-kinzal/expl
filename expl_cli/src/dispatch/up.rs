@@ -19,6 +19,18 @@ pub(crate) fn up(start: &Path, args: &UpArgs) -> Result<(), CliError> {
     for name in &args.consumers {
         declaration.consumer(name)?;
     }
+    if let Some(authority) = context.authority() {
+        // Under a daemon the project is one of its explorers: register it
+        // as `expl.toml` stands now, and let the daemon start its workers.
+        let explorer = crate::daemon::register(context.project(), authority.cluster())?;
+        let exe = std::env::current_exe().map_err(|e| CliError::io("locate the expl binary", e))?;
+        return super::explorer::started(expl_runtime::daemon::up(
+            &exe,
+            authority,
+            &explorer,
+            &args.consumers,
+        )?);
+    }
     let table = processes(context.project())?;
     // A launch that never got adopted gives its slot back; its child, if
     // it ever arrives, can no longer adopt the record.
@@ -42,9 +54,6 @@ pub(crate) fn up(start: &Path, args: &UpArgs) -> Result<(), CliError> {
         if running >= consumer.replicas {
             status(&format!("{name}: {running}/{} running", consumer.replicas));
             continue;
-        }
-        if context.authority().is_some() {
-            table.retire_dead(name)?;
         }
         for _ in running..consumer.replicas {
             // Reuse `expl run -d` so `up` and `run -d` start processes the

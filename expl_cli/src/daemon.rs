@@ -1,36 +1,49 @@
-//! Bind the exploration application to the runtime's daemon and command queue.
+//! Bind this binary to the runtime's daemon.
+//!
+//! The daemon is the framework's and hosts any explorer registered with it.
+//! This binary is its executable: `expl daemon` serves, the hidden
+//! `runtime-job` and `runtime-worker` commands are what a daemon starts,
+//! and every other command typed against a daemon is forwarded to the
+//! leader. What is specific to expl is only how a project joins: its
+//! `expl.toml` becomes the registration.
 
-use std::cell::RefCell;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Write};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::fs::{self, OpenOptions};
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
 
-use expl_core::{Interrupt, Project};
-use expl_runtime::cluster::{Authority, Cluster, CommandSpec, Outcome, Peer};
+use expl_core::{Declaration, Interrupt, ProcessId, ProcessOptions, Project};
+use expl_runtime::cluster::{Authority, Cluster, Peer};
+use expl_runtime::daemon::{self, Explorer, Registry};
 
-use crate::cli::{self, Cli};
+use crate::cli::{self, Cli, RuntimeWorkerArgs};
 use crate::dispatch;
 use crate::error::CliError;
-use crate::output::json_pretty;
-
-const SESSION: &str = "EXPL_RUNTIME_SESSION";
-const PROJECT: &str = "EXPL_RUNTIME_PROJECT";
-const CLUSTER: &str = "EXPL_RUNTIME_CLUSTER";
+use crate::output::{json_pretty, status};
+use crate::telemetry::Telemetry;
 
 pub(crate) fn dispatch(mut cli: Cli) -> Result<u8, CliError> {
-    if let cli::Command::RuntimeJob { name, peer } = cli.command {
+    if let cli::Command::RuntimeJob { name, peer } = &cli.command {
         let directory = cli
             .cluster
+            .as_deref()
             .ok_or_else(|| CliError::Usage("missing runtime directory".to_owned()))?;
-        run_job(&directory, &name, &peer)?;
+        daemon::run_job(directory, name, peer).map_err(cluster_error)?;
         return Ok(0);
     }
-    if let Some((_, _guard)) = enter()? {
-        let project = std::env::var_os(PROJECT)
+    if let cli::Command::RuntimeWorker(args) = &cli.command {
+        worker(cli.cluster.as_deref(), args)?;
+        return Ok(0);
+    }
+    // Started by the elected daemon: this is the leader's side of an
+    // operation, or something a worker executes.
+    if let Some((authority, _term)) = daemon::enter().map_err(cluster_error)? {
+        if let cli::Command::Explorer(command) = cli.command {
+            dispatch::explorer::explorer(&authority, command)?;
+            return Ok(0);
+        }
+        let directory = daemon::bound_directory()
             .ok_or_else(|| CliError::Usage("missing daemon project".to_owned()))?;
-        cli.directory = Some(PathBuf::from(project));
+        cli.directory = Some(directory);
         dispatch::dispatch(cli)?;
         return Ok(0);
     }
@@ -43,68 +56,118 @@ pub(crate) fn dispatch(mut cli: Cli) -> Result<u8, CliError> {
         serve(&start, cli.cluster.as_deref(), &cli.member)?;
         return Ok(0);
     }
+    if matches!(cli.command, cli::Command::Join) {
+        let project = Project::discover(&start)?;
+        let cluster = join_project(&project, cli.cluster.as_deref())?;
+        status(&format!(
+            "{} joined the daemon at {}",
+            explorer_name(&project),
+            cluster.root().display()
+        ));
+        return Ok(0);
+    }
     let Some(cluster) = locate(&start, cli.cluster.as_deref())? else {
         if matches!(cli.command, cli::Command::Cluster(_)) {
             return Err(CliError::Usage(
                 "no daemon configured for this project".to_owned(),
             ));
         }
+        if matches!(cli.command, cli::Command::Explorer(_)) {
+            return Err(CliError::Usage(
+                "explorer commands need a daemon: name its directory with --cluster".to_owned(),
+            ));
+        }
         dispatch::dispatch(cli)?;
         return Ok(0);
     };
     let via = cluster.member(&cli.member).map_err(cluster_error)?;
-    if let cli::Command::Cluster(args) = cli.command {
+    if let cli::Command::Cluster(args) = &cli.command {
         return match args.command {
             cli::ClusterCommand::Status => {
-                let leader = cluster.leader().map_err(cluster_error)?;
-                let role = match &via {
-                    Some(member) if Some(member) == leader.as_ref() => "leader",
-                    Some(_) => "member",
-                    None => "offline",
-                };
-                json_pretty(&serde_json::json!({
-                    "member": cli.member, "role": role, "leader": leader.as_ref().map(Peer::name),
-                }))?;
+                cluster_status(&cluster, &cli.member, via.as_ref())?;
                 Ok(0)
             }
         };
     }
     let via = via.ok_or_else(|| CliError::Usage(format!("daemon `{}` is offline", cli.member)))?;
-    let mut command = Command::new("expl");
-    command.args(std::env::args_os().skip(1));
-    let root = project_root(&cluster)?;
+    let directory = if matches!(cli.command, cli::Command::Explorer(_)) {
+        // About the daemon itself, not one explorer.
+        cluster.root().to_path_buf()
+    } else {
+        target(&cluster, &start, cli.explorer.as_deref())?
+    };
     let interrupt = Interrupt::on_signals().map_err(cluster_error)?;
-    let result = cluster
-        .control(
-            &via,
-            CommandSpec::capture(&command, &root),
-            &interrupt,
-            &mut io::stdout(),
-            &mut io::stderr(),
-        )
-        .map_err(cluster_error)?;
-    match result {
-        Outcome::Exited(status) => {
-            let status = ExitStatus::from_raw(status);
-            Ok(status
-                .code()
-                .or_else(|| status.signal().map(|signal| 128 + signal))
-                .and_then(|code| u8::try_from(code).ok())
-                .unwrap_or(2))
-        }
-        Outcome::Interrupted if interrupt.is_raised() => Ok(130),
-        Outcome::Interrupted => Err(cluster_error(io::Error::other(
-            "leader interrupted the operation",
-        ))),
-        Outcome::Failed(reason) => Err(cluster_error(io::Error::other(reason))),
-        Outcome::TimedOut | Outcome::Lingering { .. } => Err(cluster_error(io::Error::other(
-            "daemon operation did not finish",
-        ))),
-    }
+    daemon::forward(
+        &cluster,
+        &via,
+        std::env::args_os().skip(1),
+        &directory,
+        &interrupt,
+    )
+    .map_err(cluster_error)
 }
 
 fn cluster_error(error: io::Error) -> CliError {
     CliError::io("daemon", error)
+}
+
+fn cluster_status(cluster: &Cluster, member: &str, via: Option<&Peer>) -> Result<(), CliError> {
+    let leader = cluster.leader().map_err(cluster_error)?;
+    let role = match via {
+        Some(member) if Some(member) == leader.as_ref() => "leader",
+        Some(_) => "member",
+        None => "offline",
+    };
+    let explorers: Vec<String> = Registry::of(cluster)
+        .explorers()?
+        .into_iter()
+        .map(|explorer| explorer.name)
+        .collect();
+    json_pretty(&serde_json::json!({
+        "member": member,
+        "role": role,
+        "leader": leader.as_ref().map(Peer::name),
+        "explorers": explorers,
+    }))
+}
+
+/// The directory of the explorer a forwarded operation is about: the one
+/// named, else the project the command was typed in, else the daemon's
+/// only explorer.
+fn target(cluster: &Cluster, start: &Path, named: Option<&str>) -> Result<PathBuf, CliError> {
+    let registry = Registry::of(cluster);
+    if let Some(name) = named {
+        return Ok(registry.expect(name)?.directory);
+    }
+    if let Ok(project) = Project::discover(start) {
+        return Ok(project.root().to_path_buf());
+    }
+    let mut explorers = registry.explorers()?;
+    match explorers.len() {
+        0 => {
+            // A daemon directory from before explorers registered.
+            legacy_project(cluster).ok_or_else(|| {
+                CliError::Usage("no explorer is registered with this daemon".to_owned())
+            })
+        }
+        1 => Ok(explorers.remove(0).directory),
+        _ => Err(CliError::Usage(format!(
+            "this daemon hosts several explorers ({}): name one with --explorer, or run the \
+             command inside it",
+            explorers
+                .iter()
+                .map(|explorer| explorer.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// The one project a daemon directory from before the registry belonged to.
+fn legacy_project(cluster: &Cluster) -> Option<PathBuf> {
+    fs::read_to_string(cluster.root().join("project"))
+        .ok()
+        .map(PathBuf::from)
 }
 
 fn locate(start: &Path, directory: Option<&Path>) -> Result<Option<Cluster>, CliError> {
@@ -130,13 +193,72 @@ fn configured(project: &Project) -> Result<Option<PathBuf>, CliError> {
     }
 }
 
-fn project_root(cluster: &Cluster) -> Result<PathBuf, CliError> {
-    fs::read_to_string(cluster.root().join("project"))
-        .map(PathBuf::from)
-        .map_err(cluster_error)
+/// The name a project is registered under: its directory's name, in the
+/// characters a registry allows.
+fn explorer_name(project: &Project) -> String {
+    let name: String = project
+        .root()
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(100)
+        .collect();
+    if name.is_empty() {
+        "project".to_owned()
+    } else {
+        name
+    }
 }
 
-fn configure(project: &Project, directory: Option<&Path>) -> Result<Cluster, CliError> {
+/// What a project registers with a daemon: its `expl.toml`, with each
+/// consumer's reaction as a command of this binary.
+fn record(project: &Project, declaration: &Declaration) -> Result<Explorer, CliError> {
+    let exe = std::env::current_exe().map_err(|e| CliError::io("locate the expl binary", e))?;
+    let program = vec![
+        exe.to_string_lossy().into_owned(),
+        "-C".to_owned(),
+        project.root().to_string_lossy().into_owned(),
+    ];
+    let mut recover = program.clone();
+    recover.push("runtime-recover".to_owned());
+    Ok(Explorer {
+        name: explorer_name(project),
+        directory: project.root().to_path_buf(),
+        database: project.database_path(),
+        state: project.state_dir(),
+        logs: project.processes_dir(),
+        program,
+        recover,
+        telemetry: declaration
+            .telemetry
+            .as_ref()
+            .map(|telemetry| telemetry.endpoint.trim().to_owned()),
+        registration: declaration.registration_for(&exe, project.root()),
+    })
+}
+
+/// Register `project` with `cluster` as its `expl.toml` stands now, and
+/// return what was registered.
+pub(crate) fn register(project: &Project, cluster: &Cluster) -> Result<Explorer, CliError> {
+    let declaration = Declaration::load(&project.declaration_path())?;
+    let explorer = record(project, &declaration)?;
+    // The runtime opens the database as it is: bring it up to date first.
+    dispatch::processes(project)?;
+    Registry::of(cluster).join(&explorer)?;
+    Ok(explorer)
+}
+
+/// Make `project` an explorer of the daemon in `directory` (the daemon it
+/// already uses, or its own `.expl/daemon`, when none is named).
+fn join_project(project: &Project, directory: Option<&Path>) -> Result<Cluster, CliError> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -164,138 +286,55 @@ fn configure(project: &Project, directory: Option<&Path>) -> Result<Cluster, Cli
                 "stop local workers with `expl down` before starting the first daemon".to_owned(),
             ));
         }
-        set_path(&cluster.root().join("project"), project.root())?;
-        set_path(&project.cluster_path(), cluster.root())?;
+        daemon::remember(&project.cluster_path(), cluster.root()).map_err(cluster_error)?;
     }
-    if project_root(&cluster)? != project.root() {
-        return Err(CliError::Usage(
-            "daemon directory belongs to another checkout".to_owned(),
-        ));
+    register(project, &cluster)?;
+    // Before explorers registered, a daemon directory named its one project.
+    if legacy_project(&cluster).as_deref() == Some(project.root()) {
+        fs::remove_file(cluster.root().join("project")).ok();
     }
     Ok(cluster)
 }
 
-fn set_path(file: &Path, value: &Path) -> Result<(), CliError> {
-    let value = value
-        .to_str()
-        .ok_or_else(|| CliError::Usage("daemon paths must be UTF-8".to_owned()))?;
-    let write = || -> io::Result<()> {
-        let mut temp = tempfile::NamedTempFile::new_in(file.parent().expect("file parent"))?;
-        temp.write_all(value.as_bytes())?;
-        match temp.persist_noclobber(file) {
-            Ok(_) => Ok(()),
-            Err(error)
-                if error.error.kind() == ErrorKind::AlreadyExists
-                    && fs::read_to_string(file)? == value =>
-            {
-                Ok(())
-            }
-            Err(error) => Err(error.error),
-        }
-    };
-    write().map_err(cluster_error)
-}
-
 fn serve(start: &Path, directory: Option<&Path>, member: &str) -> Result<(), CliError> {
-    let project = Project::discover(start)?;
-    let cluster = configure(&project, directory)?;
+    let cluster = match (Project::discover(start), directory) {
+        // Inside a project: it joins the daemon it starts.
+        (Ok(project), directory) => join_project(&project, directory)?,
+        // A daemon of its own: it hosts whatever registers.
+        (Err(_), Some(directory)) => Cluster::open(directory).map_err(cluster_error)?,
+        (Err(error), None) => return Err(error.into()),
+    };
     let exe = std::env::current_exe().map_err(cluster_error)?;
     let interrupt = Interrupt::on_signals().map_err(cluster_error)?;
-    let recovering = RefCell::new(Vec::new());
-    let mut workers: Vec<Child> = Vec::new();
-    cluster
-        .serve(
-            member,
-            &interrupt,
-            |_| {
-                let mut table = dispatch::processes(&project).map_err(io::Error::other)?;
-                *recovering.borrow_mut() = table.recover().map_err(io::Error::other)?;
-                // The workers of the last term are gone, and with them the
-                // agent runs they journaled as running.
-                expl_core::Graph::open(&project.database_path())
-                    .and_then(|mut graph| graph.interrupt_agent_runs("leader changed"))
-                    .map_err(io::Error::other)?;
-                Ok(())
-            },
-            |authority| {
-                for (record, options) in recovering.take() {
-                    let child =
-                        dispatch::run::spawn_detached(&project, &record, options, Some(authority))
-                            .map_err(io::Error::other)?;
-                    workers.push(child);
-                }
-                let mut index = 0;
-                while index < workers.len() {
-                    if workers[index].try_wait()?.is_some() {
-                        workers.swap_remove(index).wait()?;
-                    } else {
-                        index += 1;
-                    }
-                }
-                Ok(())
-            },
-            |job, peer| {
-                Command::new(&exe)
-                    .arg("--cluster")
-                    .arg(cluster.root())
-                    .arg("runtime-job")
-                    .arg(job)
-                    .arg(serde_json::to_string(peer)?)
-                    .current_dir(project.root())
-                    .process_group(0)
-                    .spawn()
-            },
-        )
-        .map_err(cluster_error)
-}
-
-fn run_job(directory: &Path, name: &str, peer: &str) -> Result<(), CliError> {
-    let cluster = Cluster::open(directory).map_err(cluster_error)?;
-    let peer = serde_json::from_str(peer).map_err(|error| cluster_error(error.into()))?;
-    cluster
-        .run_job(name, &peer, |control, command| {
-            if !control {
-                return Ok(command);
-            }
-            let (authority, _guard) = cluster.enter(&peer)?;
-            let root = project_root(&cluster).map_err(io::Error::other)?;
-            let mut local = Command::new(std::env::current_exe()?);
-            local
-                .args(command.get_args())
-                .current_dir(&root)
-                .process_group(0);
-            bind(&mut local, &root, &authority).map_err(io::Error::other)?;
-            Ok(local)
-        })
-        .map_err(cluster_error)
-}
-
-pub(crate) fn bind(
-    command: &mut Command,
-    root: &Path,
-    authority: &Authority,
-) -> Result<(), CliError> {
-    let peer =
-        serde_json::to_string(authority.peer()).map_err(|error| cluster_error(error.into()))?;
-    command
-        .env(CLUSTER, authority.cluster().root())
-        .env(PROJECT, root)
-        .env(SESSION, peer);
+    daemon::serve(&cluster, member, &exe, &interrupt, &|note| status(note))?;
     Ok(())
 }
 
-fn enter() -> Result<Option<(Authority, File)>, CliError> {
-    let Some(peer) = std::env::var_os(SESSION) else {
-        return Ok(None);
-    };
-    let peer = serde_json::from_str(&peer.to_string_lossy())
-        .map_err(|error| cluster_error(error.into()))?;
-    let directory = std::env::var_os(CLUSTER)
-        .ok_or_else(|| CliError::Usage("missing runtime directory".to_owned()))?;
-    let cluster = Cluster::open(Path::new(&directory)).map_err(cluster_error)?;
-    cluster.enter(&peer).map(Some).map_err(cluster_error)
+/// Be one worker of a registered consumer.
+fn worker(directory: Option<&Path>, args: &RuntimeWorkerArgs) -> Result<(), CliError> {
+    let directory =
+        directory.ok_or_else(|| CliError::Usage("missing runtime directory".to_owned()))?;
+    let cluster = Cluster::open(directory).map_err(cluster_error)?;
+    let explorer = Registry::of(&cluster).expect(&args.explorer)?;
+    let interrupt =
+        Interrupt::on_signals().map_err(|e| CliError::io("install signal handlers", e))?;
+    let _telemetry = Telemetry::start_named(&explorer.name, explorer.telemetry.as_deref(), true);
+    daemon::run_worker(
+        &explorer,
+        &args.consumer,
+        ProcessId(args.adopt),
+        ProcessOptions {
+            once: args.once,
+            exit_when_idle: args.exit_when_idle,
+        },
+        interrupt,
+    )?;
+    Ok(())
 }
 
+/// The elected daemon this command runs under, if one started it.
 pub(crate) fn authority() -> Result<Option<Authority>, CliError> {
-    Ok(enter()?.map(|(authority, _)| authority))
+    Ok(daemon::enter()
+        .map_err(cluster_error)?
+        .map(|(authority, _)| authority))
 }
