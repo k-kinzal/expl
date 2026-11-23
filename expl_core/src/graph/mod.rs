@@ -6,7 +6,7 @@
 //!   **origins** (positions of the trunk — the default branch the owner
 //!   moves forward; the newest is where exploration starts), **steps**
 //!   (proposed units of work, each realised on its own git branch), and
-//!   **goals** (what a human wants; never executed, only evaluated
+//!   **goals** (what a human wants; never verified, only evaluated
 //!   against).
 //! - [`Edge`] — `source → target`: the target builds on the source. Edges
 //!   form a DAG; paths may merge (`A → C`, `B → C`), in which case the
@@ -19,7 +19,7 @@
 //! - [`Plan`] — the planner's latest view: [`PlannedPath`]s from the origin
 //!   toward goals. Priorities live on the nodes themselves.
 //! - [`Evaluation`] — the evaluator's verdict on one completed step against
-//!   one goal. Satisfied evaluations are the **candidates** a human selects
+//!   one goal. Satisfied evaluations mark the **hypotheses** a human selects
 //!   from.
 //! - [`Conclusion`] — what evaluation decided about a step itself: done,
 //!   abandoned, or continue (run it again from where it stopped), with the

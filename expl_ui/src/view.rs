@@ -14,7 +14,7 @@
 //!   origin that took it in with a line as strong as the spine itself. An
 //!   origin that took work in is a merge: it carries a halo, and its label
 //!   counts the steps it merged. Steps explored from an origin the trunk
-//!   has moved past fade, unless they are still candidates.
+//!   has moved past fade, unless they still satisfy a goal.
 //! - **Left to right is time; nearer the spine is more believed in.**
 //!   Work is drawn in groups, one horizontal band each: every path of the
 //!   latest plan (on a faint ground of its own), every chain grown past a
@@ -26,7 +26,7 @@
 //!   reached goals rather than intentions. A faint red line joins a failed
 //!   step to each new hypothesis grown from its failure.
 //! - **Goals** are listed top right, with where the trunk stands on each
-//!   and the best candidate not adopted yet, subgoals indented under the
+//!   and the best hypothesis not adopted yet, subgoals indented under the
 //!   goals they serve (and joined to them by a faint line in the graph).
 //!   Selecting a goal focuses the graph on it: what leads to it, and what
 //!   was judged against it.
@@ -44,7 +44,7 @@
 //! `f` fits the whole graph in the window, and `0` resets pan and zoom.
 //! Zooming scales the distances between dots, not the dots or the panels;
 //! when zoomed far out, only the labels that matter (selected, current,
-//! running, candidates) stay.
+//! running, satisfying a goal) stay.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -470,7 +470,7 @@ impl ExplView {
                 (_, NodeKind::Goal) => {
                     let satisfied = self
                         .snapshot
-                        .candidates
+                        .satisfying
                         .get(&source.id)
                         .is_some_and(|goals| goals.contains(&target.id));
                     if satisfied {
@@ -550,20 +550,20 @@ impl ExplView {
     ) -> AnyElement {
         let id = node.id;
         let selected = lens.selected == Some(id);
-        let candidate = self.snapshot.candidates.contains_key(&id);
+        let satisfies = self.snapshot.satisfying.contains_key(&id);
         let current = self.snapshot.lineage.current == Some(id);
         let label_color = match node.status {
             _ if selected || current => theme::bright(),
             NodeStatus::Running => theme::bright(),
             NodeStatus::Failed => theme::failure(),
-            NodeStatus::Completed if candidate => theme::accent(),
+            NodeStatus::Completed if satisfies => theme::accent(),
             NodeStatus::Completed | NodeStatus::Active | NodeStatus::Superseded => theme::text(),
             NodeStatus::Proposed | NodeStatus::Planned | NodeStatus::Pruned => theme::quiet(),
         };
         let fade = if !lens.in_focus(id) {
             OUT_OF_FOCUS
         } else if !selected
-            && !candidate
+            && !satisfies
             && node.kind == NodeKind::Step
             && self.snapshot.left_behind(id)
         {
@@ -597,7 +597,7 @@ impl ExplView {
         };
         let running = node.status == NodeStatus::Running;
         let quiet = self.zoom < QUIET_LABELS_BELOW
-            && !(selected || current || running || candidate || node.kind == NodeKind::Goal);
+            && !(selected || current || running || satisfies || node.kind == NodeKind::Goal);
         let label_w = (LABEL_W * self.zoom).clamp(MIN_LABEL_W, LABEL_W);
         let label = ((node.status != NodeStatus::Pruned || selected) && !quiet).then(|| {
             div()
@@ -623,12 +623,12 @@ impl ExplView {
             .opacity(fade)
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, Self::press(id, false, cx))
-            .child(self.dot(node, selected, candidate))
+            .child(self.dot(node, selected, satisfies))
             .children(label)
             .into_any_element()
     }
 
-    fn dot(&self, node: &Node, selected: bool, candidate: bool) -> impl IntoElement {
+    fn dot(&self, node: &Node, selected: bool, satisfies: bool) -> impl IntoElement {
         let size = radius(node) * 2.0;
         let current = self.snapshot.lineage.current == Some(node.id);
         let in_trunk = self.snapshot.lineage.in_trunk(node.id);
@@ -654,7 +654,7 @@ impl ExplView {
                     });
                 let reached = self
                     .snapshot
-                    .candidates
+                    .satisfying
                     .values()
                     .any(|g| g.contains(&node.id));
                 if trunk {
@@ -676,7 +676,7 @@ impl ExplView {
             }
             // Adopted: set into the trunk, so square.
             (NodeKind::Step, NodeStatus::Completed) if in_trunk => {
-                base.rounded_xs().bg(if candidate {
+                base.rounded_xs().bg(if satisfies {
                     theme::accent()
                 } else {
                     theme::text()
@@ -685,7 +685,7 @@ impl ExplView {
             (_, NodeStatus::Proposed) => base.border_1().border_color(theme::quiet()),
             (_, NodeStatus::Planned) => base.border_1().border_color(theme::text()),
             (_, NodeStatus::Running) => base.bg(theme::bright()),
-            (_, NodeStatus::Completed) => base.bg(if candidate {
+            (_, NodeStatus::Completed) => base.bg(if satisfies {
                 theme::accent()
             } else {
                 theme::text()
@@ -789,9 +789,9 @@ impl ExplView {
                         if e.satisfied { ", satisfied" } else { "" }
                     )
                 });
-                let mut candidates: Vec<Row> = self
+                let mut satisfying: Vec<Row> = self
                     .snapshot
-                    .candidates
+                    .satisfying
                     .iter()
                     .filter(|(_, goals)| goals.contains(&node.id))
                     .filter_map(|(step, _)| {
@@ -813,8 +813,8 @@ impl ExplView {
                         ))
                     })
                     .collect();
-                candidates.sort_by_key(|r| std::cmp::Reverse(r.score));
-                rows.extend(candidates);
+                satisfying.sort_by_key(|r| std::cmp::Reverse(r.score));
+                rows.extend(satisfying);
             }
             NodeKind::Step => {
                 if node.investigation {
@@ -950,7 +950,7 @@ impl ExplView {
     }
 
     /// Goals top right: where the trunk stands on each, and the best
-    /// candidate still open. A goal can be selected to focus the graph.
+    /// hypothesis still open. A goal can be selected to focus the graph.
     fn goals_panel(&self, lens: &Lens, cx: &Context<'_, Self>) -> impl IntoElement {
         let goals = self.snapshot.goals();
         div()

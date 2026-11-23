@@ -1,6 +1,6 @@
 //! Roles: what an agent does when an event reaches it.
 //!
-//! The vision names four agents — exploration, planning, execution,
+//! The vision names four agents — exploration, planning, verification,
 //! evaluation. Here a [`Role`] is that responsibility as a reaction
 //! contract: the [`EventKind`]s it reacts to, what it reads, which worktree
 //! its agent works in, the JSON Schema of the agent's response, and how the
@@ -10,7 +10,7 @@
 //! | --- | --- | --- | --- |
 //! | exploration | `goal.added`, `node.evaluated`, `node.failed`, `origin.advanced`, `node.revisited` | scratch at the starting node | proposing steps (`node.proposed`) |
 //! | planning | `node.proposed`, `node.evaluated`, `node.failed`, `goal.retired`, `origin.advanced` | scratch at the origin | recording a plan, joins, priorities, prunes (`plan.recorded`, `node.planned`, `node.ready`, `node.pruned`) |
-//! | execution | `node.ready` | the step's own worktree | committing the step (`node.started`, `node.completed` / `node.failed`, successors' `node.ready`) |
+//! | verification | `node.ready` | the step's own worktree | committing the step (`node.started`, `node.completed` / `node.failed`, successors' `node.ready`) |
 //! | evaluation | `node.completed`, `origin.advanced` | scratch at the step (or origin) | recording verdicts (`node.evaluated`) |
 //!
 //! `origin.advanced` means the trunk moved: a human merged into the
@@ -41,18 +41,18 @@ mod context;
 mod digest;
 mod error;
 mod evaluation;
-mod execution;
 mod exploration;
 mod planning;
 mod reaction;
+mod verification;
 
 pub use context::Context;
 pub use error::RoleError;
 pub use evaluation::{EvaluationReport, Verdict};
-pub use execution::ExecutionReport;
 pub use exploration::{ExplorationReport, Rejection};
 pub use planning::PlanningReport;
 pub use reaction::Reaction;
+pub use verification::VerificationReport;
 
 use std::fmt;
 use std::fmt::Write;
@@ -72,7 +72,8 @@ pub enum Role {
     /// Defines paths of node combinations and sets priorities.
     Planning,
     /// Realises a step on its branch.
-    Execution,
+    #[serde(alias = "execution")]
+    Verification,
     /// Judges completed steps against goals.
     Evaluation,
 }
@@ -82,7 +83,7 @@ impl Role {
     pub const ALL: [Role; 4] = [
         Role::Exploration,
         Role::Planning,
-        Role::Execution,
+        Role::Verification,
         Role::Evaluation,
     ];
 
@@ -92,7 +93,7 @@ impl Role {
         match self {
             Self::Exploration => "exploration",
             Self::Planning => "planning",
-            Self::Execution => "execution",
+            Self::Verification => "verification",
             Self::Evaluation => "evaluation",
         }
     }
@@ -119,7 +120,7 @@ impl Role {
                 EventKind::GoalRetired,
                 EventKind::OriginAdvanced,
             ],
-            Self::Execution => &[EventKind::NodeReady],
+            Self::Verification => &[EventKind::NodeReady],
             Self::Evaluation => &[
                 EventKind::NodeCompleted,
                 EventKind::NodeFailed,
@@ -150,7 +151,7 @@ impl Role {
                 .declaration()
                 .revisit_cooldown
                 .map(std::time::Duration::from_secs),
-            Self::Planning | Self::Execution | Self::Evaluation => None,
+            Self::Planning | Self::Verification | Self::Evaluation => None,
         }
     }
 
@@ -173,14 +174,14 @@ impl Role {
         match self {
             Self::Exploration => exploration::react(reaction, graph),
             Self::Planning => planning::react(reaction, graph),
-            Self::Execution => execution::react(reaction, graph),
+            Self::Verification => verification::react(reaction, graph),
             Self::Evaluation => evaluation::react(reaction, graph),
         }
     }
 
     /// Clean up after the reaction to `delivery` ended for good without
     /// succeeding (its attempts were used up, or the process gave up on
-    /// it), so no work is left hanging. Execution fails a step still
+    /// it), so no work is left hanging. Verification fails a step still
     /// held by the delivery (records `node.failed` with `why`), so planning can
     /// replan or prune it; other roles leave nothing behind. A step
     /// settled elsewhere already is left as it is. Returns what became of
@@ -196,7 +197,7 @@ impl Role {
         why: &str,
     ) -> Result<Abandonment, GraphError> {
         match self {
-            Self::Execution => execution::abandon(delivery, graph, why),
+            Self::Verification => verification::abandon(delivery, graph, why),
             Self::Exploration | Self::Planning | Self::Evaluation => Ok(Abandonment::Nothing),
         }
     }
@@ -272,8 +273,8 @@ pub enum Report {
     },
     /// A plan.
     Planning(PlanningReport),
-    /// An execution.
-    Execution(ExecutionReport),
+    /// A verification.
+    Verification(VerificationReport),
     /// An evaluation.
     Evaluation(EvaluationReport),
     /// The event needed no reaction.
@@ -291,7 +292,7 @@ impl Report {
         match self {
             Self::Planning(p) => p.covered,
             Self::Exploration { .. }
-            | Self::Execution(_)
+            | Self::Verification(_)
             | Self::Evaluation(_)
             | Self::Ignored { .. } => None,
         }
@@ -336,7 +337,7 @@ impl Report {
                 ids(&p.rebased),
                 ids(&p.pruned)
             ),
-            Self::Execution(e) => match e.answer {
+            Self::Verification(e) => match e.answer {
                 Some(answer) => format!(
                     "{} answered {answer} — {}",
                     e.node,

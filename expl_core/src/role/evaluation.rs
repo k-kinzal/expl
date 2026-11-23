@@ -1,32 +1,36 @@
-//! Evaluation — conclude about a step that was carried out, and judge
-//! whether goals are satisfied.
+//! Evaluation — keep the cycle of attempts moving: conclude about a step
+//! that was carried out, and read the result against the goals.
 //!
-//! Reacts to `node.completed` and `node.failed`. The step is first judged
+//! Reacts to `node.completed` and `node.failed`. By then verification has
+//! committed what the step left, so its branch is where steps derived from
+//! it start. The step is first concluded about
 //! by itself: is it **done**, **abandoned** (its hypothesis cannot be met
 //! this way), or to be **continued** (it stopped short — a timeout, an
-//! interrupted run, a claim the working directory does not bear out — of
+//! interrupted run, work left part-way — of
 //! an objective that still looks reachable)? The [`Conclusion`] records
 //! the hypothesis the step stood for, what was found, and what that
 //! changes, for exploration to grow the next hypotheses from. A step
 //! continued runs again from what it left, with the conclusion as guidance
 //! ([`Graph::conclude`]); at most [`CONTINUATIONS`] times. A completed step
-//! not continued is then judged against the active goals it leads to (or
-//! every active goal when it is not linked to any).
+//! not continued is then read against the active goals it leads to (or
+//! every active goal when it is not linked to any). The verdicts are
+//! information for exploration, planning and the owner: whoever set a goal
+//! decides whether it is truly met.
 //!
 //! Reacts to `origin.advanced` too: the new origin — the trunk as the
-//! owner left it — is judged against every active goal, so the lineage
+//! owner left it — is read against every active goal, so the lineage
 //! shows how each adoption moved each goal. An origin's verdicts never make
-//! it a candidate; candidates are steps. The
+//! it a hypothesis that meets a goal; only steps are. The
 //! agent works in a scratch worktree at the step's commit, so it can build
-//! and test the result without disturbing anyone; its prompt holds only the
+//! and run the result without disturbing anyone; its prompt holds only the
 //! goals.
 //!
 //! An investigation changed nothing, so its evidence is not the working
 //! directory but its finding: the prompt then holds the question, the
 //! finding, and the findings of the investigations before it on its path,
-//! and the agent judges whether they settle each goal (a question is
+//! and the agent reads how far they settle each goal (a question is
 //! satisfied once answered); the scratch worktree is the code they were
-//! about, for checking the evidence. Recording the verdicts
+//! about, to read the findings alongside. Recording the verdicts
 //! records `node.evaluated` — for a failed step too, once concluded — which
 //! sets exploration (what next from here, or in place of this failure?)
 //! and planning (re-prioritise) in motion.
@@ -49,7 +53,7 @@ use crate::role::{Reaction, Report, RoleError, digest};
 /// decides between done and abandoned.
 pub(crate) const CONTINUATIONS: usize = 3;
 
-/// Longest excerpt of the executor's report shown to the evaluator.
+/// Longest excerpt of the verifier's report shown to the evaluator.
 const REPORT_EXCERPT: usize = 4000;
 
 /// What one evaluation did.
@@ -167,9 +171,9 @@ fn goals_schema() -> serde_json::Value {
                     "required": ["goal", "satisfied", "score", "reason"],
                     "properties": {
                         "goal": {"type": "integer", "description": "The goal's number in brackets."},
-                        "satisfied": {"type": "boolean", "description": "Whether the repository, as it is, satisfies the goal."},
+                        "satisfied": {"type": "boolean", "description": "Whether the repository, as it is, looks to meet the goal, by your reading."},
                         "score": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Progress toward the goal."},
-                        "reason": {"type": "string", "description": "Evidence for the verdict, and what is still missing."}
+                        "reason": {"type": "string", "description": "What the verdict rests on, and what looks still missing."}
                     }
                 }
             }
@@ -360,15 +364,15 @@ struct StepUnderJudgment<'a> {
 }
 
 impl StepUnderJudgment<'_> {
-    /// The first part of a step's evaluation: the step, what its executor
+    /// The first part of a step's evaluation: the step, what its verifier
     /// reported, earlier conclusions, and how to conclude.
     fn section(&self) -> String {
         let node = self.node;
         let failed = node.status == NodeStatus::Failed;
         let mut out = format!(
             "## The step\n\n{id} — {title}\n\nObjective: {objective}\n\n\
-             It {how}. Its executor reported (before the work was committed, which may be \
-             why the report calls its changes uncommitted; that is expected, not a fault):\n\n\
+             It {how}. Its verifier reported the following, and what it left in the working \
+             directory was committed afterwards:\n\n\
              {report}\n\n",
             id = node.id,
             title = node.title,
@@ -392,8 +396,9 @@ impl StepUnderJudgment<'_> {
         }
         out.push_str(
             "## Conclude about the step\n\n\
-             Every step is a hypothesis. First judge the step itself, by what the working \
-             directory shows rather than by the report, which is a claim to check. Decide:\n\
+             Every step is a hypothesis. First conclude about the step itself: the working \
+             directory holds what it left, committed, and the report is its verifier's account \
+             of the attempt. Read both to decide how the attempt came out:\n\
              - `done`: it did what its objective set out to do;\n\
              - `abandoned`: its hypothesis cannot be met this way, and running it again would \
                not help;\n",
@@ -401,9 +406,8 @@ impl StepUnderJudgment<'_> {
         if self.may_continue {
             out.push_str(
                 "- `continue`: it stopped short — a timeout, an interrupted or crashed run, a \
-                   merge left unresolved, a transient tool or environment failure, or a report \
-                   claiming more than the working directory shows — of an objective that still \
-                   looks reachable. It runs again, starting from what this attempt left, with \
+                   merge left unresolved, a transient tool or environment failure, or work left \
+                   part-way — of an objective that still looks reachable. It runs again, starting from what this attempt left, with \
                    your `finding` and `consequence` as its guidance.\n",
             );
         } else {
@@ -423,19 +427,28 @@ impl StepUnderJudgment<'_> {
         if failed {
             out.push_str("For this failed step, return an empty `evaluations` array.\n\n");
         } else {
-            out.push_str(
-                "Then judge the result against the goals below. Return one evaluation per goal, \
-                 using the number in brackets. The verdicts are set aside if the step runs \
-                 again.\n\n",
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!(
+                    "Then read the result against the goals below. Return one evaluation per \
+                     goal, using the number in brackets. {VERDICTS} The verdicts are set aside if \
+                     the step runs again.\n\n"
+                ),
             );
         }
         out
     }
 }
 
-/// The prompt for a change step or an origin: the goals to judge against,
-/// with the working directory as the evidence, and for a step first the
-/// step itself to conclude about.
+/// What the goal verdicts are for, said wherever they are asked for: they
+/// inform, and the goal's owner decides whether it is met.
+const VERDICTS: &str = "The verdicts tell exploration and planning where the work stands and \
+                        show the owner how each goal moved; whoever set a goal decides whether it \
+                        is truly met, so give your reading together with what it rests on.";
+
+/// The prompt for a change step or an origin: the goals to read the
+/// working directory against, and for a step first the step itself to
+/// conclude about.
 fn prompt(
     reaction: &Reaction<'_>,
     step: Option<&StepUnderJudgment<'_>>,
@@ -446,15 +459,17 @@ fn prompt(
     Prompt::from(format!(
         "## Task\n\n\
          {task} \
-         Inspect the code and run builds and tests as needed. Do not modify files, and leave the \
-         working directory as you found it: remove anything a build or test writes there outside \
-         ignored paths.\n\n\
+         Look into the code as you need: read it, build it, run it. Do not modify files, and \
+         leave the working directory as you found it: remove anything a build or test writes \
+         there outside ignored paths.\n\n\
          {step}## Goals\n\n{goals}{instructions}{response}",
         task = if step.is_some() {
-            "Conclude about the step below."
+            "Conclude about the step below.".to_owned()
         } else {
-            "Judge the repository in the working directory against each goal below. \
-             Return one evaluation per goal, using the number in brackets."
+            format!(
+                "Read the repository in the working directory against each goal below. \
+                 Return one evaluation per goal, using the number in brackets. {VERDICTS}"
+            )
         },
         step = step.map(StepUnderJudgment::section).unwrap_or_default(),
         goals = digest::numbered_goals(goals, tree),
@@ -481,13 +496,12 @@ fn investigation_prompt(
         "## Task\n\n\
          The step {id} was an investigation: it changed nothing, and set out to answer the \
          question \"{title}\". Conclude about it first (below). For a completed investigation, \
-         judge the findings on its path (below, its own last) against each goal below: \
+         read the findings on its path (below, its own last) against each goal below: \
          how far they settle it. A goal that asks a question is \
          satisfied when the findings answer it with convincing evidence — whatever the answer; \
          a goal that asks for a change is not satisfied by findings alone, but they can move it \
-         (by ruling routes in or out). Check the evidence against the working directory, which \
-         holds the code the investigation was about, rather than taking it on trust. Do not \
-         modify files.\n\n\
+         (by ruling routes in or out). {VERDICTS} The working directory holds the code the \
+         investigation was about, to read the findings alongside. Do not modify files.\n\n\
          {step}## Findings\n\n{findings}\n## Goals\n\n{goals}{instructions}{response}",
         id = node.id,
         title = node.title,

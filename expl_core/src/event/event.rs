@@ -30,19 +30,19 @@ pub enum EventKind {
     /// A step was proposed.
     #[serde(rename = "node.proposed")]
     NodeProposed,
-    /// A step was given a priority and may be executed.
+    /// A step was given a priority and may be verified.
     #[serde(rename = "node.planned")]
     NodePlanned,
     /// A planned step's predecessors are all completed: it can run now.
     #[serde(rename = "node.ready")]
     NodeReady,
-    /// A step started executing.
+    /// A step's verification started.
     #[serde(rename = "node.started")]
     NodeStarted,
     /// A step was realised on its branch.
     #[serde(rename = "node.completed")]
     NodeCompleted,
-    /// A step's execution failed.
+    /// A step's verification failed.
     #[serde(rename = "node.failed")]
     NodeFailed,
     /// A completed step was judged against goals.

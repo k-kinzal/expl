@@ -1095,7 +1095,7 @@ impl Map {
         format!(
             "\n## The whole map\n\n\
              This prompt shows only part of the work so far. All of it is in a JSON file you may \
-             read and analyse as freely as you like — with jq, Python, or anything else. It is a \
+             read and analyse as freely as you like, with whatever tools suit you. It is a \
              copy: nothing you do to it changes anything.\n\n\
              `{path}`\n\n\
              It holds `nodes` (every origin, step and goal, with its status, objective, and \
@@ -1132,7 +1132,7 @@ mod tests {
             .propose_step("open", "y", &[origin], &[goal])
             .expect("open");
         graph.plan_step(failed, 1).expect("plan");
-        let delivery = Inbox::open(&db, "executor")
+        let delivery = Inbox::open(&db, "verifier")
             .expect("inbox")
             .lease(&[EventKind::NodeReady], ProcessId(1), false, 3)
             .expect("lease")

@@ -1,9 +1,9 @@
 ---
 name: expl-adopt
-description: Decide whether an expl candidate (a step branch expl/node-<id>) belongs in main, and merge it — judging what the goals need, reviewing the node's code and the merged whole, the Markdown freeze and build/test gate, and what to do after the merge. Use whenever `expl candidate ls` lists something, or a completed step looks worth taking in.
+description: Decide whether an expl hypothesis (a step branch expl/node-<id>) belongs in main, and merge it — judging what the goals need, reviewing the node's code and the merged whole, the Markdown freeze and build/test gate, and what to do after the merge. Use whenever `expl hypothesis ls` lists something, or a completed step looks worth taking in.
 ---
 
-# Adopting candidates into main
+# Adopting hypotheses into main
 
 Adoption is a plain git merge into the trunk (`main`). Running processes notice the
 move within seconds, record a new origin (`origin.advanced`), evaluate it against
@@ -25,7 +25,7 @@ of reaching a goal, and that leaves `main` as a whole better placed for every go
 - **The owner's goals come first.** A feature the owner asked for that `main`
   still lacks outranks polishing what exists. Check the goals (`expl goal ls`) and
   the latest origin verdicts (`expl node inspect <origin>`) for what is still
-  missing, and prefer candidates — or your own work, when nothing in the graph
+  missing, and prefer hypotheses — or your own work, when nothing in the graph
   gets there — that close those gaps.
 
 ## Gate (mechanical; all must hold)
@@ -37,7 +37,7 @@ of reaching a goal, and that leaves `main` as a whole better placed for every go
 3. **On the merged tree:** `cargo fmt --all --check`, `cargo clippy --all-targets`,
    `cargo test` pass — run once, in a target directory no agent builds into.
 
-`skills/expl-adopt/scripts/check-candidate.sh N` checks 1–3 in a throwaway worktree
+`skills/expl-adopt/scripts/check-hypothesis.sh N` checks 1–3 in a throwaway worktree
 (target dir `.expl/check-target`) and exits non-zero with the reason.
 
 ## Review (the judgement; do not skip)
@@ -68,7 +68,7 @@ merge into a scratch worktree and `git diff main HEAD` there.
   both sides touched.
 - Does it contradict an assumption another adopted change relies on, or AGENTS.md?
 - Does `main` need it — or does it duplicate, half-implement, or complicate what is
-  there? Several competing candidates: take the one that best serves the goals with
+  there? Several competing hypotheses: take the one that best serves the goals with
   the least added surface; the others stay in the graph as alternatives.
 
 For a non-trivial diff, get a second read that is not anchored on yours: give a
@@ -85,10 +85,10 @@ add it to the graph yourself with `expl node add`).
 ## Procedure
 
 ```sh
-expl goal ls; expl candidate ls                     # what the goals need; what is on offer
+expl goal ls; expl hypothesis ls                    # what the goals need; what is on offer
 expl node inspect N | less                          # objective, outcome, evaluations
 git log --oneline main..expl/node-N                 # the whole path that would come in
-skills/expl-adopt/scripts/check-candidate.sh N      # the gate
+skills/expl-adopt/scripts/check-hypothesis.sh N      # the gate
 # review: the node's diff, then the merged diff against main (above)
 skills/expl-adopt/scripts/adopt.sh N                # gate again + merge --no-ff + build & install
 expl origin ls                                      # confirm: new origin, ADOPTED shows #N

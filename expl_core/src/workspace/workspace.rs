@@ -3,16 +3,13 @@
 use std::collections::{HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::event::LeaseToken;
 use crate::git::{BranchBlocker, Git, GitError};
 use crate::graph::{Node, NodeId};
 use crate::project::Project;
 use crate::workspace::WorkspaceError;
-
-/// Distinguishes scratch worktrees made by one process.
-static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+use crate::workspace::clone::{AgentClone, Start, identity_args};
 
 /// How many names [`Workspaces::create`] tries for a step's branch before
 /// it gives up.
@@ -26,7 +23,7 @@ pub struct Workspaces {
     lock: PathBuf,
 }
 
-/// One execution attempt's own worktree, on its branch.
+/// One verification attempt's own worktree, on its branch.
 #[derive(Debug, Clone)]
 pub struct Workspace {
     node: NodeId,
@@ -44,14 +41,13 @@ pub struct Workspace {
     conflicts: Vec<String>,
 }
 
-/// A private, detached worktree for one read-only reaction; removed on
-/// drop.
+/// A private clone at a commit, detached, for one read-only reaction;
+/// removed on drop.
 #[derive(Debug)]
 pub struct ScratchWorkspace {
     repository: Git,
-    path: PathBuf,
-    lock: PathBuf,
-    /// The commit HEAD was detached at when the worktree was created.
+    clone: AgentClone,
+    /// The commit the clone was created at.
     head: String,
 }
 
@@ -59,12 +55,10 @@ pub struct ScratchWorkspace {
 /// when it is unchanged.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScratchChanges {
-    /// The commit the worktree was created at.
+    /// The commit the clone was created at.
     pub created_at: String,
-    /// The commit HEAD points at now, when it moved away from `created_at`.
-    pub moved_to: Option<String>,
-    /// Changed paths, sorted: those that differ between `created_at` and
-    /// the moved HEAD, plus staged, modified, deleted, and untracked files.
+    /// Changed paths, sorted: files whose content differs from
+    /// `created_at`, deleted files, and new files no ignore rule matches.
     pub paths: Vec<String>,
 }
 
@@ -72,24 +66,17 @@ impl ScratchChanges {
     /// Whether nothing changed.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.moved_to.is_none() && self.paths.is_empty()
+        self.paths.is_empty()
     }
 }
 
 impl std::fmt::Display for ScratchChanges {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(moved_to) = &self.moved_to {
-            write!(f, "HEAD moved from {} to {moved_to}", self.created_at)?;
-            if !self.paths.is_empty() {
-                f.write_str("; ")?;
-            }
+        if self.paths.is_empty() {
+            f.write_str("no changes")
+        } else {
+            write!(f, "changed paths: {}", self.paths.join(", "))
         }
-        if !self.paths.is_empty() {
-            write!(f, "changed paths: {}", self.paths.join(", "))?;
-        } else if self.moved_to.is_none() {
-            f.write_str("no changes")?;
-        }
-        Ok(())
     }
 }
 
@@ -143,7 +130,7 @@ impl Workspaces {
         }
     }
 
-    /// Where the attempt holding `lease` executes `node`. Each lease has
+    /// Where the attempt holding `lease` verifies `node`. Each lease has
     /// its own path, including when a delivery's attempt count starts over.
     #[must_use]
     pub fn path_of(&self, node: NodeId, lease: &LeaseToken) -> PathBuf {
@@ -264,7 +251,7 @@ impl Workspaces {
         Ok(None)
     }
 
-    /// A private detached worktree at `node`'s commit.
+    /// A private detached clone at `node`'s commit.
     ///
     /// # Errors
     ///
@@ -278,34 +265,57 @@ impl Workspaces {
         self.scratch_at(node.id, commit)
     }
 
-    /// A private detached worktree at `commit`, for work about `node`.
+    /// A private detached clone at `commit`, for work about `node`.
     ///
     /// # Errors
     ///
-    /// [`WorkspaceError::Git`] when git fails.
+    /// [`WorkspaceError::Git`] when git fails; [`WorkspaceError::Io`] on
+    /// filesystem failure.
     pub fn scratch_at(
         &self,
         node: NodeId,
         commit: &str,
     ) -> Result<ScratchWorkspace, WorkspaceError> {
         let commit = self.repository.resolve_commit(commit)?;
-        let sequence = SCRATCH_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-        let path = self.root.join(format!(
-            "scratch-{}-{}-{sequence}",
-            node.0,
-            std::process::id()
-        ));
-        let _guard = lock(&self.lock)?;
-        std::fs::create_dir_all(&self.root)?;
-        let path_text = path.display().to_string();
-        self.repository
-            .run(&["worktree", "add", "--detach", &path_text, &commit])?;
+        let clone = AgentClone::create(
+            &self.repository,
+            &self.root,
+            &format!("scratch-{}", node.0),
+            Start {
+                commit: commit.clone(),
+                branch: None,
+                merging: None,
+            },
+        )?;
         Ok(ScratchWorkspace {
             repository: self.repository.clone(),
-            path,
-            lock: self.lock.clone(),
+            clone,
             head: commit,
         })
+    }
+
+    /// A private clone for the agent working on `workspace`'s step: at the
+    /// worktree's HEAD, on a branch of the step's name, with the merge
+    /// whose conflicts wait to be resolved there redone. The worktree
+    /// itself stays expl's: what the agent produces is taken in from the
+    /// clone ([`Workspace::take_in`], [`Workspace::take_resolution`]).
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Git`] when git fails; [`WorkspaceError::Io`] on
+    /// filesystem failure.
+    pub fn clone_for(&self, workspace: &Workspace) -> Result<AgentClone, WorkspaceError> {
+        let commit = Git::in_worktree(&workspace.path).resolve_commit("HEAD")?;
+        AgentClone::create(
+            &self.repository,
+            &self.root,
+            &format!("node-{}", workspace.node.0),
+            Start {
+                commit,
+                branch: Some(workspace.branch.clone()),
+                merging: workspace.merging.clone(),
+            },
+        )
     }
 
     /// The node worktrees registered with git, each with its node and path
@@ -739,75 +749,107 @@ impl Workspace {
         }
         Ok(git.run(&["rev-parse", "HEAD"])?)
     }
+
+    /// Take in what the agent left in `clone` as the worktree's files: the
+    /// clone's files as they are, whatever the agent committed or not on
+    /// the way, with paths matching a pathspec in `frozen` left as they
+    /// are at HEAD. Nothing is committed ([`commit`](Self::commit) does
+    /// that).
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::JoinIncomplete`] while predecessors are not all
+    /// merged; [`WorkspaceError::LeftBranch`], with nothing written, when
+    /// the worktree left the step's branch; [`WorkspaceError::Git`] when
+    /// git fails.
+    pub fn take_in(&self, clone: &AgentClone, frozen: &[String]) -> Result<(), WorkspaceError> {
+        if !self.is_joined() {
+            return Err(WorkspaceError::JoinIncomplete(
+                self.merging.iter().chain(&self.pending).cloned().collect(),
+            ));
+        }
+        self.check_branch()?;
+        let git = Git::in_worktree(&self.path);
+        let head = git.resolve_commit("HEAD")?;
+        let tree = clone.snapshot(&head, frozen)?;
+        git.run(&["read-tree", "-u", "--reset", &tree])?;
+        Ok(())
+    }
+
+    /// Take in the agent's resolution of the merge in progress from
+    /// `clone`: each conflicted file as the clone holds it (gone where the
+    /// agent removed it). Everything else of the clone is left behind:
+    /// the join concludes with what git merged plus the resolved files
+    /// ([`resume`](Self::resume)).
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::LeftBranch`], with nothing written, when the
+    /// worktree left the step's branch; [`WorkspaceError::Git`] when git
+    /// fails; [`WorkspaceError::Io`] on filesystem failure.
+    pub fn take_resolution(&self, clone: &AgentClone) -> Result<(), WorkspaceError> {
+        if self.merging.is_none() {
+            return Ok(());
+        }
+        self.check_branch()?;
+        let git = Git::in_worktree(&self.path);
+        let head = git.resolve_commit("HEAD")?;
+        let tree = clone.snapshot(&head, &[])?;
+        for path in &self.conflicts {
+            let object = format!("{tree}:{path}");
+            if git.test(&["cat-file", "-e", &object])? {
+                git.run(&["--literal-pathspecs", "checkout", &tree, "--", path])?;
+            } else {
+                match std::fs::remove_file(self.path.join(path)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ScratchWorkspace {
-    /// Worktree directory.
+    /// The clone's directory.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.path
+        self.clone.path()
     }
 
-    /// The commit HEAD was detached at when the worktree was created.
+    /// The commit the clone was created at.
     #[must_use]
     pub fn head(&self) -> &str {
         &self.head
     }
 
-    /// Put the worktree back at the commit it was created at, discarding
-    /// what an attempt left behind (a reset and a clean, as
-    /// [`Git::restore`] does) — only while HEAD is still detached, so no
-    /// branch is ever reset.
+    /// Put the clone back as it was created, discarding whatever an
+    /// attempt left behind.
     ///
     /// # Errors
     ///
-    /// [`WorkspaceError::ScratchAttached`], with nothing reset, when a
-    /// branch is checked out there; [`WorkspaceError::Git`] when git fails.
+    /// [`WorkspaceError::Git`] when git fails; [`WorkspaceError::Io`] on
+    /// filesystem failure.
     pub fn restore(&self) -> Result<(), WorkspaceError> {
-        let git = Git::in_worktree(&self.path);
-        if let Some(head) = git.head_ref()? {
-            return Err(WorkspaceError::ScratchAttached { head });
-        }
-        git.restore(&self.head)?;
-        Ok(())
+        self.clone.reset()
     }
 
-    /// What changed since the worktree was created: whether HEAD moved,
-    /// files changed, or untracked files appeared (ignored files aside).
+    /// What changed in the clone's files since it was created: changed,
+    /// deleted, and new files (ignored files aside). What the agent did
+    /// with git there — commits, branches — is its own, and counts only as
+    /// far as it changed the files.
     ///
     /// # Errors
     ///
     /// [`WorkspaceError::Git`] when git fails.
     pub fn changes(&self) -> Result<ScratchChanges, WorkspaceError> {
-        let git = Git::in_worktree(&self.path);
-        let head = git.resolve_commit("HEAD")?;
-        let mut paths = git.status_paths()?;
-        let moved_to = if head == self.head {
-            None
-        } else {
-            paths.extend(git.diff_paths(&self.head, &head)?);
-            Some(head)
-        };
-        paths.sort();
-        paths.dedup();
+        let tree = self.clone.snapshot(&self.head, &[])?;
+        let paths = self.repository.diff_paths(&self.head, &tree)?;
         Ok(ScratchChanges {
             created_at: self.head.clone(),
-            moved_to,
             paths,
         })
-    }
-}
-
-impl Drop for ScratchWorkspace {
-    fn drop(&mut self) {
-        // Best effort: a leftover scratch worktree is pruned by the next one.
-        if let Ok(_guard) = lock(&self.lock) {
-            let path = self.path.display().to_string();
-            self.repository
-                .run(&["worktree", "remove", "--force", &path])
-                .ok();
-            self.repository.run(&["worktree", "prune"]).ok();
-        }
     }
 }
 
@@ -833,24 +875,6 @@ fn has_conflict_markers(path: &Path) -> Result<bool, WorkspaceError> {
             .iter()
             .any(|marker| line.starts_with(*marker))
     }))
-}
-
-/// `-c user.name=… -c user.email=…` when the repository has no identity
-/// configured, so expl's own commits never fail on a bare machine.
-fn identity_args(git: &Git) -> Result<Vec<String>, WorkspaceError> {
-    let configured = |key: &str| match git.run(&["config", "--get", key]) {
-        Ok(value) => Ok(!value.is_empty()),
-        Err(GitError::Failed { .. }) => Ok(false),
-        Err(error @ GitError::Spawn(_)) => Err(error),
-    };
-    let mut args = Vec::new();
-    if !configured("user.name")? {
-        args.extend(["-c".to_owned(), "user.name=expl".to_owned()]);
-    }
-    if !configured("user.email")? {
-        args.extend(["-c".to_owned(), "user.email=expl@localhost".to_owned()]);
-    }
-    Ok(args)
 }
 
 #[cfg(test)]
@@ -1143,12 +1167,11 @@ mod tests {
         assert!(matches!(restore, GitError::Failed { .. }));
         assert_eq!(checkout(), before, "restore changed the main checkout");
 
-        fs::remove_file(scratch.path().join(".git")).expect("remove scratch git file");
-        let changes = scratch.changes().expect_err("scratch inspection must fail");
-        assert!(matches!(
-            changes,
-            WorkspaceError::Git(GitError::Failed { .. })
-        ));
+        // The scratch clone's files are read by the project's own git, so
+        // inspecting them needs nothing of the clone's `.git`.
+        fs::remove_dir_all(scratch.path().join(".git")).expect("remove scratch git directory");
+        let changes = scratch.changes().expect("scratch inspection");
+        assert!(changes.is_empty(), "{changes}");
         assert_eq!(
             checkout(),
             before,
@@ -1355,10 +1378,8 @@ mod tests {
         assert_eq!(git(&["show", &format!("{head}:tracked")]), "step");
     }
 
-    #[test]
-    fn a_scratch_worktree_with_a_branch_checked_out_is_not_restored() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
+    /// A repository with `tracked` at `base`, then `second` on `main`.
+    fn two_commits(root: &Path) -> (Git, String, String) {
         let repository = Git::new(root);
         let git = |args: &[&str]| repository.run(args).expect("git");
         git(&["init", "-q", "-b", "main"]);
@@ -1368,27 +1389,141 @@ mod tests {
         fs::write(root.join("tracked"), "base\n").expect("tracked file");
         git(&["add", "tracked"]);
         git(&["commit", "-qm", "base"]);
+        git(&["tag", "v1"]);
         let base = git(&["rev-parse", "HEAD"]);
         fs::write(root.join("tracked"), "second\n").expect("tracked file");
         git(&["commit", "-qam", "second"]);
         let second = git(&["rev-parse", "HEAD"]);
+        (repository, base, second)
+    }
+
+    #[test]
+    fn a_scratch_clone_holds_the_history_and_keeps_the_project_refs_out_of_reach() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let (repository, base, second) = two_commits(root);
 
         let workspaces = Workspaces::new(&Project::at(root));
         let scratch = workspaces.scratch_at(NodeId(1), &base).expect("scratch");
-        fs::write(scratch.path().join("litter"), "x\n").expect("litter");
-        scratch.restore().expect("restore a detached scratch");
-        assert!(!scratch.path().join("litter").exists());
+        let clone = Git::in_worktree(scratch.path());
+        assert_eq!(clone.resolve_commit("HEAD").expect("head"), base);
+        assert_eq!(clone.head_ref().expect("head ref"), None, "detached");
+        assert_eq!(clone.resolve_commit("v1").expect("tag"), base);
+        assert_eq!(
+            clone.run(&["log", "--format=%s", &second]).expect("log"),
+            "second\nbase",
+            "the whole history is there"
+        );
 
-        Git::in_worktree(scratch.path())
-            .run(&["switch", "-q", "--ignore-other-worktrees", "main"])
-            .expect("switch to the trunk");
+        // Whatever the agent does with git in its clone stays there.
         let before = refs(&repository);
-        let error = scratch.restore().expect_err("restore refuses");
-        let WorkspaceError::ScratchAttached { head } = error else {
-            panic!("{error}");
-        };
-        assert_eq!(head, "refs/heads/main");
+        let force = |args: &[&str]| clone.run(args).expect("git in the clone");
+        force(&["branch", "-f", "main", &second]);
+        force(&["checkout", "-q", "main"]);
+        fs::write(scratch.path().join("tracked"), "agent\n").expect("edit");
+        force(&[
+            "-c",
+            "user.name=a",
+            "-c",
+            "user.email=a@a",
+            "commit",
+            "-qam",
+            "agent",
+        ]);
         assert_eq!(refs(&repository), before);
-        assert_eq!(git(&["rev-parse", "refs/heads/main"]), second);
+        assert_eq!(repository.resolve_commit("main").expect("main"), second);
+
+        let changes = scratch.changes().expect("changes");
+        assert_eq!(changes.paths, ["tracked"]);
+        scratch.restore().expect("restore");
+        assert!(scratch.changes().expect("changes").is_empty());
+        assert_eq!(clone.head_ref().expect("head ref"), None);
+        assert_eq!(clone.resolve_commit("HEAD").expect("head"), base);
+        assert_eq!(refs(&repository), before);
+    }
+
+    #[test]
+    fn a_step_takes_in_the_clones_files_with_the_frozen_paths_as_they_were() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let (repository, base, _) = two_commits(root);
+        fs::write(root.join("README.md"), "readme\n").expect("readme");
+        fs::create_dir(root.join("docs")).expect("docs");
+        fs::write(root.join("docs/guide.md"), "guide\n").expect("guide");
+        repository.run(&["add", "-A"]).expect("add");
+        repository.run(&["commit", "-qm", "docs"]).expect("commit");
+
+        let mut graph = Graph::in_memory().expect("graph");
+        let head = repository.resolve_commit("HEAD").expect("head");
+        let origin = graph
+            .create_origin("Origin", Some("main"), &head)
+            .expect("origin");
+        let step = graph
+            .propose_step("Step", "Change code", &[origin], &[])
+            .expect("step");
+        let workspaces = Workspaces::new(&Project::at(root));
+        let origin = graph.node(origin).expect("origin node");
+        let workspace = workspaces
+            .create(
+                &graph.node(step).expect("step node"),
+                &LeaseToken::for_test(1),
+                &[origin],
+                &[],
+            )
+            .expect("step worktree");
+        let clone = workspaces.clone_for(&workspace).expect("clone");
+        let in_clone = Git::in_worktree(clone.path());
+        assert_eq!(
+            in_clone.current_branch().expect("branch").as_deref(),
+            Some(workspace.branch())
+        );
+
+        // The agent commits part of its work itself, leaves the rest, and
+        // touches the frozen Markdown both ways.
+        fs::write(clone.path().join("tracked"), "agent\n").expect("edit");
+        fs::write(clone.path().join("README.md"), "rewritten\n").expect("edit readme");
+        in_clone
+            .run(&[
+                "-c",
+                "user.name=a",
+                "-c",
+                "user.email=a@a",
+                "commit",
+                "-qam",
+                "agent",
+            ])
+            .expect("agent's own commit");
+        fs::remove_file(clone.path().join("docs/guide.md")).expect("remove guide");
+        fs::write(clone.path().join("docs/new.md"), "new\n").expect("new doc");
+        fs::write(clone.path().join("added"), "added\n").expect("new file");
+        in_clone
+            .run(&["branch", "-f", "main", &base])
+            .expect("move the clone's main");
+
+        let before = refs(&repository);
+        workspace
+            .take_in(&clone, &["*.md".to_owned()])
+            .expect("take in");
+        let tip = workspace.commit("step").expect("commit");
+        let show = |path: &str| repository.run(&["show", &format!("{tip}:{path}")]);
+        assert_eq!(show("tracked").expect("tracked"), "agent");
+        assert_eq!(show("added").expect("added"), "added");
+        assert_eq!(show("README.md").expect("readme"), "readme");
+        assert_eq!(show("docs/guide.md").expect("guide"), "guide");
+        assert!(show("docs/new.md").is_err(), "a new frozen file stays out");
+        assert_eq!(
+            repository
+                .run(&["rev-list", "--count", &format!("{head}..{tip}")])
+                .expect("count"),
+            "1",
+            "one commit of expl's on the step's start, the agent's own left behind"
+        );
+        let after = refs(&repository);
+        let moved: Vec<&str> = after
+            .lines()
+            .filter(|line| !before.lines().any(|b| b == *line))
+            .collect();
+        assert_eq!(moved.len(), 1, "only the step's branch moved: {moved:?}");
+        assert!(moved[0].starts_with(&format!("refs/heads/{} ", workspace.branch())));
     }
 }

@@ -91,7 +91,7 @@ pub enum ProcessActivity<'a> {
     Abandoned {
         /// The delivery, as its last holder leased it.
         delivery: &'a Delivery,
-        /// The step its execution left `running`, now failed.
+        /// The step its verification left `running`, now failed.
         failed: Option<NodeId>,
     },
     /// The process is exiting.
@@ -564,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn an_execution_whose_holders_keep_dying_fails_its_step() {
+    fn a_verification_whose_holders_keep_dying_fails_its_step() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("expl.db");
         let mut graph = Graph::open(&db).expect("graph");
@@ -576,8 +576,8 @@ mod tests {
             .propose_step("s", "s", &[origin], &[goal])
             .expect("step");
         graph.plan_step(step, 1).expect("plan"); // node.ready
-        let role = Role::Execution;
-        let mut inbox = Inbox::open(&db, "executor").expect("inbox");
+        let role = Role::Verification;
+        let mut inbox = Inbox::open(&db, "verifier").expect("inbox");
         let mut ready = None;
         for attempt in 1..=MAX_ATTEMPTS {
             let delivery = inbox
@@ -658,8 +658,8 @@ mod tests {
             .propose_investigation("q", "is it so?", &[origin], &[goal])
             .expect("investigation");
         graph.plan_step(question, 1).expect("plan"); // node.ready
-        let role = Role::Execution;
-        let mut inbox = Inbox::open(&db, "executor").expect("inbox");
+        let role = Role::Verification;
+        let mut inbox = Inbox::open(&db, "verifier").expect("inbox");
         let mut last = None;
         for attempt in 1..=MAX_ATTEMPTS {
             let delivery = inbox
@@ -715,7 +715,7 @@ mod tests {
             .propose_step("s", "s", &[origin], &[goal])
             .expect("step");
         graph.plan_step(step, 1).expect("plan"); // node.ready
-        let role = Role::Execution;
+        let role = Role::Verification;
         // The owner, `fast`, is carrying the step out.
         let mut fast = Inbox::open(&db, "fast").expect("inbox");
         let owner = fast

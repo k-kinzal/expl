@@ -421,7 +421,7 @@ mod tests {
             .propose_step("Step", &objective, &[origin], &[goal])
             .expect("step");
         graph.plan_step(step, 1).expect("plan");
-        let delivery = Inbox::open(&db, "executor")
+        let delivery = Inbox::open(&db, "verifier")
             .expect("inbox")
             .lease(&[EventKind::NodeReady], ProcessId(1), false, 3)
             .expect("lease")

@@ -38,7 +38,7 @@ pub struct AgentRunRecord {
     pub id: AgentRunId,
     /// Declared agent name.
     pub agent: String,
-    /// The agent's role (`exploration`, `planning`, `execution`, `evaluation`).
+    /// The agent's role (`exploration`, `planning`, `verification`, `evaluation`).
     pub role: String,
     /// The process that ran it.
     pub process: Option<i64>,

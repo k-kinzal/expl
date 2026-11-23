@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Decide whether a candidate step may be merged into the trunk.
+# Decide whether a hypothesis (a step) may be merged into the trunk.
 #
-# Usage: skills/expl-adopt/scripts/check-candidate.sh NODE_ID [TRUNK]
+# Usage: skills/expl-adopt/scripts/check-hypothesis.sh NODE_ID [TRUNK]
 #
 # Checks, in a throwaway worktree so the main checkout is never touched:
 #   1. the step's recorded branch exists and still points at the commit it
@@ -13,7 +13,7 @@
 #      cargo test pass.
 # Exit 0 means "safe to adopt"; anything else prints why not.
 set -euo pipefail
-node="${1:?usage: check-candidate.sh NODE_ID [TRUNK]}"
+node="${1:?usage: check-hypothesis.sh NODE_ID [TRUNK]}"
 node="${node#\#}"
 trunk="${2:-main}"
 repo="$(git rev-parse --show-toplevel)"

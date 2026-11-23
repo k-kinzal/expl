@@ -17,7 +17,7 @@
 //! planned at their current priority, so a plan always settles the
 //! proposals it saw — and only those. Planning a step
 //! whose predecessors are completed records `node.ready`, which is what
-//! sets execution in motion.
+//! sets verification in motion.
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -108,7 +108,7 @@ fn schema() -> serde_json::Value {
                     "required": ["goal", "nodes", "rationale"],
                     "properties": {
                         "goal": {"type": "integer", "description": "Goal id."},
-                        "nodes": {"type": "array", "items": {"type": "integer"}, "description": "Step ids in execution order (omit origin and goal)."},
+                        "nodes": {"type": "array", "items": {"type": "integer"}, "description": "Step ids in the order they are verified (omit origin and goal)."},
                         "rationale": {"type": "string"}
                     }
                 }
@@ -121,7 +121,7 @@ fn schema() -> serde_json::Value {
                     "required": ["node", "priority"],
                     "properties": {
                         "node": {"type": "integer"},
-                        "priority": {"type": "integer", "description": "Higher executes first."}
+                        "priority": {"type": "integer", "description": "Higher is verified first."}
                     }
                 }
             },

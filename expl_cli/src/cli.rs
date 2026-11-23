@@ -8,7 +8,7 @@
 //! Graph:      expl goal add|ls|retire
 //!             expl node ls|inspect|add|retry|prune|logs
 //! Trunk:      expl origin ls   (the trunk itself moves with git)
-//!             expl graph show · expl path ls · expl candidate ls
+//!             expl graph show · expl path ls · expl hypothesis ls
 //!             expl event ls
 //! Agents:     expl agent ls
 //! Processes:  expl run <AGENT> [-d]
@@ -30,21 +30,22 @@ use expl_core::{EventKind, NodeId, NodeKind, NodeStatus};
     about = "Explore a problem space with agents that react to graph events",
     long_about = "expl explores a problem space as a graph of git branches. Every change to the \
                   graph is an event. Agents declared in expl.toml react to the events of their \
-                  role: exploration proposes steps toward goals (and backward from them), \
-                  planning orders them into paths and sets priorities, execution realises ready \
-                  steps as commits on their own branches, and evaluation judges them against the \
-                  goals. Agents run as processes, managed like containers: run as many as you \
+                  role: exploration proposes hypotheses — steps toward goals (and backward from them) — \
+                  planning orders them into paths and sets priorities, verification tests ready \
+                  hypotheses (as commits on their own branches, or as findings), and evaluation \
+                  judges whether each was verified and how far it moves the goals. Agents run \
+                  as processes, managed like containers: run as many as you \
                   like, and processes of one agent share its events, so independent work happens \
-                  in parallel. Exploration never ends by itself: choosing among the candidates \
+                  in parallel. Exploration never ends by itself: choosing among the hypotheses \
                   that satisfy a goal is yours.",
     after_help = "EXAMPLES:\n  \
                   expl init\n  \
                   expl goal add \"Support Codex\" --objective \"...\"\n  \
                   expl up                       # every agent, `replicas` processes each\n  \
                   expl ps\n  \
-                  expl run executor -d          # one more executor\n  \
-                  expl logs executor-5 -f\n  \
-                  expl candidate ls\n  \
+                  expl run verifier -d          # one more verifier\n  \
+                  expl logs verifier-5 -f\n  \
+                  expl hypothesis ls\n  \
                   git merge expl/node-7         # adopt it; running processes follow the trunk\n  \
                   expl origin ls                # what was adopted, and when\n  \
                   expl down"
@@ -92,9 +93,9 @@ pub(crate) enum Command {
     /// Show the latest plan's paths.
     #[command(subcommand)]
     Path(PathCommand),
-    /// Show steps evaluated as satisfying a goal.
-    #[command(subcommand)]
-    Candidate(CandidateCommand),
+    /// Show hypotheses evaluated as satisfying a goal.
+    #[command(subcommand, alias = "candidate")]
+    Hypothesis(HypothesisCommand),
     /// Show the trunk's lineage: every origin exploration started from.
     #[command(subcommand)]
     Origin(OriginCommand),
@@ -312,10 +313,10 @@ pub(crate) enum PathCommand {
     Ls(ListingArgs),
 }
 
-/// `expl candidate ...`.
+/// `expl hypothesis ...`.
 #[derive(Debug, Subcommand)]
-pub(crate) enum CandidateCommand {
-    /// List candidates, best first.
+pub(crate) enum HypothesisCommand {
+    /// List hypotheses that satisfy a goal, best first.
     Ls(ListingArgs),
 }
 

@@ -1,4 +1,5 @@
-//! Execution — realise a ready step on its own branch.
+//! Verification — test a ready hypothesis: realise a change step on its
+//! own branch, or answer an investigation step's question.
 //!
 //! Reacts to `node.ready`. The step is claimed (`node.started`), its branch
 //! starts from its predecessors (merged when paths join), the agent works
@@ -32,7 +33,7 @@
 //! than starting over.
 //!
 //! Each ready step is its own event, so as many steps run at once as there
-//! are execution processes.
+//! are verification processes.
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -46,11 +47,11 @@ use crate::graph::{
 use crate::prompt::Prompt;
 use crate::role::{Abandonment, Reaction, Report, RoleError};
 use crate::trunk::Trunk;
-use crate::workspace::{Workspace, WorkspaceError};
+use crate::workspace::{AgentClone, Workspace, WorkspaceError};
 
-/// What one execution did.
+/// What one verification did.
 #[derive(Debug, Clone, Serialize)]
-pub struct ExecutionReport {
+pub struct VerificationReport {
     /// The step.
     pub node: NodeId,
     /// `completed` or `failed`.
@@ -211,7 +212,7 @@ fn realise(reaction: &Reaction<'_>, graph: &mut Graph, node: &Node) -> Result<Re
     // settles. Settled: the branch holds what there is, and the worktree
     // goes. On lease loss or interruption, the worktree goes only if
     // nothing was left in it, so unsaved work stays to be inspected.
-    if matches!(result, Ok(Report::Execution(_))) && !reaction.lease_lost() {
+    if matches!(result, Ok(Report::Verification(_))) && !reaction.lease_lost() {
         workspaces.release(workspace).ok();
     } else {
         workspaces.unregister(workspace.path()).ok();
@@ -232,9 +233,16 @@ fn carry_out(
     let id = node.id;
     let token = reaction.token();
     let schema = schema();
+    let workspaces = reaction.context().workspaces();
+    // The agent works in a clone of its own; the worktree stays expl's,
+    // and takes in what the agent left once it is done.
     while !workspace.is_joined() {
+        let clone = match workspaces.clone_for(workspace) {
+            Ok(clone) => clone,
+            Err(error) => return fail(graph, token, node, branch, None, error.to_string()),
+        };
         let prompt = resolution_prompt(reaction, node, workspace, &schema);
-        let (resolved, summary) = invoke(reaction, graph, id, workspace, &prompt, &schema)?;
+        let (resolved, summary) = invoke(reaction, graph, id, &clone, &prompt, &schema)?;
         if !resolved {
             return fail(
                 graph,
@@ -245,7 +253,10 @@ fn carry_out(
                 format!("merge conflicts were not resolved: {summary}"),
             );
         }
-        if let Err(error) = workspace.resume() {
+        if let Err(error) = workspace
+            .take_resolution(&clone)
+            .and_then(|()| workspace.resume())
+        {
             return fail(
                 graph,
                 token,
@@ -257,13 +268,39 @@ fn carry_out(
         }
     }
 
+    let clone = match workspaces.clone_for(workspace) {
+        Ok(clone) => clone,
+        Err(error) => return fail(graph, token, node, branch, None, error.to_string()),
+    };
+    let frozen = &reaction.context().declaration().workspace.frozen;
     let prompt = prompt(reaction, node, attempt, &schema);
-    let (succeeded, summary) = invoke(reaction, graph, id, workspace, &prompt, &schema)?;
+    let (succeeded, summary) = match invoke(reaction, graph, id, &clone, &prompt, &schema) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // Stopped part-way: what the agent left stays in this
+            // attempt's worktree, uncommitted, to be inspected.
+            workspace.take_in(&clone, frozen).ok();
+            return Err(error);
+        }
+    };
     // The lease is the right to write this step. Lost while the agent ran,
-    // the step may already be another process's: touch nothing of it.
+    // the step may already be another process's: touch nothing of it
+    // beyond this attempt's own worktree.
     if reaction.lease_lost() {
+        workspace.take_in(&clone, frozen).ok();
         return Err(RoleError::Agent(AgentError::Interrupted));
     }
+    if let Err(error) = workspace.take_in(&clone, frozen) {
+        return fail(
+            graph,
+            token,
+            node,
+            branch,
+            None,
+            format!("{summary}\n\n{error}"),
+        );
+    }
+    drop(clone);
     pause(Window::Commit);
     let message = format!("{}\n\n{}", node.title, summary);
     let head = match workspace.commit(&message) {
@@ -309,7 +346,7 @@ fn carry_out(
             outcome: &summary,
         },
     )?;
-    Ok(Report::Execution(ExecutionReport {
+    Ok(Report::Verification(VerificationReport {
         node: id,
         status: NodeStatus::Completed,
         branch: branch.to_owned(),
@@ -319,7 +356,7 @@ fn carry_out(
     }))
 }
 
-/// A point in execution between a lease check and a write:
+/// A point in verification between a lease check and a write:
 /// the check is not atomic with the write, so another process can take the
 /// lease over in between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,7 +385,7 @@ thread_local! {
 }
 
 /// Reach `window`: tests can act there (take the lease over, say) before
-/// execution goes on; otherwise nothing happens.
+/// verification goes on; otherwise nothing happens.
 fn pause(window: Window) {
     #[cfg(test)]
     PAUSE.with_borrow_mut(|hook| {
@@ -449,7 +486,7 @@ fn investigate(
     }
     pause(Window::Finding);
     graph.record_finding(id, token, &code, finding.answer, &finding.evidence)?;
-    Ok(Report::Execution(ExecutionReport {
+    Ok(Report::Verification(VerificationReport {
         node: id,
         status: NodeStatus::Completed,
         branch: String::new(),
@@ -500,12 +537,12 @@ fn invoke(
     reaction: &Reaction<'_>,
     graph: &mut Graph,
     id: NodeId,
-    workspace: &Workspace,
+    clone: &AgentClone,
     prompt: &Prompt,
     schema: &serde_json::Value,
 ) -> Result<(bool, String), RoleError> {
     let result: Result<Response, RoleError> =
-        reaction.invoke(graph, Some(id), workspace, prompt, schema);
+        reaction.invoke(graph, Some(id), clone, prompt, schema);
     match result {
         Ok(response) => Ok((response.succeeded, response.summary)),
         Err(error @ RoleError::Agent(AgentError::Interrupted)) => {
@@ -517,7 +554,9 @@ fn invoke(
             }
             Err(error)
         }
-        Err(error @ RoleError::Agent(_)) => Ok((false, format!("execution agent failed: {error}"))),
+        Err(error @ RoleError::Agent(_)) => {
+            Ok((false, format!("verification agent failed: {error}")))
+        }
         Err(error) => {
             graph.fail(id, reaction.token(), &error.to_string())?;
             Err(error)
@@ -568,7 +607,7 @@ fn fail(
             },
         )?;
     }
-    Ok(Report::Execution(ExecutionReport {
+    Ok(Report::Verification(VerificationReport {
         node: node.id,
         status: NodeStatus::Failed,
         branch: branch.to_owned(),
@@ -591,8 +630,8 @@ fn resolution_prompt(
         "## Task\n\nCombine earlier work before starting on: {title}\n\n\
          Merging earlier work into the working directory left conflicts in: {conflicts}. \
          Resolve every conflict so that the intent of both sides is kept, and remove every \
-         conflict marker. Do only this: do not start on the task above yet, leave your changes \
-         uncommitted, and do not conclude or abort the merge.\n\
+         conflict marker. Do only this: the task above comes after. The conflicted files as the \
+         working directory holds them when you report are taken as the resolution.\n\
          {instructions}\nReport `succeeded: false` honestly if a conflict cannot be resolved.\n\
          {response}",
         title = node.title,
@@ -673,7 +712,8 @@ fn prompt(
     Prompt::from(format!(
         "## Task\n\n{title}\n\n{objective}\n\n\
          Do the work in the working directory: edit files, run builds and tests, and verify the \
-         objective. Leave your changes uncommitted, and do not switch branches.\n\
+         objective. The repository is yours to use as you see fit, git included: what the \
+         working directory holds when you report is taken as the result.\n\
          {continued}{instructions}\nReport `succeeded: false` honestly if the objective is not \
          achieved.\n\
          {response}",
@@ -756,14 +796,14 @@ mod tests {
         graph.plan_step(step, 1).expect("plan"); // node.ready
         let declaration = Declaration::parse(
             r#"
-            [agent.executor]
-            role = "execution"
+            [agent.verifier]
+            role = "verification"
             driver = "generic"
             command = ["sh", "-c", '''if grep '^## Question$' >/dev/null; then printf '%s\n' "$1"; else echo old > old.txt; printf '%s\n' "$2"; fi''', "agent", '{"investigated":true,"answer":"yes","evidence":"old holder"}', '{"succeeded":true,"summary":"old holder"}']
             replicas = 1
 
             [agent.replacement]
-            role = "execution"
+            role = "verification"
             driver = "generic"
             command = ["false"]
             replicas = 1
@@ -773,16 +813,16 @@ mod tests {
         let context = Context::new(project.clone(), declaration);
         let mut processes = Processes::open(&db, &project.logs_dir()).expect("processes");
         let holder = processes
-            .create("executor", None, false)
+            .create("verifier", None, false)
             .expect("process")
             .id;
         let taker = processes
             .create("replacement", None, false)
             .expect("process")
             .id;
-        let delivery = Inbox::open(&db, "executor")
+        let delivery = Inbox::open(&db, "verifier")
             .expect("inbox")
-            .lease(Role::Execution.reactions(), holder, false, MAX_ATTEMPTS)
+            .lease(Role::Verification.reactions(), holder, false, MAX_ATTEMPTS)
             .expect("lease")
             .expect("node.ready");
         Held {
@@ -840,7 +880,7 @@ mod tests {
             }
             let delivery = Inbox::open(&db, "replacement")
                 .expect("inbox")
-                .lease(Role::Execution.reactions(), taker, false, MAX_ATTEMPTS)
+                .lease(Role::Verification.reactions(), taker, false, MAX_ATTEMPTS)
                 .expect("lease")
                 .expect("replacement agent's delivery");
             assert_eq!(delivery.attempts, 1);
@@ -859,7 +899,7 @@ mod tests {
                 .expect("db")
                 .execute(
                     &format!(
-                        "UPDATE deliveries SET leased_until = {EPOCH} - 1 WHERE agent = 'executor'"
+                        "UPDATE deliveries SET leased_until = {EPOCH} - 1 WHERE agent = 'verifier'"
                     ),
                     [],
                 )
@@ -889,7 +929,7 @@ mod tests {
             };
             // The first agent can renew its own inbox lease even though
             // that lease no longer holds the step.
-            Inbox::open(&db, "executor")
+            Inbox::open(&db, "verifier")
                 .expect("inbox")
                 .renew(&first)
                 .expect("first agent still holds its inbox lease");
@@ -910,7 +950,7 @@ mod tests {
     fn assert_takeover_at(at: Window) {
         let mut held = held_step(at == Window::Finding);
         let (_hook, takeover) = take_over_at(&held, at);
-        let agent = held.context.agent("executor").expect("agent");
+        let agent = held.context.agent("verifier").expect("agent");
         let reaction = Reaction::new(
             &held.context,
             &agent,
@@ -934,7 +974,7 @@ mod tests {
             Err(GraphError::LeaseLost(id)) if id == held.step
         ));
         assert_eq!(
-            Role::Execution
+            Role::Verification
                 .abandon(&held.delivery, &mut held.graph, "late abandonment")
                 .expect("abandon"),
             Abandonment::Nothing
@@ -966,12 +1006,12 @@ mod tests {
     }
 
     #[test]
-    fn an_execution_left_alone_passes_every_window_and_completes() {
+    fn a_verification_left_alone_passes_every_window_and_completes() {
         let mut held = held_step(false);
         let reached = Rc::new(RefCell::new(Vec::new()));
         let seen = Rc::clone(&reached);
         let _hook = Hooked::install(move |window| seen.borrow_mut().push(window));
-        let agent = held.context.agent("executor").expect("agent");
+        let agent = held.context.agent("verifier").expect("agent");
         let reaction = Reaction::new(
             &held.context,
             &agent,
@@ -982,7 +1022,7 @@ mod tests {
         let report = react(&reaction, &mut held.graph).expect("reaction");
         assert!(matches!(
             report,
-            Report::Execution(ExecutionReport {
+            Report::Verification(VerificationReport {
                 status: NodeStatus::Completed,
                 ..
             })
@@ -1002,7 +1042,7 @@ mod tests {
         let mut held = held_step(false);
         let retry = Processes::open(&held.db, &held.context.project().logs_dir())
             .expect("processes")
-            .create("executor", None, false)
+            .create("verifier", None, false)
             .expect("retry process")
             .id;
         assert!(
@@ -1040,9 +1080,9 @@ mod tests {
                 [],
             )
             .expect("expire");
-        let delivery = Inbox::open(&held.db, "executor")
+        let delivery = Inbox::open(&held.db, "verifier")
             .expect("inbox")
-            .lease(Role::Execution.reactions(), retry, false, MAX_ATTEMPTS)
+            .lease(Role::Verification.reactions(), retry, false, MAX_ATTEMPTS)
             .expect("lease")
             .expect("redelivery");
         assert_eq!(delivery.attempts, 2);
@@ -1058,11 +1098,11 @@ mod tests {
                 assert!(stale.wait().expect("stale process exit").success());
             }
         });
-        let agent = held.context.agent("executor").expect("agent");
+        let agent = held.context.agent("verifier").expect("agent");
         let reaction = Reaction::new(&held.context, &agent, retry, &delivery, &held.interrupt);
-        let report = react(&reaction, &mut held.graph).expect("reclaim and execute");
-        let Report::Execution(report) = report else {
-            panic!("expected execution, got {report:?}");
+        let report = react(&reaction, &mut held.graph).expect("reclaim and verify");
+        let Report::Verification(report) = report else {
+            panic!("expected verification, got {report:?}");
         };
         assert_eq!(report.status, NodeStatus::Completed);
         let commit = report.head_commit.expect("commit");
@@ -1088,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_commits_without_resolving_a_dangling_symbolic_trunk() {
+    fn verification_commits_without_resolving_a_dangling_symbolic_trunk() {
         let mut held = held_step(false);
         let mut declaration = held.context.declaration().clone();
         declaration.trunk = Some("trunk".to_owned());
@@ -1100,7 +1140,7 @@ mod tests {
             .expect("trunk ref");
         assert!(git.resolve_commit(trunk).is_err());
 
-        let agent = held.context.agent("executor").expect("agent");
+        let agent = held.context.agent("verifier").expect("agent");
         let reaction = Reaction::new(
             &held.context,
             &agent,
@@ -1108,8 +1148,9 @@ mod tests {
             &held.delivery,
             &held.interrupt,
         );
-        let Report::Execution(report) = react(&reaction, &mut held.graph).expect("reaction") else {
-            panic!("expected an execution report");
+        let Report::Verification(report) = react(&reaction, &mut held.graph).expect("reaction")
+        else {
+            panic!("expected a verification report");
         };
 
         assert_eq!(report.status, NodeStatus::Completed, "{}", report.summary);
@@ -1141,10 +1182,10 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_executor_resumed_before_allocation_leaves_the_replacement_worktree_intact() {
+    fn a_stale_verifier_resumed_before_allocation_leaves_the_replacement_worktree_intact() {
         let mut held = held_step(false);
         let (_hook, takeover) = take_over_at(&held, Window::Allocate);
-        let agent = held.context.agent("executor").expect("agent");
+        let agent = held.context.agent("verifier").expect("agent");
         let reaction = Reaction::new(
             &held.context,
             &agent,
@@ -1223,14 +1264,14 @@ mod tests {
             // lease expires, and settles it first.
             let delivery = Inbox::open(&db, "replacement")
                 .expect("inbox")
-                .lease(Role::Execution.reactions(), taker, false, MAX_ATTEMPTS)
+                .lease(Role::Verification.reactions(), taker, false, MAX_ATTEMPTS)
                 .expect("lease")
                 .expect("replacement agent's delivery");
             store::open(&db)
                 .expect("db")
                 .execute(
                     &format!(
-                        "UPDATE deliveries SET leased_until = {EPOCH} - 1 WHERE agent = 'executor'"
+                        "UPDATE deliveries SET leased_until = {EPOCH} - 1 WHERE agent = 'verifier'"
                     ),
                     [],
                 )
@@ -1241,7 +1282,7 @@ mod tests {
                 .record_finding(step, &delivery.token, "abc", Answer::No, "replacement")
                 .expect("the replacement's finding");
         });
-        let agent = held.context.agent("executor").expect("agent");
+        let agent = held.context.agent("verifier").expect("agent");
         let reaction = Reaction::new(
             &held.context,
             &agent,
@@ -1276,7 +1317,7 @@ mod tests {
     fn a_lease_lost_after_the_commit_publishes_nothing_of_the_attempt() {
         let mut held = held_step(false);
         let (_hook, takeover) = take_over_at(&held, Window::Publish);
-        let agent = held.context.agent("executor").expect("agent");
+        let agent = held.context.agent("verifier").expect("agent");
         let reaction = Reaction::new(
             &held.context,
             &agent,
@@ -1328,7 +1369,7 @@ mod tests {
     #[test]
     fn a_retry_that_fails_before_committing_shows_no_earlier_tip() {
         let mut held = held_step(false);
-        let agent = held.context.agent("executor").expect("agent");
+        let agent = held.context.agent("verifier").expect("agent");
         let workspaces = held.context.workspaces();
         let git = Git::new(held.context.project().root());
 
@@ -1341,13 +1382,13 @@ mod tests {
             &held.delivery,
             &held.interrupt,
         );
-        let Report::Execution(first) = react(&reaction, &mut held.graph).expect("first attempt")
+        let Report::Verification(first) = react(&reaction, &mut held.graph).expect("first attempt")
         else {
-            panic!("expected an execution report");
+            panic!("expected a verification report");
         };
         assert_eq!(first.status, NodeStatus::Completed, "{}", first.summary);
         let first_tip = first.head_commit.clone().expect("first tip");
-        Inbox::open(&held.db, "executor")
+        Inbox::open(&held.db, "verifier")
             .expect("inbox")
             .ack(&held.delivery, None)
             .expect("ack");
@@ -1381,12 +1422,12 @@ mod tests {
             .expect("executable hook");
         let retry = Processes::open(&held.db, &held.context.project().logs_dir())
             .expect("processes")
-            .create("executor", None, false)
+            .create("verifier", None, false)
             .expect("retry process")
             .id;
-        let delivery = Inbox::open(&held.db, "executor")
+        let delivery = Inbox::open(&held.db, "verifier")
             .expect("inbox")
-            .lease(Role::Execution.reactions(), retry, false, MAX_ATTEMPTS)
+            .lease(Role::Verification.reactions(), retry, false, MAX_ATTEMPTS)
             .expect("lease")
             .expect("the reopened step's node.ready");
         assert_eq!(delivery.event.node, Some(held.step));
@@ -1410,8 +1451,8 @@ mod tests {
             }
         });
         let reaction = Reaction::new(&held.context, &agent, retry, &delivery, &held.interrupt);
-        let Report::Execution(report) = react(&reaction, &mut held.graph).expect("retry") else {
-            panic!("expected an execution report");
+        let Report::Verification(report) = react(&reaction, &mut held.graph).expect("retry") else {
+            panic!("expected a verification report");
         };
 
         assert_eq!(report.status, NodeStatus::Failed, "{}", report.summary);
@@ -1445,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn a_terminally_failed_execution_leaves_its_step_failed() {
+    fn a_terminally_failed_verification_leaves_its_step_failed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("expl.db");
         let mut graph = Graph::open(&db).expect("graph");
@@ -1461,11 +1502,11 @@ mod tests {
             .expect("step");
         graph.plan_step(running, 1).expect("plan");
         graph.plan_step(planned, 1).expect("plan");
-        let mut inbox = Inbox::open(&db, "executor").expect("inbox");
+        let mut inbox = Inbox::open(&db, "verifier").expect("inbox");
         let [claimed, unclaimed] = [running, planned].map(|id| {
             let delivery = inbox
                 .lease(
-                    Role::Execution.reactions(),
+                    Role::Verification.reactions(),
                     ProcessId(1),
                     false,
                     MAX_ATTEMPTS,
@@ -1477,7 +1518,7 @@ mod tests {
         });
         assert!(graph.claim(running, &claimed.token).expect("claim"));
 
-        // Only execution leaves steps behind.
+        // Only verification leaves steps behind.
         assert_eq!(
             Role::Planning
                 .abandon(&claimed, &mut graph, "gone")
@@ -1490,7 +1531,7 @@ mod tests {
         );
 
         assert_eq!(
-            Role::Execution
+            Role::Verification
                 .abandon(&claimed, &mut graph, "its holder died")
                 .expect("abandon"),
             Abandonment::Failed(running)
@@ -1513,7 +1554,7 @@ mod tests {
             (&claimed, Abandonment::Settled(running)),
         ] {
             assert_eq!(
-                Role::Execution
+                Role::Verification
                     .abandon(delivery, &mut graph, "again")
                     .expect("abandon"),
                 abandonment

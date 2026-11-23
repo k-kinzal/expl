@@ -23,7 +23,7 @@ pub enum WorkspaceError {
     /// The attempt already has a worktree path or registration.
     #[error("the attempt already has a worktree at {}", .0.display())]
     AttemptExists(std::path::PathBuf),
-    /// Merge conflicts remain after the executor ran.
+    /// Merge conflicts remain after the verifier ran.
     #[error("unresolved merge conflicts in: {}", .0.join(", "))]
     UnresolvedConflicts(Vec<String>),
     /// The merge of a predecessor was aborted or concluded by someone
@@ -58,15 +58,6 @@ pub enum WorkspaceError {
         /// The ref HEAD is attached to instead (such as `refs/heads/main`),
         /// or `None` when HEAD is detached.
         head: Option<String>,
-    },
-    /// A scratch worktree, which stays detached, has a branch checked out:
-    /// resetting it would move that branch, so nothing is written there.
-    #[error(
-        "the scratch worktree has `{head}` checked out instead of a detached HEAD; nothing was written there"
-    )]
-    ScratchAttached {
-        /// The ref HEAD is attached to (such as `refs/heads/main`).
-        head: String,
     },
     /// Predecessor commits are still waiting to be merged.
     #[error("predecessor commits not merged yet: {}", .0.join(", "))]

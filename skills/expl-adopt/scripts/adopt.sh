@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Merge a checked candidate into the trunk, then put the adopted expl to work.
+# Merge a checked hypothesis into the trunk, then put the adopted expl to work.
 #
 # Usage: skills/expl-adopt/scripts/adopt.sh [--restart] NODE_ID [TRUNK]
 #
-# Runs check-candidate.sh first and refuses on any failure. The merge is a
+# Runs check-hypothesis.sh first and refuses on any failure. The merge is a
 # --no-ff merge so the lineage keeps the step's commits as they were made.
 # Because the repository is expl itself, the adopted code is built and
 # installed over the `expl` on PATH, so processes started from now on run it. With
@@ -23,7 +23,7 @@ cd "$repo"
 [ "$(git branch --show-current)" = "$trunk" ] || { echo "checkout ${trunk} first"; exit 1; }
 [ -z "$(git status --porcelain --untracked-files=no)" ] || { echo "the trunk checkout has uncommitted changes"; exit 1; }
 
-"$here/check-candidate.sh" "$node" "$trunk"
+"$here/check-hypothesis.sh" "$node" "$trunk"
 
 # The branch recorded on the node: a retried step's is expl/node-<id>-<n>.
 title="$(expl node inspect "$node" | python3 -c 'import json,sys; print(json.load(sys.stdin)["node"]["title"])')"

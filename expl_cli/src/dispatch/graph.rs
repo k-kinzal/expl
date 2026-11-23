@@ -19,9 +19,9 @@ pub(crate) fn show(start: &Path, args: &GraphShowArgs) -> Result<(), CliError> {
         GraphFormat::Json => json_pretty(&json!({ "nodes": nodes, "edges": edges })),
         GraphFormat::Mermaid => print(&mermaid(&nodes, &edges)),
         GraphFormat::Text => {
-            let mut candidates = std::collections::BTreeMap::new();
-            for evaluation in graph.candidates()? {
-                candidates
+            let mut satisfying = std::collections::BTreeMap::new();
+            for evaluation in graph.satisfying()? {
+                satisfying
                     .entry(evaluation.node)
                     .or_insert_with(Vec::new)
                     .push(evaluation.goal.to_string());
@@ -45,7 +45,7 @@ pub(crate) fn show(start: &Path, args: &GraphShowArgs) -> Result<(), CliError> {
                 if !after.is_empty() {
                     let _ = write!(out, "  ← {}", after.join(", "));
                 }
-                if let Some(goals) = candidates.get(&node.id) {
+                if let Some(goals) = satisfying.get(&node.id) {
                     let _ = write!(out, "  ★ satisfies {}", goals.join(", "));
                 }
                 out.push('\n');

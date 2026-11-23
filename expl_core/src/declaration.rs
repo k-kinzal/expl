@@ -129,8 +129,22 @@ pub struct Declaration {
     /// advances to it and exploration starts again from there.
     #[serde(default)]
     pub trunk: Option<String>,
+    /// How what an agent produces is taken in.
+    #[serde(default)]
+    pub workspace: WorkspaceDeclaration,
     /// Named agents.
     pub agent: BTreeMap<String, AgentDeclaration>,
+}
+
+/// `[workspace]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDeclaration {
+    /// Git pathspecs of the paths a change step's commit keeps as they
+    /// were where the step started. The agent sees these paths in its own
+    /// clone and may change them there; the change stays in the clone.
+    #[serde(default)]
+    pub frozen: Vec<String>,
 }
 
 /// One `[agent.<name>]`.
@@ -253,12 +267,12 @@ impl Declaration {
 # Each [agent.<name>] is started as processes (`expl run <name>`, or
 # `expl up` for `replicas` of every agent). An agent reacts to the graph
 # events of its role:
-#   exploration — goal.added, node.evaluated, origin.advanced → proposes steps;
-#                 when idle, every `revisit_cooldown` seconds it explores again
-#                 from a random starting point (node.revisited)
-#   planning    — node.proposed/evaluated/failed, goal.retired, origin.advanced → paths and priorities
-#   execution   — node.ready                       → commits on the step's branch
-#   evaluation  — node.completed, origin.advanced → verdicts against goals
+#   exploration  — goal.added, node.evaluated, origin.advanced → proposes hypotheses (steps);
+#                  when idle, every `revisit_cooldown` seconds it explores again
+#                  from a random starting point (node.revisited)
+#   planning     — node.proposed/evaluated/failed, goal.retired, origin.advanced → paths and priorities
+#   verification — node.ready                      → verifies the step: commits on its branch, or a finding
+#   evaluation   — node.completed, origin.advanced → whether it held, verdicts against goals
 #
 # `driver` selects how the CLI is spoken to:
 #   claude_code  — `claude --print --output-format json --json-schema ...`
@@ -277,10 +291,17 @@ impl Declaration {
 # Agents run unattended inside expl-owned git worktrees, so the defaults
 # below let Claude Code edit files and run commands without asking.
 
-# The default branch. Merge the candidates you choose into it with git;
+# The default branch. Merge the hypotheses you choose into it with git;
 # running processes notice it moved, the origin follows, and exploration
 # starts again from there.
 trunk = "main"
+
+# Every agent works in a private clone of the repository, with its whole
+# history, and expl takes in what it leaves there. `frozen` lists git
+# pathspecs (`*.md` matches Markdown at any depth) that a step's commit
+# keeps as they were where the step started.
+[workspace]
+frozen = []
 
 [agent.explorer]
 role = "exploration"
@@ -298,8 +319,8 @@ command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
 replicas = 1
 
-[agent.executor]
-role = "execution"
+[agent.verifier]
+role = "verification"
 driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
@@ -363,6 +384,11 @@ replicas = 1
         let invalid = |name: &str, what: &str| {
             Err(DeclarationError::Invalid(format!("agent `{name}`: {what}")))
         };
+        if self.workspace.frozen.iter().any(|p| p.trim().is_empty()) {
+            return Err(DeclarationError::Invalid(
+                "`workspace.frozen` holds an empty pathspec".to_owned(),
+            ));
+        }
         for (name, agent) in &self.agent {
             if agent
                 .clis()
@@ -391,7 +417,7 @@ replicas = 1
                         return invalid(name, "exploration needs `breadth` >= 1");
                     }
                 }
-                Role::Planning | Role::Execution | Role::Evaluation => {
+                Role::Planning | Role::Verification | Role::Evaluation => {
                     if agent.breadth.is_some()
                         || agent.speculate.is_some()
                         || agent.revisit_cooldown.is_some()
@@ -477,8 +503,8 @@ mod tests {
     fn template_is_a_valid_declaration() {
         let declaration = Declaration::parse(Declaration::TEMPLATE).expect("template parses");
         assert_eq!(declaration.agent.len(), 4);
-        assert_eq!(declaration.agent["executor"].role, Role::Execution);
-        assert_eq!(declaration.agent["executor"].replicas, 2);
+        assert_eq!(declaration.agent["verifier"].role, Role::Verification);
+        assert_eq!(declaration.agent["verifier"].replicas, 2);
         assert_eq!(declaration.trunk.as_deref(), Some("main"));
         let none = Declaration::parse(&Declaration::template(None)).expect("parses");
         assert_eq!(none.trunk, None);
@@ -544,7 +570,7 @@ mod tests {
         assert_eq!(clis[0].driver, DriverKind::ClaudeCode);
         assert_eq!(clis[1].driver, DriverKind::Codex);
         assert_eq!(clis[1].env["A"], "1");
-        assert_eq!(declaration.agent["executor"].clis().len(), 1);
+        assert_eq!(declaration.agent["verifier"].clis().len(), 1);
 
         let empty = format!(
             "{}\n[[agent.planner.alternative]]\ndriver = \"codex\"\ncommand = []\n",

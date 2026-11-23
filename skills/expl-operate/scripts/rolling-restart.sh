@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Restart every process that runs an older expl binary than the installed
 # one, each at a moment it is idle ("waiting for events" or "paused"), or
-# right after it moved on to a new event (an executor leases the next step
+# right after it moved on to a new event (a verifier leases the next step
 # at once, so it is never seen idle; at most INTERVAL seconds of the new
 # run are lost). In-flight agent runs are never cut short otherwise. Exits
 # when all processes run the installed binary.

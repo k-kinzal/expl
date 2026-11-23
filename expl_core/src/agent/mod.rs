@@ -1,7 +1,7 @@
 //! Agents: the declared units that react to events.
 //!
 //! An [`Agent`] is what `expl.toml` declares under `[agent.<name>]`: a
-//! [`Role`](crate::role::Role) (exploration, planning, execution,
+//! [`Role`](crate::role::Role) (exploration, planning, verification,
 //! evaluation), the AI CLI that carries it out, and how many processes of
 //! it `expl up` keeps running. An agent is to a process what an image is to
 //! a container: the definition, started any number of times.

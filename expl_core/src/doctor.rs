@@ -3,14 +3,14 @@
 //! The graph records what happened; git holds the work. The two drift apart
 //! when a human deletes or moves a step's branch, rewrites the trunk and
 //! lets git collect its old commits, kills a process in the middle of an
-//! execution, or leaves worktrees behind. [`Doctor::examine`] reports every
+//! verification, or leaves worktrees behind. [`Doctor::examine`] reports every
 //! place where they disagree as an [`Inconsistency`], and
 //! [`Doctor::repair`] fixes those that are safe to fix:
 //!
 //! | Inconsistency | Repair |
 //! | --- | --- |
 //! | a completed or failed step whose branch or head commit is missing, or whose branch tip is not its head commit | none: which side is right is the human's call |
-//! | a running step whose `node.ready` nobody holds a lease on (an expired lease is left to the inbox, which delivers it again) | unclaimed: back to `planned`, with `node.ready` recorded again so execution is delivered it anew |
+//! | a running step whose `node.ready` nobody holds a lease on (an expired lease is left to the inbox, which delivers it again) | unclaimed: back to `planned`, with `node.ready` recorded again so verification is delivered it anew |
 //! | an origin whose commit no longer exists | none: the trunk's history is gone from git |
 //! | a worktree or leftover attempt directory for a step that is settled (completed, failed, pruned) or unknown | registration removed when its directory is gone; registered worktree removed when clean, keeping its branch; unregistered directory removed when empty |
 //!
@@ -530,7 +530,7 @@ mod tests {
 
         /// Lease and claim a planned step's `node.ready`.
         fn claim(&mut self, id: NodeId) -> Delivery {
-            let process = self.process("executor");
+            let process = self.process("verifier");
             let mut inbox = self.inbox();
             loop {
                 let delivery = inbox
@@ -546,8 +546,8 @@ mod tests {
         }
 
         /// A planned step whose `node.ready` a live process leased and
-        /// which it claimed and gave a worktree, as execution does.
-        fn executing(&mut self) -> NodeId {
+        /// which it claimed and gave a worktree, as verification does.
+        fn verifying(&mut self) -> NodeId {
             let id = self.planned();
             let delivery = self.claim(id);
             let node = self.graph.node(id).expect("node");
@@ -558,9 +558,9 @@ mod tests {
             id
         }
 
-        /// A step executed as execution does: in its own worktree, which
+        /// A step verified as verification does: in its own worktree, which
         /// commits `file` and is left in place; then `complete`d or failed.
-        fn executed(&mut self, file: &str, complete: bool) -> (NodeId, PathBuf) {
+        fn verified(&mut self, file: &str, complete: bool) -> (NodeId, PathBuf) {
             let id = self.planned();
             let delivery = self.claim(id);
             let node = self.graph.node(id).expect("node");
@@ -587,9 +587,9 @@ mod tests {
             (id, workspace.path().to_owned())
         }
 
-        /// Like [`executed`](Self::executed), without leaving the worktree.
+        /// Like [`verified`](Self::verified), without leaving the worktree.
         fn settled(&mut self, file: &str, complete: bool) -> NodeId {
-            let (id, path) = self.executed(file, complete);
+            let (id, path) = self.verified(file, complete);
             let path = path.display().to_string();
             git(&self.root, &["worktree", "remove", "--force", &path]);
             id
@@ -629,7 +629,7 @@ mod tests {
         }
 
         fn inbox(&self) -> Inbox {
-            Inbox::open(&self.project.database_path(), "executor").expect("inbox")
+            Inbox::open(&self.project.database_path(), "verifier").expect("inbox")
         }
     }
 
@@ -648,7 +648,7 @@ mod tests {
         fx.graph
             .fail(never_committed, &delivery.token, "no worktree")
             .expect("fail");
-        fx.executing();
+        fx.verifying();
         let origin = fx.graph.origin().expect("origin");
         let _scratch = fx.workspaces().scratch(&origin).expect("scratch");
 
@@ -733,7 +733,7 @@ mod tests {
         // claimed; the last was claimed before holder tokens were recorded.
         let mut leases = Vec::new();
         for id in [held, killed, given_up] {
-            let process = fx.process("executor");
+            let process = fx.process("verifier");
             let delivery = fx
                 .inbox()
                 .lease(READY, process, false, crate::process::MAX_ATTEMPTS)
@@ -780,7 +780,7 @@ mod tests {
         // Redelivered: a new process is handed the given-up and the
         // unleased step again. The killed one's events wait for its dead
         // holder's lease to expire.
-        let fresh = fx.process("executor");
+        let fresh = fx.process("verifier");
         let mut inbox = fx.inbox();
         let mut delivered = Vec::new();
         while let Some(delivery) = inbox
@@ -836,11 +836,11 @@ mod tests {
     #[test]
     fn stale_worktrees_are_detected_and_pruned() {
         let mut fx = Fixture::new();
-        let (completed, completed_path) = fx.executed("done.txt", true);
-        let (dirty, dirty_path) = fx.executed("broken.txt", false);
+        let (completed, completed_path) = fx.verified("done.txt", true);
+        let (dirty, dirty_path) = fx.verified("broken.txt", false);
         let workspaces = fx.workspaces();
         std::fs::write(dirty_path.join("wip.txt"), "wip").expect("write");
-        let (pruned, _) = fx.executed("pruned.txt", false);
+        let (pruned, _) = fx.verified("pruned.txt", false);
         fx.graph.prune(pruned, "by operator").expect("prune");
 
         let unknown = NodeId(999);
@@ -860,7 +860,7 @@ mod tests {
                 "main",
             ],
         );
-        let running = fx.executing();
+        let running = fx.verifying();
         std::fs::remove_dir_all(&unknown_path).expect("remove");
         let empty_attempt = workspaces.path_of(completed, &LeaseToken::for_test(2));
         std::fs::create_dir(&empty_attempt).expect("empty leftover");

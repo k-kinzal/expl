@@ -9,11 +9,11 @@ use expl_core::testing::scaled;
 
 /// One script plays every role. Exploration proposes a step only for a new
 /// goal or a failed step, so the graph settles (a survey answers with
-/// `@DIR@/survey.json`); execution fails while `@DIR@/fail` exists, else
+/// `@DIR@/survey.json`); verification fails while `@DIR@/fail` exists, else
 /// writes a file named after its node
 /// (and `shared.txt` too while `@DIR@/shared` exists, so joined steps
 /// conflict) and sleeps while `@DIR@/slow` exists. Facing merge conflicts,
-/// execution resolves them, or claims to while `@DIR@/unresolvable`
+/// verification resolves them, or claims to while `@DIR@/unresolvable`
 /// exists, leaving a stray `litter-*.txt` behind while `@DIR@/litter` does. Planning sleeps while `@DIR@/slow-planning` exists and answers
 /// with `@DIR@/plan.json` when present; evaluation answers with
 /// `@DIR@/evaluation.sh` when present. Evaluation, which must not touch
@@ -25,10 +25,11 @@ use expl_core::testing::scaled;
 /// `@DIR@/finding.json` when present. Prompts are kept in `@DIR@/prompts/`
 /// for inspection. While `@DIR@/fast-revisits` exists, the fake explorer
 /// records the first revisit prompt and immediately returns no proposals.
-/// While `@DIR@/switch` exists, execution first takes its worktree off the
-/// step's branch — to the branch named in it, or a detached HEAD when it
-/// says `detached` — and edits `README.md` there; with `@DIR@/switch-fails`
-/// too, it then exits 1 instead of reporting.
+/// While `@DIR@/switch` exists, verification first uses git in its clone as it
+/// likes: points the branch named in it at its HEAD and switches to it (or
+/// detaches HEAD when it says `detached`), and commits an edit of
+/// `README.md` there; with `@DIR@/switch-fails` too, it then exits 1
+/// instead of reporting.
 const AGENT: &str = r#"#!/bin/sh
 if [ "$EXPL_ROLE" = exploration ] && [ "$EXPL_EVENT" = node.revisited ] && [ -f "@DIR@/fast-revisits" ]; then
   prompt="@DIR@/prompts/exploration-revisit.txt"
@@ -62,7 +63,7 @@ planning)
   else
     echo 'Plan follows: {"summary":"one path","paths":[{"goal":2,"nodes":[3],"rationale":"only option"}],"priorities":[{"node":3,"priority":5}],"prunes":[],"joins":[]}'
   fi ;;
-execution)
+verification)
   while [ -f "@DIR@/slow" ]; do sleep 0.2; done
   if grep -q '^## Question' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
     if [ -f "@DIR@/investigation-writes" ]; then echo made > hello.txt; fi
@@ -92,9 +93,10 @@ execution)
     if [ "$target" = detached ]; then
       git switch -q --detach
     else
-      git switch -q --ignore-other-worktrees "$target"
+      git branch -f "$target" HEAD && git switch -q "$target"
     fi
     echo "edited by $EXPL_NODE" > README.md
+    git -c user.name=agent -c user.email=agent@example.com commit -q -am "agent's own"
     if [ -f "@DIR@/switch-fails" ]; then exit 1; fi
   fi
   echo "node $EXPL_NODE" > "node-$EXPL_NODE.txt"
@@ -289,7 +291,7 @@ fn events_flow_through_every_role() {
     for agent in [
         "explorer",
         "planner",
-        "executor",
+        "verifier",
         "evaluator",
         "explorer",
         "planner",
@@ -302,13 +304,13 @@ fn events_flow_through_every_role() {
     assert_eq!(step["node"]["priority"], 5);
     assert_eq!(step["predecessors"], serde_json::json!([1]));
     assert_eq!(step["successors"], serde_json::json!([2]));
-    // explorer (from the evaluated step) + evaluator + executor.
+    // explorer (from the evaluated step) + evaluator + verifier.
     let runs = step["agent_runs"].as_array().expect("runs");
     let agents: Vec<&str> = runs.iter().filter_map(|r| r["agent"].as_str()).collect();
-    assert_eq!(agents, ["explorer", "evaluator", "executor"], "{runs:?}");
+    assert_eq!(agents, ["explorer", "evaluator", "verifier"], "{runs:?}");
     assert_eq!(git(repo, &["show", "expl/node-3:node-3.txt"]), "node 3");
 
-    assert_eq!(ok(repo, &["candidate", "ls", "-q"]), "3");
+    assert_eq!(ok(repo, &["hypothesis", "ls", "-q"]), "3");
     assert_eq!(ok(repo, &["path", "ls", "-q"]), "3");
     assert!(ok(repo, &["graph", "show", "--format", "mermaid"]).contains("n1 --> n3"));
 
@@ -385,7 +387,7 @@ fn events_flow_through_every_role() {
     }
     assert_eq!(
         roles.into_iter().collect::<Vec<_>>(),
-        ["evaluation", "execution", "exploration", "planning"]
+        ["evaluation", "exploration", "planning", "verification"]
     );
     // Commits carry the step's own words, not expl's.
     assert_eq!(
@@ -416,7 +418,7 @@ fn an_investigation_that_changes_the_code_fails_instead_of_answering() {
     );
     // The agent writes hello.txt and then reports finding it.
     sandbox.marker("investigation-writes", true);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     let step = node(repo, &question)["node"].clone();
     assert_eq!(step["status"], "failed", "{step}");
     assert!(step["answer"].is_null(), "{step}");
@@ -475,7 +477,7 @@ fn an_investigation_answers_without_a_commit_and_its_finding_is_judged() {
     assert!(evidence.find("Decisive").expect("decisive") > 600);
     let finding = serde_json::json!({"investigated": true, "answer": "no", "evidence": evidence});
     std::fs::write(sandbox.dir.path().join("finding.json"), finding.to_string()).expect("finding");
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
 
     // Answered, at the code it was about, with no branch or commit of its own.
     let code = git(repo, &["rev-parse", &format!("expl/node-{change}")]);
@@ -511,8 +513,8 @@ fn an_investigation_answers_without_a_commit_and_its_finding_is_judged() {
         );
     }
     assert!(judged.contains(padding.trim_end()), "{judged}");
-    let candidates = ok(repo, &["candidate", "ls"]);
-    assert!(candidates.contains("answer: no"), "{candidates}");
+    let satisfying = ok(repo, &["hypothesis", "ls"]);
+    assert!(satisfying.contains("answer: no"), "{satisfying}");
 
     // Adopting the change it read takes in the change, never the
     // investigation — not even after the change after it is adopted too.
@@ -525,11 +527,11 @@ fn an_investigation_answers_without_a_commit_and_its_finding_is_judged() {
         let id: i64 = step.parse().expect("id");
         assert_eq!(adopted, &serde_json::json!([id]), "adopting {step}");
     }
-    let candidates = json_lines(&ok(repo, &["candidate", "ls", "--format", "json"]));
-    let answer = candidates
+    let satisfying = json_lines(&ok(repo, &["hypothesis", "ls", "--format", "json"]));
+    let answer = satisfying
         .iter()
         .find(|c| c["node"].as_i64() == question.parse().ok())
-        .expect("the finding is still a candidate");
+        .expect("the finding still satisfies the goal");
     assert_eq!(answer["adopted_into"], serde_json::Value::Null, "{answer}");
 }
 
@@ -554,9 +556,9 @@ fn completed_predecessors_make_joined_steps_ready() {
             "1",
         ],
     );
-    // C becomes ready only when both A and B complete; one executor
+    // C becomes ready only when both A and B complete; one verifier
     // process handles the whole cascade.
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     assert_eq!(node(repo, &c)["node"]["status"], "completed");
 
     let branch = format!("expl/node-{c}");
@@ -579,7 +581,7 @@ fn conflicting_joins_merge_every_predecessor() {
     let repo = &sandbox.repo;
     let (parents, join) = sandbox.conflicting_join(3);
     sandbox.marker("litter", true);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
 
     // The first merge conflicts, and so does the next; each is resolved
     // and merging resumes before the step itself is worked on.
@@ -626,13 +628,13 @@ fn falling_over_starts_the_next_cli_clean_and_keeps_a_merge_in_progress() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
     let dir = sandbox.dir.path();
-    // A second executor CLI that dirties its directory, then fails.
-    let failing = dir.join("failing-executor.sh");
+    // A second verifier CLI that dirties its directory, then fails.
+    let failing = dir.join("failing-verifier.sh");
     std::fs::write(
         &failing,
         "#!/bin/sh\ncat > /dev/null\necho dirt > \"dirt-$$.txt\"\nexit 1\n",
     )
-    .expect("failing executor");
+    .expect("failing verifier");
     let mut perms = std::fs::metadata(&failing).expect("meta").permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
     std::fs::set_permissions(&failing, perms).expect("chmod");
@@ -640,7 +642,7 @@ fn falling_over_starts_the_next_cli_clean_and_keeps_a_merge_in_progress() {
     std::fs::write(
         repo.join("expl.toml"),
         format!(
-            "{declaration}\n[[agent.executor.alternative]]\ndriver = \"generic\"\ncommand = [\"{}\"]\n",
+            "{declaration}\n[[agent.verifier.alternative]]\ndriver = \"generic\"\ncommand = [\"{}\"]\n",
             failing.display()
         ),
     )
@@ -649,7 +651,7 @@ fn falling_over_starts_the_next_cli_clean_and_keeps_a_merge_in_progress() {
     // One process takes turns between the CLIs: some steps, and the first
     // conflict resolution, start at the failing one and fall over.
     let (parents, join) = sandbox.conflicting_join(3);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     let logs = std::fs::read_dir(repo.join(".expl/logs"))
         .expect("logs")
         .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("log"))
@@ -676,7 +678,7 @@ fn unresolved_conflicts_fail_the_step() {
     let repo = &sandbox.repo;
     let (parents, join) = sandbox.conflicting_join(2);
     sandbox.marker("unresolvable", true);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
 
     for parent in &parents {
         assert_eq!(node(repo, parent)["node"]["status"], "completed");
@@ -732,7 +734,7 @@ fn planning_joins_paths() {
         [a.parse::<i64>().expect("a"), b.parse().expect("b")]
     );
 
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     assert_eq!(node(repo, &c)["node"]["status"], "completed");
     let files = git(repo, &["ls-tree", "--name-only", &format!("expl/node-{c}")]);
     for expected in [
@@ -953,25 +955,25 @@ fn up_runs_every_agent_until_down() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
     let started = ok(repo, &["up"]);
-    // explorer, planner, 2 executors, evaluator.
+    // explorer, planner, 2 verifiers, evaluator.
     assert_eq!(started.lines().count(), 5, "{started}");
     assert_eq!(ok(repo, &["ps", "-q"]).lines().count(), 5);
 
     // Adding a goal is all it takes: the running processes react.
     ok(repo, &["goal", "add", "Say hello"]);
-    wait_until(repo, "a candidate", || {
-        ok(repo, &["candidate", "ls", "-q"]) == "3"
+    wait_until(repo, "a hypothesis that satisfies the goal", || {
+        ok(repo, &["hypothesis", "ls", "-q"]) == "3"
     });
 
     // `up` is idempotent.
     assert_eq!(ok(repo, &["up"]), "");
     assert_eq!(ok(repo, &["ps", "-q"]).lines().count(), 5);
-    let executor = ok(repo, &["ps", "--format", "json"])
+    let verifier = ok(repo, &["ps", "--format", "json"])
         .lines()
         .map(json)
-        .find(|p| p["agent"] == "executor")
-        .expect("an executor");
-    let name = executor["name"].as_str().expect("name");
+        .find(|p| p["agent"] == "verifier")
+        .expect("a verifier");
+    let name = verifier["name"].as_str().expect("name");
     assert!(ok(repo, &["logs", name]).contains("started process"));
 
     assert_eq!(ok(repo, &["down"]).lines().count(), 5);
@@ -991,11 +993,11 @@ fn an_abandoned_start_gives_its_replica_slot_back() {
     // adopting it.
     let mut table = expl_core::Processes::open(&project.database_path(), &project.processes_dir())
         .expect("processes");
-    let orphan = table.create("executor", None, true).expect("create");
+    let orphan = table.create("verifier", None, true).expect("create");
     let id = orphan.id.to_string();
 
     // While its startup deadline holds, it occupies one of the two slots.
-    assert_eq!(ok(repo, &["up", "executor"]).lines().count(), 1);
+    assert_eq!(ok(repo, &["up", "verifier"]).lines().count(), 1);
     let record = json(&ok(repo, &["process", "inspect", &id]));
     assert_eq!(record["state"], "created", "{record}");
 
@@ -1015,7 +1017,7 @@ fn an_abandoned_start_gives_its_replica_slot_back() {
         json(&ok(repo, &["process", "inspect", &id]))["state"],
         "dead"
     );
-    let up = expl(repo, &["up", "executor"]);
+    let up = expl(repo, &["up", "verifier"]);
     assert!(up.status.success(), "{up:?}");
     assert_eq!(String::from_utf8_lossy(&up.stdout).lines().count(), 1);
     assert!(
@@ -1026,17 +1028,17 @@ fn an_abandoned_start_gives_its_replica_slot_back() {
     assert_eq!(record["state"], "exited", "{record}");
     let reason = record["exit_reason"].as_str().expect("reason").to_owned();
     assert!(reason.starts_with("abandoned"), "{record}");
-    let executors = || {
+    let verifiers = || {
         json_lines(&ok(repo, &["ps", "--format", "json"]))
             .into_iter()
-            .filter(|p| p["agent"] == "executor")
+            .filter(|p| p["agent"] == "verifier")
             .collect::<Vec<_>>()
     };
-    assert_eq!(executors().len(), 2);
-    assert!(executors().iter().all(|p| p["id"] != orphan.id.0));
+    assert_eq!(verifiers().len(), 2);
+    assert!(verifiers().iter().all(|p| p["id"] != orphan.id.0));
 
     // The child arriving late cannot adopt the expired record.
-    let late = expl(repo, &["run", "executor", "--adopt", &id]);
+    let late = expl(repo, &["run", "verifier", "--adopt", &id]);
     assert_eq!(late.status.code(), Some(1), "{late:?}");
     assert!(
         String::from_utf8_lossy(&late.stderr).contains("cannot be adopted"),
@@ -1049,24 +1051,24 @@ fn an_abandoned_start_gives_its_replica_slot_back() {
 
     // Nor can a second child adopt a record that is already running.
     wait_until(repo, "both replicas to run", || {
-        executors().iter().all(|p| p["state"] == "running")
+        verifiers().iter().all(|p| p["state"] == "running")
     });
-    let running = executors()[0]["id"].to_string();
-    let twin = expl(repo, &["run", "executor", "--adopt", &running]);
+    let running = verifiers()[0]["id"].to_string();
+    let twin = expl(repo, &["run", "verifier", "--adopt", &running]);
     assert_eq!(twin.status.code(), Some(1), "{twin:?}");
 
-    assert_eq!(ok(repo, &["up", "executor"]), "");
-    assert_eq!(executors().len(), 2);
+    assert_eq!(ok(repo, &["up", "verifier"]), "");
+    assert_eq!(verifiers().len(), 2);
 }
 
 #[test]
-fn stopping_mid_execution_gives_the_event_back() {
+fn stopping_mid_verification_gives_the_event_back() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
     ok(repo, &["goal", "add", "g"]);
     let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
     sandbox.slow(true);
-    let name = ok(repo, &["run", "executor", "-d"]);
+    let name = ok(repo, &["run", "verifier", "-d"]);
     wait_until(repo, "the step to start", || {
         node(repo, &a)["node"]["status"] == "running"
     });
@@ -1086,21 +1088,21 @@ fn stopping_mid_execution_gives_the_event_back() {
             "--kind",
             "node.ready",
             "--agent",
-            "executor",
+            "verifier",
             "--format",
             "json",
         ],
     );
     assert_eq!(json(&ready)["delivery"], "pending");
 
-    // The released event is delivered to the next executor process.
+    // The released event is delivered to the next verifier process.
     sandbox.slow(false);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     assert_eq!(node(repo, &a)["node"]["status"], "completed");
 }
 
 #[test]
-fn a_timed_out_execution_fails_the_step() {
+fn a_timed_out_verification_fails_the_step() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
     let path = repo.join("expl.toml");
@@ -1111,7 +1113,7 @@ fn a_timed_out_execution_fails_the_step() {
     let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
     sandbox.slow(true);
 
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     let step = node(repo, &a);
     assert_eq!(step["node"]["status"], "failed", "{step}");
     let outcome = step["node"]["outcome"].as_str().unwrap_or_default();
@@ -1128,12 +1130,12 @@ fn losing_the_lease_interrupts_the_reaction() {
     ok(repo, &["goal", "add", "g"]);
     let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
     sandbox.slow(true);
-    let name = ok(repo, &["run", "executor", "-d"]);
+    let name = ok(repo, &["run", "verifier", "-d"]);
     wait_until(repo, "the agent run to start", || {
         node(repo, &a)["agent_runs"][0]["status"] == "running"
     });
 
-    // Its lease runs out and another executor takes the event over, in one
+    // Its lease runs out and another verifier takes the event over, in one
     // step so the process cannot reclaim the event itself first.
     let db = rusqlite::Connection::open(repo.join(".expl/expl.db")).expect("db");
     db.busy_timeout(busy_timeout()).expect("timeout");
@@ -1142,7 +1144,7 @@ fn losing_the_lease_interrupts_the_reaction() {
             "UPDATE deliveries SET lease_token = 'replacement', process_id = 999, \
              attempts = attempts + 1, \
              leased_until = CAST(strftime('%s','now') AS INTEGER) + 600 \
-             WHERE agent = 'executor' AND status = 'leased'",
+             WHERE agent = 'verifier' AND status = 'leased'",
             [],
         )
         .expect("take over");
@@ -1162,7 +1164,7 @@ fn losing_the_lease_interrupts_the_reaction() {
     let lease: (String, i64, String) = db
         .query_row(
             "SELECT status, process_id, lease_token FROM deliveries \
-             WHERE agent = 'executor' AND event_id = (SELECT MAX(id) FROM events \
+             WHERE agent = 'verifier' AND event_id = (SELECT MAX(id) FROM events \
              WHERE kind = 'node.ready' AND node_id = ?1)",
             [a.parse::<i64>().expect("id")],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -1189,7 +1191,7 @@ fn discovery_stops_at_node_worktrees() {
     let repo = &sandbox.repo;
     ok(repo, &["goal", "add", "g"]);
     let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     // A settled step's worktree is gone; check out its branch where one
     // would be while it runs.
     let worktree = repo.join(".expl/worktrees").join(format!("node-{a}-a1"));
@@ -1219,7 +1221,7 @@ fn the_origin_follows_the_trunk() {
     ok(repo, &["goal", "add", "Say hello"]);
     let a = ok(repo, &["node", "add", "A", "--priority", "1"]);
     let b = ok(repo, &["node", "add", "B", "--priority", "1"]);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     let open = ok(repo, &["node", "add", "Later"]);
 
     // The owner merges A with git; the next process to run follows the
@@ -1235,8 +1237,8 @@ fn the_origin_follows_the_trunk() {
     assert_eq!(lineage[1]["origin"]["status"], "active");
     assert_eq!(lineage[1]["adopted"], serde_json::json!([3]));
     let second = lineage[1]["origin"]["id"].to_string();
-    // Every step keeps its base when the trunk moves: B stays a candidate
-    // on the old origin, and so does the step that had not started — until
+    // Every step keeps its base when the trunk moves: B stays on
+    // the old origin, and so does the step that had not started — until
     // planning moves it onto the new one.
     assert_eq!(node(repo, &open)["predecessors"], serde_json::json!([1]));
     assert_eq!(node(repo, &b)["predecessors"], serde_json::json!([1]));
@@ -1270,12 +1272,12 @@ fn the_origin_follows_the_trunk() {
         agents.contains(&"explorer") && agents.contains(&"evaluator"),
         "{agents:?}"
     );
-    let candidates = json_lines(&ok(repo, &["candidate", "ls", "--format", "json"]));
+    let satisfying = json_lines(&ok(repo, &["hypothesis", "ls", "--format", "json"]));
     let entry = |id: &str| {
-        candidates
+        satisfying
             .iter()
             .find(|c| c["node"].as_i64() == id.parse().ok())
-            .unwrap_or_else(|| panic!("{id} in {candidates:?}"))
+            .unwrap_or_else(|| panic!("{id} in {satisfying:?}"))
             .clone()
     };
     assert_eq!(entry(&a)["adopted_into"], 6);
@@ -1336,7 +1338,7 @@ fn a_step_takes_a_fresh_branch_and_leaves_the_trunk_and_other_branches_alone() {
 
     // A first attempt that fails stays on a branch of its own.
     sandbox.marker("fail", true);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     let mut failed = Vec::new();
     for id in [&a, &b] {
         let step = node(repo, id);
@@ -1356,7 +1358,7 @@ fn a_step_takes_a_fresh_branch_and_leaves_the_trunk_and_other_branches_alone() {
     sandbox.marker("fail", false);
     ok(repo, &["node", "retry", &a]);
     ok(repo, &["node", "retry", &b]);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     for id in [&a, &b] {
         let step = node(repo, id);
         assert_eq!(step["node"]["status"], "completed", "{step}");
@@ -1411,7 +1413,7 @@ fn a_symbolic_trunk_and_its_target_are_left_alone_when_a_step_takes_that_name() 
     let declaration = declaration.replacen("trunk = \"main\"", "trunk = \"trunk\"", 1);
     std::fs::write(&path, declaration).expect("declaration");
 
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     let step = node(repo, &a);
     assert_eq!(step["node"]["status"], "completed", "{step}");
     let branch = format!("expl/node-{a}-2");
@@ -1451,7 +1453,7 @@ fn a_reinitialised_graph_reusing_an_id_keeps_the_unadopted_branch() {
     // adopted.
     let old = ok(repo, &["node", "add", "Old work", "--priority", "1"]);
     assert_eq!(old, "2");
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     let step = node(repo, &old);
     assert_eq!(step["node"]["status"], "completed", "{step}");
     assert_eq!(step["node"]["branch"], "expl/node-2", "{step}");
@@ -1465,7 +1467,7 @@ fn a_reinitialised_graph_reusing_an_id_keeps_the_unadopted_branch() {
     assert_eq!(ok(repo, &["init"]), "1");
     let new = ok(repo, &["node", "add", "New work", "--priority", "1"]);
     assert_eq!(new, "2");
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     let step = node(repo, &new);
     assert_eq!(step["node"]["status"], "completed", "{step}");
     assert_eq!(step["node"]["branch"], "expl/node-2-2", "{step}");
@@ -1488,11 +1490,14 @@ fn refs(repo: &Path) -> String {
     git(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
 }
 
-/// A step whose agent takes its worktree to `target` (a branch, or
-/// `detached`) fails naming `head`, and moves no ref but the step's own
-/// branch's creation; with `fallback`, the agent fails there and a second
-/// CLI waits, so the restore before it is what must refuse.
-fn a_step_that_leaves_its_branch(target: &str, head: &str, fallback: bool) {
+/// A step whose agent uses git in its clone as it likes — points the
+/// branch `target` at its own work and switches there (or detaches HEAD),
+/// and commits — moves no ref of the project's but the step's own branch,
+/// and leaves the main checkout alone. Without `fallback` the step
+/// completes with what the agent's files hold; with it, the agent fails
+/// there, the clone is made again for a second CLI, which fails too, and
+/// the step fails.
+fn a_step_that_moves_refs_in_its_clone(target: &str, fallback: bool) {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
     let dir = sandbox.dir.path();
@@ -1506,7 +1511,7 @@ fn a_step_that_leaves_its_branch(target: &str, head: &str, fallback: bool) {
         std::fs::write(
             repo.join("expl.toml"),
             format!(
-                "{declaration}\n[[agent.executor.alternative]]\ndriver = \"generic\"\ncommand = [\"{}\"]\n",
+                "{declaration}\n[[agent.verifier.alternative]]\ndriver = \"generic\"\ncommand = [\"{}\"]\n",
                 dir.join("agent.sh").display()
             ),
         )
@@ -1520,38 +1525,43 @@ fn a_step_that_leaves_its_branch(target: &str, head: &str, fallback: bool) {
     let trunk = git(repo, &["rev-parse", "refs/heads/main"]);
     let refs_before = refs(repo);
     let status_before = git(repo, &["status", "--porcelain", "--untracked-files=all"]);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
 
     let inspected = node(repo, &step);
-    assert_eq!(inspected["node"]["status"], "failed", "{inspected}");
-    let outcome = inspected["node"]["outcome"].as_str().unwrap_or_default();
-    assert!(
-        outcome.contains(&format!("worktree left its branch `expl/node-{step}`"))
-            && outcome.contains(head),
-        "{outcome}"
-    );
-    let completed = ok(
-        repo,
-        &[
-            "event",
-            "ls",
-            "--kind",
-            "node.completed",
-            "--format",
-            "json",
-        ],
-    );
-    assert_eq!(completed, "", "{completed}");
-    // Every ref is where it was; the step's branch, made for it, holds
-    // nothing of the agent's.
     let branch = format!("refs/heads/expl/node-{step}");
+    if fallback {
+        assert_eq!(inspected["node"]["status"], "failed", "{inspected}");
+        let log = std::fs::read_dir(repo.join(".expl/logs"))
+            .expect("logs")
+            .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("log"))
+            .collect::<String>();
+        assert!(log.contains("restored the working directory"), "{log}");
+        assert!(log.contains("falling over"), "{log}");
+    } else {
+        assert_eq!(inspected["node"]["status"], "completed", "{inspected}");
+        assert_eq!(
+            git(repo, &["show", &format!("{branch}:README.md")]),
+            format!("edited by {step}")
+        );
+        assert_eq!(
+            git(repo, &["show", &format!("{branch}:node-{step}.txt")]),
+            format!("node {step}")
+        );
+        // One commit of expl's on the trunk; the agent's own stayed in
+        // its clone.
+        assert_eq!(
+            git(repo, &["log", "--format=%s", &format!("{trunk}..{branch}")]),
+            "A"
+        );
+    }
+    // Every ref but the step's own branch is where it was.
     let refs_after = refs(repo);
     let refs_after: Vec<&str> = refs_after
         .lines()
         .filter(|line| !line.starts_with(&format!("{branch} ")))
         .collect();
     assert_eq!(refs_after.join("\n"), refs_before, "{target}");
-    assert_eq!(git(repo, &["rev-parse", &branch]), trunk);
+    assert_eq!(git(repo, &["rev-parse", "refs/heads/main"]), trunk);
     // The main checkout is untouched.
     assert_eq!(git(repo, &["symbolic-ref", "HEAD"]), "refs/heads/main");
     assert_eq!(
@@ -1562,51 +1572,27 @@ fn a_step_that_leaves_its_branch(target: &str, head: &str, fallback: bool) {
         std::fs::read_to_string(repo.join("README.md")).expect("readme"),
         "hello\n"
     );
-    if fallback {
-        let log = std::fs::read_dir(repo.join(".expl/logs"))
-            .expect("logs")
-            .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("log"))
-            .collect::<String>();
-        assert!(!log.contains("restored the working directory"), "{log}");
-        assert!(!log.contains("falling over"), "{log}");
-    }
-
-    // An ordinary step still commits on its own branch.
-    std::fs::remove_file(dir.join("switch")).expect("switch marker");
-    let b = ok(repo, &["node", "add", "B", "--priority", "1"]);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
-    let inspected = node(repo, &b);
-    assert_eq!(inspected["node"]["status"], "completed", "{inspected}");
-    assert_eq!(
-        git(repo, &["show", &format!("expl/node-{b}:node-{b}.txt")]),
-        format!("node {b}")
-    );
-    assert_eq!(git(repo, &["rev-parse", "refs/heads/main"]), trunk);
 }
 
 #[test]
-fn a_step_that_switches_its_worktree_to_the_trunk_fails_and_moves_no_ref() {
-    a_step_that_leaves_its_branch("main", "`refs/heads/main`", false);
+fn a_step_that_moves_the_trunks_name_in_its_clone_moves_no_ref_of_the_project() {
+    a_step_that_moves_refs_in_its_clone("main", false);
 }
 
 #[test]
-fn a_step_that_switches_its_worktree_to_another_branch_fails_and_moves_no_ref() {
-    a_step_that_leaves_its_branch("other", "`refs/heads/other`", false);
+fn a_step_that_moves_another_branchs_name_in_its_clone_moves_no_ref_of_the_project() {
+    a_step_that_moves_refs_in_its_clone("other", false);
 }
 
 #[test]
-fn a_step_that_detaches_its_worktree_fails_and_moves_no_ref() {
-    a_step_that_leaves_its_branch("detached", "is detached", false);
+fn a_step_that_detaches_its_clone_moves_no_ref_of_the_project() {
+    a_step_that_moves_refs_in_its_clone("detached", false);
 }
 
 #[test]
-fn the_restore_before_a_fallback_cli_refuses_a_worktree_off_its_branch() {
-    for (target, head) in [
-        ("main", "`refs/heads/main`"),
-        ("other", "`refs/heads/other`"),
-        ("detached", "is detached"),
-    ] {
-        a_step_that_leaves_its_branch(target, head, true);
+fn the_restore_before_a_fallback_cli_makes_the_clone_again() {
+    for target in ["main", "other", "detached"] {
+        a_step_that_moves_refs_in_its_clone(target, true);
     }
 }
 
@@ -1852,7 +1838,7 @@ fn a_failed_step_grows_new_hypotheses_in_its_place() {
     ok(repo, &["run", "explorer", "--exit-when-idle"]);
     ok(repo, &["run", "planner", "--exit-when-idle"]);
     sandbox.marker("fail", true);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     assert_eq!(node(repo, "3")["node"]["status"], "failed");
 
     // Exploration reacts to the failure once evaluation concluded about
@@ -1921,7 +1907,7 @@ fn a_failed_step_grows_new_hypotheses_in_its_place() {
     // Failing again, the next exploration is told what already grew from
     // this failure, so it looks for other causes.
     ok(repo, &["node", "retry", "3"]);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     assert_eq!(node(repo, "3")["node"]["status"], "failed");
     std::fs::remove_dir_all(&prompts).expect("clear prompts");
     ok(repo, &["run", "evaluator", "--exit-when-idle"]);
@@ -1949,7 +1935,7 @@ fn evaluation_carries_on_a_step_that_stopped_short_from_where_it_stopped() {
     ok(repo, &["run", "explorer", "--exit-when-idle"]);
     ok(repo, &["run", "planner", "--exit-when-idle"]);
     sandbox.marker("fail-partial", true);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     let first = node(repo, "3");
     assert_eq!(first["node"]["status"], "failed", "{first}");
     let left = first["node"]["head_commit"]
@@ -1978,7 +1964,7 @@ fn evaluation_carries_on_a_step_that_stopped_short_from_where_it_stopped() {
     // The next attempt starts from what the first left, and is told.
     let prompts = sandbox.dir.path().join("prompts");
     std::fs::remove_dir_all(&prompts).expect("clear prompts");
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     let step = node(repo, "3");
     assert_eq!(step["node"]["status"], "completed", "{step}");
     let branch = step["node"]["branch"].as_str().expect("branch").to_owned();
@@ -2047,7 +2033,7 @@ fn a_graph_wide_exploration_surveys_and_attaches_anywhere() {
     ok(repo, &["goal", "add", "Say hello"]);
     ok(repo, &["run", "explorer", "--exit-when-idle"]);
     ok(repo, &["run", "planner", "--exit-when-idle"]);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     assert_eq!(node(repo, "3")["node"]["status"], "completed");
 
     let declaration = std::fs::read_to_string(repo.join("expl.toml")).expect("read");
@@ -2173,7 +2159,7 @@ fn speculative_exploration_grows_past_steps_not_carried_out() {
     )
     .expect("declaration");
     ok(repo, &["goal", "add", "Say hello"]);
-    // Planned, never executed (no executor runs here).
+    // Planned, never verified (no verifier runs here).
     let open = ok(
         repo,
         &[
@@ -2226,7 +2212,7 @@ fn evaluate_a_completed_step(sandbox: &Sandbox, marker: Option<&str>) -> serde_j
     let repo = &sandbox.repo;
     ok(repo, &["goal", "add", "A file greets"]);
     let step = ok(repo, &["node", "add", "Write a file", "--priority", "1"]);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     assert_eq!(node(repo, &step)["node"]["status"], "completed");
     if let Some(marker) = marker {
         sandbox.marker(marker, true);
@@ -2285,15 +2271,9 @@ fn an_evaluator_writing_into_its_scratch_is_reported_and_records_no_verdicts() {
 fn an_evaluator_committing_in_its_scratch_is_reported() {
     let sandbox = sandbox();
     let step = evaluate_a_completed_step(&sandbox, Some("eval-commits"));
+    // Reported by the file it added: the commit itself stayed in the
+    // evaluator's clone.
     assert_reported_violations(&step, "sneaky.txt");
-    let error = step["agent_runs"]
-        .as_array()
-        .expect("runs")
-        .iter()
-        .find(|r| r["role"] == "evaluation")
-        .and_then(|r| r["error"].as_str())
-        .expect("error");
-    assert!(error.contains("HEAD moved from"), "{error}");
     assert_nothing_recorded(&sandbox.repo, &step);
     // The stray commit never reached a branch.
     let subjects = git(&sandbox.repo, &["log", "--branches", "--format=%s"]);
@@ -2325,7 +2305,7 @@ fn a_partial_evaluation_records_nothing_until_a_complete_retry() {
         .parse()
         .expect("second goal ID");
     let step_id = ok(repo, &["node", "add", "Write a file", "--priority", "1"]);
-    ok(repo, &["run", "executor", "--exit-when-idle"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
     assert_eq!(node(repo, &step_id)["node"]["status"], "completed");
 
     let script = sandbox.dir.path().join("evaluation.sh");

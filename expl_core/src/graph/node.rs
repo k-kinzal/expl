@@ -38,7 +38,7 @@ pub enum NodeKind {
     /// A unit of work toward some goal: a change realised on its own branch,
     /// or an investigation that answers a question and changes nothing.
     Step,
-    /// What the human wants. Evaluated against; never executed.
+    /// What the human wants. Evaluated against; never verified.
     Goal,
 }
 
@@ -54,16 +54,16 @@ pub enum NodeKind {
 pub enum NodeStatus {
     /// Found by exploration, not yet planned.
     Proposed,
-    /// Given a priority by the planner; eligible for execution once every
+    /// Given a priority by the planner; eligible for verification once every
     /// predecessor is completed.
     Planned,
-    /// An executor is working on it.
+    /// A verifier is working on it.
     Running,
-    /// Executed; its branch holds the result.
+    /// Verified: carried out, its branch (or finding) holds the result.
     Completed,
-    /// Execution failed.
+    /// Verification failed: the step could not be carried out.
     Failed,
-    /// Discarded; never executed.
+    /// Discarded; never verified.
     Pruned,
     /// A goal that is being pursued, or the current origin.
     Active,
@@ -166,10 +166,10 @@ pub struct Node {
     pub proposed_by: Option<String>,
     /// Git branch holding this node's work (origin and change steps).
     pub branch: Option<String>,
-    /// Commit at the tip of the branch once executed (origin: base commit;
+    /// Commit at the tip of the branch once verified (origin: base commit;
     /// investigation: the code it was about).
     pub head_commit: Option<String>,
-    /// Executor's report, or the reason the node was pruned or failed.
+    /// Verifier's report, or the reason the node was pruned or failed.
     pub outcome: Option<String>,
     /// Creation time (UTC, RFC 3339).
     pub created_at: String,

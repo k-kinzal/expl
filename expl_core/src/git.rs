@@ -6,8 +6,9 @@
 //! knows how to talk to git; it does not know what a node is.
 
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use thiserror::Error;
 
@@ -48,6 +49,9 @@ pub enum BranchBlocker {
 pub struct Git {
     dir: PathBuf,
     discovery: Discovery,
+    /// An index file used in place of the repository's own
+    /// ([`reading`](Self::reading)).
+    index: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +59,9 @@ enum Discovery {
     Default,
     Worktree,
     Below(OsString),
+    /// The repository at this git directory, with `dir` as its working
+    /// tree.
+    Explicit(PathBuf),
 }
 
 impl Git {
@@ -64,6 +71,7 @@ impl Git {
         Self {
             dir: dir.into(),
             discovery: Discovery::Default,
+            index: None,
         }
     }
 
@@ -73,6 +81,7 @@ impl Git {
         Self {
             dir: dir.into(),
             discovery: Discovery::Worktree,
+            index: None,
         }
     }
 
@@ -81,7 +90,41 @@ impl Git {
         Self {
             dir,
             discovery: Discovery::Below(ceiling),
+            index: None,
         }
+    }
+
+    /// This repository reading the files of `work_tree` through the index
+    /// file `index`: its own configuration, objects and refs, another
+    /// directory's files. Whatever `work_tree` holds of git — a `.git` of
+    /// its own, with its configuration and hooks — is never consulted.
+    ///
+    /// # Errors
+    ///
+    /// [`GitError`] when this repository's git directory cannot be found.
+    pub(crate) fn reading(&self, work_tree: &Path, index: &Path) -> Result<Self, GitError> {
+        let git_dir = self.run(&["rev-parse", "--absolute-git-dir"])?;
+        Ok(Self {
+            dir: work_tree.to_path_buf(),
+            discovery: Discovery::Explicit(PathBuf::from(git_dir)),
+            index: Some(index.to_path_buf()),
+        })
+    }
+
+    /// The directory holding this repository's objects, shared by all of
+    /// its worktrees.
+    ///
+    /// # Errors
+    ///
+    /// [`GitError`] when git fails.
+    pub(crate) fn objects_dir(&self) -> Result<PathBuf, GitError> {
+        let common = PathBuf::from(self.run(&["rev-parse", "--git-common-dir"])?);
+        let common = if common.is_relative() {
+            self.dir.join(common)
+        } else {
+            common
+        };
+        Ok(common.join("objects"))
     }
 
     /// The directory this git runs in.
@@ -91,6 +134,40 @@ impl Git {
     }
 
     fn output(&self, args: &[&str]) -> Result<Output, GitError> {
+        self.command(args).output().map_err(GitError::Spawn)
+    }
+
+    /// Run git with `input` on its standard input and return trimmed
+    /// stdout. For commands that read their instructions from stdin and
+    /// write little (`update-ref --stdin`).
+    ///
+    /// # Errors
+    ///
+    /// [`GitError`] when git cannot start or exits non-zero.
+    pub(crate) fn run_with_input(&self, args: &[&str], input: &str) -> Result<String, GitError> {
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(GitError::Spawn)?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(input.as_bytes()).map_err(GitError::Spawn)?;
+        }
+        let output = child.wait_with_output().map_err(GitError::Spawn)?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        } else {
+            Err(GitError::Failed {
+                args: args.join(" "),
+                dir: self.dir.display().to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            })
+        }
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new("git");
         // Start discovery and resolve Git's storage paths from the selected
         // checkout, even when Expl was launched from a Git hook.
@@ -123,13 +200,20 @@ impl Git {
             Discovery::Below(ceiling) => {
                 command.env("GIT_CEILING_DIRECTORIES", ceiling);
             }
+            Discovery::Explicit(git_dir) => {
+                let mut flag = OsString::from("--git-dir=");
+                flag.push(git_dir);
+                command.arg(flag).arg("--work-tree=.");
+            }
+        }
+        if let Some(index) = &self.index {
+            command.env("GIT_INDEX_FILE", index);
         }
         command
             .args(args)
             .current_dir(&self.dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map_err(GitError::Spawn)
+            .env("GIT_TERMINAL_PROMPT", "0");
+        command
     }
 
     /// Run git and return trimmed stdout.

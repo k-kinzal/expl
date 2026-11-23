@@ -208,6 +208,13 @@ UPDATE nodes SET proposed_by = (
 ",
     CONCLUSIONS_MIGRATION,
     EXECUTION_CLAIMS_MIGRATION,
+    r"
+-- A step is a hypothesis, and the role that carries it out verifies it:
+-- the `execution` role is now `verification`. Runs and assignments keep
+-- their role under its new name, so routing decided before still holds.
+UPDATE agent_runs SET role = 'verification' WHERE role = 'execution';
+UPDATE assignments SET role = 'verification' WHERE role = 'execution';
+",
 ];
 
 const CONCLUSIONS_MIGRATION: &str = r"

@@ -14,7 +14,7 @@ pub struct Evaluation {
     pub node: NodeId,
     /// The goal it was judged against.
     pub goal: NodeId,
-    /// Whether the step's branch satisfies the goal.
+    /// Whether the evaluator read the step's branch as meeting the goal.
     pub satisfied: bool,
     /// Progress toward the goal, 0–100.
     pub score: i64,

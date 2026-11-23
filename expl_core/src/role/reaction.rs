@@ -8,12 +8,11 @@ use serde::de::DeserializeOwned;
 
 use crate::agent::{Agent, AgentError, Invocation};
 use crate::event::{Delivery, Event, LeaseToken};
-use crate::git::Git;
 use crate::graph::{AgentRunStatus, Graph, NodeId};
 use crate::process::{Interrupt, ProcessId};
 use crate::prompt::Prompt;
 use crate::role::{Context, Report, RoleError};
-use crate::workspace::{ScratchWorkspace, Workspace};
+use crate::workspace::{AgentClone, ScratchWorkspace};
 
 /// Everything a role needs to react to one event.
 #[derive(Debug, Clone, Copy)]
@@ -101,8 +100,8 @@ impl<'a> Reaction<'a> {
         }
     }
 
-    /// Invoke the agent once in the step's own `workspace` and decode its
-    /// response.
+    /// Invoke the agent once in `clone`, the step's private clone, and
+    /// decode its response.
     ///
     /// The invocation is journaled (`agent_runs`) with its raw log under
     /// `.expl/logs/`, whether it succeeds or not.
@@ -110,13 +109,11 @@ impl<'a> Reaction<'a> {
         &self,
         graph: &mut Graph,
         node: Option<NodeId>,
-        workspace: &Workspace,
+        clone: &AgentClone,
         prompt: &Prompt,
         schema: &serde_json::Value,
     ) -> Result<T, RoleError> {
-        self.run(graph, node, Place::Step(workspace), prompt, schema, |_| {
-            Ok(())
-        })
+        self.run(graph, node, Place::Step(clone), prompt, schema, |_| Ok(()))
     }
 
     /// Invoke the agent once in the read-only `scratch` worktree, as
@@ -171,7 +168,7 @@ impl<'a> Reaction<'a> {
         validate: impl Fn(&T) -> Result<(), AgentError>,
     ) -> Result<T, RoleError> {
         let (directory, scratch) = match place {
-            Place::Step(workspace) => (workspace.path(), None),
+            Place::Step(clone) => (clone.path(), None),
             Place::Scratch(scratch) => (scratch.path(), Some(scratch)),
         };
         let role = self.agent.role();
@@ -198,24 +195,14 @@ impl<'a> Reaction<'a> {
         if let Some(node) = node {
             facts.push(("EXPL_NODE".to_owned(), node.0.to_string()));
         }
-        // Every directory an agent works in is a worktree expl made for it,
-        // so a failed attempt's leftovers can be reset before the next CLI.
-        // Not while it resolves a merge: resetting would abort the merge
-        // the next CLI is to finish. Nor once the worktree left the branch
-        // it holds (or, for a scratch worktree, its detached HEAD): the
-        // reset would move whatever branch HEAD points at now.
-        let git = Git::in_worktree(directory);
-        let merging = git
-            .run(&["rev-parse", "-q", "--verify", "MERGE_HEAD"])
-            .is_ok();
-        let started_at = (!merging)
-            .then(|| git.resolve_commit("HEAD").ok())
-            .flatten();
+        // Every directory an agent works in is a clone expl made for it, so
+        // a failed attempt's leftovers are put back before the next CLI:
+        // the clone is made again as it started, a merge to resolve
+        // included.
         let restore = || -> std::io::Result<()> {
-            let restored = match (&started_at, place) {
-                (None, _) => Ok(()),
-                (Some(head), Place::Step(workspace)) => workspace.restore(head),
-                (Some(_), Place::Scratch(scratch)) => scratch.restore(),
+            let restored = match place {
+                Place::Step(clone) => clone.reset(),
+                Place::Scratch(scratch) => scratch.restore(),
             };
             restored.map_err(std::io::Error::other)
         };
@@ -278,9 +265,9 @@ impl<'a> Reaction<'a> {
 /// Where an agent is invoked.
 #[derive(Debug, Clone, Copy)]
 enum Place<'a> {
-    /// A change step's own worktree, on the step's branch.
-    Step(&'a Workspace),
-    /// A read-only scratch worktree, detached.
+    /// A change step's private clone, on a branch of the step's name.
+    Step(&'a AgentClone),
+    /// A read-only scratch clone, detached.
     Scratch(&'a ScratchWorkspace),
 }
 

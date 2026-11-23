@@ -3,7 +3,7 @@
 //! The model in one paragraph: the **graph** (SQLite) holds the exploration
 //! — origins, steps, goals, and the edges between them. Every change to
 //! the graph is recorded as an **event**. Declared **agents** react to the
-//! events of their **role** (exploration, planning, execution, evaluation),
+//! events of their **role** (exploration, planning, verification, evaluation),
 //! and their reactions change the graph, which records new events. Agents
 //! run as **processes**, managed like Docker containers: start as many as
 //! you like; processes of one agent compete for its events, so independent
@@ -66,4 +66,6 @@ pub use prompt::Prompt;
 pub use role::{Context, Direction, Reaction, Report, Role, RoleError};
 pub use store::StoreError;
 pub use trunk::{Advance, Trunk, TrunkError};
-pub use workspace::{ScratchChanges, ScratchWorkspace, Workspace, WorkspaceError, Workspaces};
+pub use workspace::{
+    AgentClone, ScratchChanges, ScratchWorkspace, Workspace, WorkspaceError, Workspaces,
+};

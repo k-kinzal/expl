@@ -768,7 +768,7 @@ mod tests {
         // a becomes ready first, at a high priority; b later, at a low one.
         f.graph.plan_step(a, 100).expect("plan a"); // node.planned, node.ready
         f.graph.plan_step(b, 1).expect("plan b");
-        let mut inbox = Inbox::open(&f.db, "executor").expect("inbox");
+        let mut inbox = Inbox::open(&f.db, "verifier").expect("inbox");
         let kinds = &[EventKind::NodeReady, EventKind::NodeProposed];
         let mut next = || {
             let delivery = inbox.lease(kinds, ProcessId(1), false, 3).expect("lease")?;

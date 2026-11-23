@@ -1,21 +1,21 @@
 ---
 name: expl-operate
-description: Operate expl on this repository (expl developing itself) — start, watch, and steer the exploration/planning/execution/evaluation processes, manage goals, and keep the UI open. Use whenever you are the controller of a running expl, before adopting candidates (expl-adopt) or fixing expl itself (expl-troubleshoot).
+description: Operate expl on this repository (expl developing itself) — start, watch, and steer the exploration/planning/verification/evaluation processes, manage goals, and keep the UI open. Use whenever you are the controller of a running expl, before adopting hypotheses (expl-adopt) or fixing expl itself (expl-troubleshoot).
 ---
 
 # Operating expl (controller notes)
 
-You are the **controller**. expl's agents explore, plan, execute and evaluate on
-their own; you keep them running, read what they produce, adopt good candidates
+You are the **controller**. expl's agents explore (propose hypotheses), plan, verify and evaluate on
+their own; you keep them running, read what they produce, adopt good hypotheses
 into `main`, and fix expl when it stops behaving. You do not implement features
 yourself — expl does. You only fix what blocks expl from continuing to explore.
 
 ## Standing rules (from the owner)
 
 - Exploration, planning and evaluation run on **Claude Code and Codex, routed
-  automatically**; execution runs on **cursor-agent with Claude Opus 5.5**
+  automatically**; verification runs on **cursor-agent with Claude Opus 5.5**
   (`claude-opus-5-5-high`). This is configured in `expl.toml`; keep it so.
-- **Markdown files are frozen for expl's agents.** No candidate that adds, modifies
+- **Markdown files are frozen for expl's agents.** No hypothesis that adds, modifies
   or deletes a `*.md` file is ever merged. The controller edits Markdown only when
   the owner explicitly asks (they did for these skills, and for rewriting
   `AGENTS.md` when the vision changed) and commits it to `main` directly.
@@ -39,7 +39,7 @@ yourself — expl does. You only fix what blocks expl from continuing to explore
 | fringe | exploration (niche + counterexamples, `weight = 1`) | claude_code ⇄ codex | 1 |
 | surveyor | exploration across the whole graph (`scope = "graph"`, `weight = 1`) | claude_code ⇄ codex | 1 |
 | planner | planning | claude_code ⇄ codex | 1 |
-| executor | execution | cursor_agent (`--model claude-opus-5-5-high --force --trust --sandbox disabled`) | 1 |
+| verifier | verification | cursor_agent (`--model claude-opus-5-5-high --force --trust --sandbox disabled`) | 1 |
 | evaluator | evaluation | claude_code ⇄ codex | 1 |
 
 - **Three kinds of exploration, routed by `weight` (4:1:1).** `explorer` enumerates
@@ -60,7 +60,7 @@ yourself — expl does. You only fix what blocks expl from continuing to explore
 - **Explore wide, plan narrow.** Explorers list up to `breadth = 8` possibilities
   without filtering by likelihood; the planner ranks weak or counterproductive steps
   low and prunes only duplicates. There is no backlog limit, on the owner's
-  instruction: a new candidate can change what is most promising, and crowding is
+  instruction: a new hypothesis can change what is most promising, and crowding is
   planning's problem to solve, not a reason to stop exploring.
 - **One replica per agent, on purpose.** The owner prefers slow exploration over
   bursts of token use. Do not raise `replicas` without being asked.
@@ -71,12 +71,12 @@ yourself — expl does. You only fix what blocks expl from continuing to explore
   (`node.revisited` in `expl event ls`). Starting points are revisited again and
   again (routed by weight like any exploration event); each prompt lists the steps that already exist so new ones are different.
   Raise the cooldown if token use is too high — it is the only brake on
-  exploration besides execution's pace.
+  exploration besides verification's pace.
 - **Exploring ahead** (`speculate = true` on explorer and fringe — an experiment the
-  owner wants to judge by its results): revisits also pick steps not carried out
+  owner wants to judge by its results): revisits also pick steps not verified
   yet; exploring one assumes it (and the open steps under it) succeeds and proposes
   what comes next (`explored ahead from #N`, prompt section `## Assumed done`). The
-  tree then grows deep before execution catches up. Only revisits do this, so the
+  tree then grows deep before verification catches up. Only revisits do this, so the
   cooldown bounds it.
 - **Rebasing is planning's call.** When the trunk moves, no step moves with it;
   the planner lists in `rebases` the open steps that should start from the new
@@ -115,7 +115,7 @@ nohup expl-ui -C "$PWD" > .expl/operator/expl-ui.log 2>&1 &   # the live graph w
 # Adopted work is drawn as a branch merging into the trunk spine; merge origins have
 # a halo and a "+N" in their label.
 expl down -t 30                           # stop all (in-flight runs are interrupted and redelivered)
-expl run executor -d                      # one extra process of an agent
+expl run verifier -d                      # one extra process of an agent
 ```
 
 `skills/expl-operate/scripts/rolling-restart.sh` restarts every process that runs
@@ -134,7 +134,7 @@ Check the UI is alive with `pgrep -fl expl-ui`; restart it with the line above i
 expl ps                       # what each process is doing right now
 expl node ls                  # proposed → planned → ready → running → completed/failed
 expl path ls                  # the latest plan
-expl candidate ls             # steps evaluated as satisfying a goal (adoption list)
+expl hypothesis ls            # hypotheses evaluated as satisfying a goal (adoption list)
 expl origin ls                # lineage: each trunk position, what it adopted, trunk scores
 expl event ls --limit 30      # event log
 expl event ls --agent planner # how one agent's deliveries stand (failed / leased / acked)
@@ -142,7 +142,7 @@ expl node inspect <id>        # edges, evaluations, agent runs of one node
 expl node logs <id>           # newest raw agent log about a node
 ```
 
-Typical rhythm: look every few minutes; act when (a) a candidate appears or a step
+Typical rhythm: look every few minutes; act when (a) a hypothesis satisfies a goal or a step
 scores high → `expl-adopt`; (b) a delivery failed, a process exited, or nothing has
 moved for long → `expl-troubleshoot`.
 

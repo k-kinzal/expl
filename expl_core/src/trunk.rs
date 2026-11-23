@@ -2,7 +2,7 @@
 //!
 //! Exploration starts from the **origin**: the trunk as it stands. Agents
 //! never touch the trunk. The owner moves it with git, merging the
-//! candidates they choose and resolving conflicts as with any branch.
+//! hypotheses they choose and resolving conflicts as with any branch.
 //! expl only follows: when the trunk's tip moves, [`Trunk::follow`] records
 //! the new commit as the active origin and keeps the previous one,
 //! superseded, so the graph remembers what was taken in and when
@@ -413,9 +413,9 @@ mod tests {
             let head = git(&path, &["rev-parse", "HEAD"]);
             git(&self.root, &["worktree", "remove", "--force", &path_text]);
             self.graph.plan_step(id, 1).expect("plan");
-            let mut inbox = Inbox::open(&self.project.database_path(), "executor").expect("inbox");
+            let mut inbox = Inbox::open(&self.project.database_path(), "verifier").expect("inbox");
             let delivery = inbox
-                .lease(Role::Execution.reactions(), ProcessId(1), false, 3)
+                .lease(Role::Verification.reactions(), ProcessId(1), false, 3)
                 .expect("lease")
                 .expect("node.ready");
             assert_eq!(delivery.event.node, Some(id));

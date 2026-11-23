@@ -939,7 +939,7 @@ impl Graph {
     }
 
     /// Give a running step back to the plan without recording an event:
-    /// its execution was interrupted, and the redelivered `node.ready`
+    /// its verification was interrupted, and the redelivered `node.ready`
     /// will claim it again.
     ///
     /// # Errors
@@ -955,7 +955,7 @@ impl Graph {
     }
 
     /// Running steps whose `node.ready` nobody holds a lease on (see
-    /// `orphaned`). Their execution was abandoned, and nothing would ever
+    /// `orphaned`). Their verification was abandoned, and nothing would ever
     /// take it up again.
     ///
     /// # Errors
@@ -971,7 +971,7 @@ impl Graph {
     }
 
     /// Give an [orphaned](Self::orphans) step back to the plan and record
-    /// `node.ready` again when it can run, so execution is delivered it
+    /// `node.ready` again when it can run, so verification is delivered it
     /// anew. `false`, changing nothing, when the step is not orphaned (any
     /// more): it settled, or a live process took it up.
     ///
@@ -1494,7 +1494,7 @@ impl Graph {
         Ok(points)
     }
 
-    /// Steps awaiting execution (`proposed` + `planned`).
+    /// Steps awaiting verification (`proposed` + `planned`).
     ///
     /// # Errors
     ///
@@ -1682,13 +1682,13 @@ impl Graph {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Goal candidates: the latest evaluation per (step, goal) pair that
+    /// Hypotheses that satisfy a goal: the latest evaluation per (step, goal) pair that
     /// says the goal is satisfied, best score first.
     ///
     /// # Errors
     ///
     /// [`GraphError`] on SQLite failure.
-    pub fn candidates(&self) -> Result<Vec<Evaluation>, GraphError> {
+    pub fn satisfying(&self) -> Result<Vec<Evaluation>, GraphError> {
         let mut stmt = self.conn.prepare(
             "SELECT v.id, v.node_id, v.goal_id, v.satisfied, v.score, v.reason, v.created_at \
              FROM evaluations v JOIN nodes n ON n.id = v.node_id \
@@ -1852,7 +1852,7 @@ mod tests {
     use crate::event::{Delivery, Inbox};
     use crate::process::ProcessId;
 
-    const EXECUTOR: &str = "executor";
+    const VERIFIER: &str = "verifier";
 
     fn seeded() -> (Graph, NodeId, NodeId) {
         seed(Graph::in_memory().expect("graph"))
@@ -1862,7 +1862,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("expl.db");
         let (graph, origin, goal) = seed(Graph::open(&db).expect("graph"));
-        let inbox = Inbox::open(&db, EXECUTOR).expect("inbox");
+        let inbox = Inbox::open(&db, VERIFIER).expect("inbox");
         (dir, graph, origin, goal, inbox)
     }
 
@@ -1965,11 +1965,11 @@ mod tests {
     }
 
     #[test]
-    fn only_the_current_executor_can_record_a_finding() {
+    fn only_the_current_verifier_can_record_a_finding() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("expl.db");
         let (mut graph, origin, goal) = seed(Graph::open(&db).expect("graph"));
-        let mut inbox = Inbox::open(&db, EXECUTOR).expect("inbox");
+        let mut inbox = Inbox::open(&db, VERIFIER).expect("inbox");
         let question = graph
             .propose_investigation("ask", "is it so?", &[origin], &[goal])
             .expect("investigation");
@@ -1993,11 +1993,11 @@ mod tests {
             .conn
             .execute(
                 "UPDATE deliveries SET leased_until = 0 WHERE agent = ?1 AND event_id = ?2",
-                params![EXECUTOR, first.event.id.0],
+                params![VERIFIER, first.event.id.0],
             )
             .expect("expire");
         assert_eq!(expired, 1);
-        let mut replacement_inbox = Inbox::open(&db, EXECUTOR).expect("inbox");
+        let mut replacement_inbox = Inbox::open(&db, VERIFIER).expect("inbox");
         let replacement = lease_ready(&mut replacement_inbox, 2, question);
         assert_eq!(replacement.event.id, first.event.id);
         assert_eq!(replacement.attempts, 2);
@@ -2060,7 +2060,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("expl.db");
         let (mut graph, first, goal) = seed(Graph::open(&db).expect("graph"));
-        let mut inbox = Inbox::open(&db, EXECUTOR).expect("inbox");
+        let mut inbox = Inbox::open(&db, VERIFIER).expect("inbox");
         let change = graph.propose_step("c", "c", &[first], &[goal]).expect("c");
         let question = graph
             .propose_investigation("q", "q?", &[first], &[goal])
@@ -2162,7 +2162,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("expl.db");
         let mut graph = Graph::open(&db).expect("graph");
-        let mut inbox = Inbox::open(&db, EXECUTOR).expect("inbox");
+        let mut inbox = Inbox::open(&db, VERIFIER).expect("inbox");
         let origin = graph
             .create_origin("origin", Some("main"), "abc")
             .expect("origin");
@@ -2324,7 +2324,7 @@ mod tests {
     fn concurrent_claims_from_different_agents_start_the_step_once() {
         let (dir, mut graph, origin, goal, mut first_inbox) = seeded_with_inbox();
         let db = dir.path().join("expl.db");
-        let mut second_inbox = Inbox::open(&db, "another-executor").expect("inbox");
+        let mut second_inbox = Inbox::open(&db, "another-verifier").expect("inbox");
         let step = graph
             .propose_step("s", "s", &[origin], &[goal])
             .expect("step");
@@ -2356,7 +2356,7 @@ mod tests {
     }
 
     #[test]
-    fn candidates_use_latest_verdict() {
+    fn satisfying_uses_latest_verdict() {
         let (_dir, mut graph, origin, goal, mut inbox) = seeded_with_inbox();
         let a = graph.propose_step("a", "a", &[origin], &[goal]).expect("a");
         graph.plan_step(a, 1).expect("plan");
@@ -2372,11 +2372,11 @@ mod tests {
             reason: "r".into(),
         };
         graph.record_evaluations(a, &[verdict(true)]).expect("eval");
-        assert_eq!(graph.candidates().expect("candidates")[0].score, 100);
+        assert_eq!(graph.satisfying().expect("satisfying")[0].score, 100);
         graph
             .record_evaluations(a, &[verdict(false)])
             .expect("eval");
-        assert!(graph.candidates().expect("candidates").is_empty());
+        assert!(graph.satisfying().expect("satisfying").is_empty());
     }
 
     #[test]
@@ -2436,7 +2436,7 @@ mod tests {
         let answered = graph.node(question).expect("node");
         let before = graph.last_event().expect("last");
 
-        // Still under the same delivery's lease, as a late executor is.
+        // Still under the same delivery's lease, as a late verifier is.
         let late = graph.fail(question, &delivery.token, "late failure");
         assert!(
             matches!(
@@ -2746,7 +2746,7 @@ mod tests {
     }
 
     #[test]
-    fn origin_verdicts_are_not_candidates() {
+    fn origin_verdicts_satisfy_nothing() {
         let (mut graph, origin, goal) = seeded();
         graph
             .record_evaluations(
@@ -2759,7 +2759,7 @@ mod tests {
                 }],
             )
             .expect("eval");
-        assert!(graph.candidates().expect("candidates").is_empty());
+        assert!(graph.satisfying().expect("satisfying").is_empty());
     }
 
     fn concluded(decision: Decision) -> NewConclusion {
@@ -2905,7 +2905,7 @@ mod tests {
             .expect("conclude");
 
         assert_eq!(graph.evaluations_of(step).expect("evaluations").len(), 1);
-        assert_eq!(graph.candidates().expect("candidates").len(), 1);
+        assert_eq!(graph.satisfying().expect("satisfying").len(), 1);
         assert!(
             graph
                 .conclude(origin, newest(&graph), &concluded(Decision::Done), &[])

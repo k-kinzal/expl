@@ -29,9 +29,9 @@ ls -t .expl/logs | head                      # newest agent runs
 | run log ends with `claude reported error_*` / `usage limit` / codex exit 1 | CLI quota or outage | routing falls over to the other CLI automatically; if both fail, wait, or temporarily remove the broken CLI from `expl.toml` and restart that agent |
 | `codex's last message is not a JSON object` / `no structured output` | CLI answered prose | usually transient (retried); if systematic, check the role schema still matches what the CLI accepts |
 | cursor-agent `is_error` / auth error | Cursor login expired | ask the owner to run `! cursor-agent login`; then `expl node retry <id>` for failed steps |
-| step `failed` with "cargo … failed" in its summary | executor could not make tests pass | normal outcome; planning re-plans or prunes it — leave it unless it repeats for the same reason |
+| step `failed` with "cargo … failed" in its summary | verifier could not make tests pass | normal outcome; planning re-plans or prunes it — leave it unless it repeats for the same reason |
 | process `dead` in `expl ps` | crashed or killed without exiting | `expl rm <name>` then `expl up`; its leases expire after 60 s and the events are redelivered |
-| a step stuck `running` with no live executor | executor died mid-run | the lease expires and the redelivered `node.ready` reclaims it; if not, `expl stop`/`up` the executors |
+| a step stuck `running` with no live verifier | verifier died mid-run | the lease expires and the redelivered `node.ready` reclaims it; if not, `expl stop`/`up` the verifiers |
 | nothing `ready` although steps are `planned` | predecessors not completed, or planner never prioritised them | `expl path ls`, `expl event ls --agent planner` |
 | merged into main but `expl origin ls` shows no new origin | no process is running, or trunk branch mismatch | `expl up`; `trunk = "main"` in `expl.toml`; the process log shows `cannot follow the trunk: …` |
 | `worktree add` / `branch -D` errors | leftover worktree or branch from a crash | `git worktree prune`; inspect `.expl/worktrees`; never delete `expl/node-*` branches of completed steps |

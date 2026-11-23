@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-screen status of a running expl: processes, graph, candidates,
+# One-screen status of a running expl: processes, graph, hypotheses that satisfy a goal,
 # lineage, failing deliveries and recent agent runs.
 #
 # Usage: skills/expl-operate/scripts/status.sh [REPO]
@@ -17,8 +17,8 @@ section "goals"
 expl goal ls
 section "nodes"
 expl node ls
-section "candidates"
-expl candidate ls
+section "hypotheses"
+expl hypothesis ls
 section "lineage"
 expl origin ls
 section "recent events"

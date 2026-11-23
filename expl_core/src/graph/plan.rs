@@ -28,7 +28,7 @@ pub struct Plan {
 pub struct PlannedPath {
     /// The goal this path heads for.
     pub goal: NodeId,
-    /// Nodes in execution order (the goal itself is implied).
+    /// Nodes in the order they are verified (the goal itself is implied).
     pub nodes: Vec<NodeId>,
     /// Why the planner believes in this path.
     pub rationale: String,

@@ -3,12 +3,12 @@
 # Each [agent.<name>] is started as processes (`expl run <name>`, or
 # `expl up` for `replicas` of every agent). An agent reacts to the graph
 # events of its role:
-#   exploration — goal.added, node.evaluated, origin.advanced → proposes steps;
-#                 when idle, every `revisit_cooldown` seconds it explores again
-#                 from a random starting point (node.revisited)
-#   planning    — node.proposed/evaluated/failed, goal.retired, origin.advanced → paths and priorities
-#   execution   — node.ready                                   → commits on the step's branch
-#   evaluation  — node.completed, origin.advanced → verdicts against goals
+#   exploration  — goal.added, node.evaluated, origin.advanced → proposes hypotheses (steps);
+#                  when idle, every `revisit_cooldown` seconds it explores again
+#                  from a random starting point (node.revisited)
+#   planning     — node.proposed/evaluated/failed, goal.retired, origin.advanced → paths and priorities
+#   verification — node.ready                                  → verifies the step: commits on its branch, or a finding
+#   evaluation   — node.completed, origin.advanced → whether it held, verdicts against goals
 #
 # `driver` selects how the CLI is spoken to:
 #   claude_code  — `claude --print --output-format json --json-schema ...`
@@ -18,21 +18,26 @@
 #
 # Exploration, planning and evaluation are routed across Claude Code and
 # Codex (`[[agent.<name>.alternative]]`): each invocation goes to the next CLI in turn and falls over to the
-# other when one fails. Execution is routed the same way.
+# other when one fails. Verification is routed the same way.
 #
-# All agents share one cargo target directory so that every worktree does
+# All agents share one cargo target directory so that every clone does
 # not rebuild the dependencies (gpui above all) from scratch.
 #
 # Every agent runs one process (replicas = 1): exploration takes longer, but
 # token use never spikes.
 #
-# Agents run unattended inside expl-owned git worktrees, so these let the
-# CLIs edit files and run commands without asking.
+# Agents run unattended inside private clones expl makes for them, so these
+# let the CLIs edit files and run commands without asking.
 
-# The default branch. Merge the candidates you choose into it with git;
+# The default branch. Merge the hypotheses you choose into it with git;
 # running processes notice it moved, the origin follows, and exploration
 # starts again from there.
 trunk = "main"
+
+# Markdown is frozen while exploring: a step's commit keeps every *.md as
+# it was where the step started, whatever the verifier did to it.
+[workspace]
+frozen = ["*.md"]
 
 # Exploration is two agents routed by `weight` (each event goes to one of
 # them, 4:1): `explorer` searches where the goal promises the most;
@@ -141,8 +146,8 @@ driver = "codex"
 command = ["codex"]
 args = ["--dangerously-bypass-approvals-and-sandbox"]
 
-[agent.executor]
-role = "execution"
+[agent.verifier]
+role = "verification"
 # Claude Code first, Codex when it fails. (Cursor Agent, used before, hit its
 # monthly Opus usage limit until 2026-12-17.)
 driver = "claude_code"
@@ -153,14 +158,12 @@ replicas = 1
 instructions = """
 This repository is expl itself (Rust workspace: expl_core, expl_cli, expl_ui). Follow AGENTS.md:
 keep its nouns and responsibilities, document public items, keep errors typed (thiserror).
-Markdown files (*.md) are frozen: do not add, modify, or delete any .md file, even if the task
-seems to ask for it.
 For a change: before finishing, `cargo fmt`, `cargo clippy --all-targets`, and `cargo test`
 must pass; report succeeded=false if they do not. For an investigation (a question to answer):
 change nothing, and back the answer with evidence from the code, builds, or tests you ran.
 """
 
-[[agent.executor.alternative]]
+[[agent.verifier.alternative]]
 driver = "codex"
 command = ["codex"]
 args = ["--dangerously-bypass-approvals-and-sandbox"]
@@ -170,17 +173,15 @@ role = "evaluation"
 driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
-# Its own target directory: sharing the executor's, a test run could pick up
-# a binary another worktree's build had just overwritten.
+# Its own target directory: sharing the verifier's, a test run could pick up
+# a binary another clone's build had just overwritten.
 env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target-evaluator" }
 replicas = 1
 instructions = """
 For a change: run `cargo clippy --all-targets` and `cargo test`. A goal is never satisfied by a
 branch on which either fails. For an investigation: there is nothing to build; check that the
 evidence holds against the code in the working directory, and judge whether the findings settle
-the goal. A branch that adds, modifies, or deletes any Markdown (*.md) file satisfies
-no goal: check with `git diff --name-only "$(git merge-base HEAD main)" HEAD -- '*.md'`, which
-must print nothing. Judge naming and responsibilities against AGENTS.md as part of quality.
+the goal. Judge naming and responsibilities against AGENTS.md as part of quality.
 """
 
 [[agent.evaluator.alternative]]

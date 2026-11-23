@@ -54,7 +54,7 @@ pub(crate) struct Snapshot {
     /// Every evaluation, oldest first.
     pub(crate) evaluations: Vec<Evaluation>,
     /// Steps that satisfy a goal → the goals they satisfy.
-    pub(crate) candidates: BTreeMap<NodeId, Vec<NodeId>>,
+    pub(crate) satisfying: BTreeMap<NodeId, Vec<NodeId>>,
     /// The trunk's history: every origin and what was adopted into it.
     pub(crate) lineage: Lineage,
     /// Which goals are subgoals of which.
@@ -82,9 +82,9 @@ impl Snapshot {
         let nodes = graph.nodes(&NodeFilter::default())?;
         let edges = graph.edges()?;
         let evaluations = graph.evaluations()?;
-        let mut candidates: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-        for evaluation in graph.candidates()? {
-            candidates
+        let mut satisfying: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+        for evaluation in graph.satisfying()? {
+            satisfying
                 .entry(evaluation.node)
                 .or_default()
                 .push(evaluation.goal);
@@ -124,7 +124,7 @@ impl Snapshot {
             nodes,
             edges,
             evaluations,
-            candidates,
+            satisfying,
             lineage,
             goal_tree,
             paths,
@@ -187,10 +187,10 @@ impl Snapshot {
         })
     }
 
-    /// The best-scoring candidate for `goal` that is not in the trunk yet:
+    /// The best-scoring hypothesis for `goal` that is not in the trunk yet:
     /// what the owner could adopt next.
     pub(crate) fn best_open(&self, goal: NodeId) -> Option<&Evaluation> {
-        self.candidates
+        self.satisfying
             .iter()
             .filter(|(step, goals)| goals.contains(&goal) && !self.lineage.in_trunk(**step))
             .filter_map(|(step, _)| self.verdicts(*step).into_iter().find(|e| e.goal == goal))
@@ -261,7 +261,7 @@ mod tests {
     use expl_core::{EventKind, Inbox};
 
     #[test]
-    fn reads_nodes_edges_events_and_candidates() {
+    fn reads_nodes_edges_events_and_satisfying() {
         let dir = tempfile::tempdir().expect("tempdir");
         let project = Project::at(dir.path());
         std::fs::create_dir_all(project.state_dir()).expect("state dir");
@@ -274,7 +274,7 @@ mod tests {
             .propose_step("cache", "add a cache", &[origin], &[goal])
             .expect("step");
         graph.plan_step(step, 5).expect("plan");
-        let delivery = Inbox::open(&project.database_path(), "executor")
+        let delivery = Inbox::open(&project.database_path(), "verifier")
             .expect("inbox")
             .lease(&[EventKind::NodeReady], ProcessId(1), false, 3)
             .expect("lease")
@@ -297,7 +297,7 @@ mod tests {
 
         let snapshot = Snapshot::load(&project).expect("snapshot");
         assert_eq!(snapshot.nodes.len(), 3);
-        assert_eq!(snapshot.candidates.get(&step), Some(&vec![goal]));
+        assert_eq!(snapshot.satisfying.get(&step), Some(&vec![goal]));
         assert_eq!(snapshot.verdicts(step).first().map(|e| e.score), Some(90));
         assert_eq!(snapshot.best_open(goal).map(|e| e.node), Some(step));
         assert!(snapshot.trunk_verdict(goal).is_none());
@@ -336,7 +336,7 @@ mod tests {
         );
         assert!(
             snapshot.best_open(goal).is_none(),
-            "the candidate is in the trunk"
+            "the hypothesis is in the trunk"
         );
         assert!(!snapshot.left_behind(step));
         // A new proposal on the old origin is left behind the trunk.

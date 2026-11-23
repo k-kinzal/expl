@@ -1,4 +1,4 @@
-//! `expl candidate ls` — the steps a human chooses from: change steps to
+//! `expl hypothesis ls` — the hypotheses a human chooses from: change steps to
 //! merge, and the findings of investigations that answer a goal.
 
 use std::path::Path;
@@ -12,11 +12,11 @@ use crate::output::{Table, clip, json_line, print, println};
 
 pub(crate) fn ls(start: &Path, listing: &ListingArgs) -> Result<(), CliError> {
     let (_, graph) = open(start)?;
-    let candidates = graph.candidates()?;
+    let satisfying = graph.satisfying()?;
     let lineage = graph.lineage()?;
     if listing.quiet {
-        for candidate in &candidates {
-            println(&candidate.node.0.to_string())?;
+        for satisfied in &satisfying {
+            println(&satisfied.node.0.to_string())?;
         }
         return Ok(());
     }
@@ -30,21 +30,21 @@ pub(crate) fn ls(start: &Path, listing: &ListingArgs) -> Result<(), CliError> {
         "TITLE",
         "REASON",
     ]);
-    for candidate in &candidates {
-        let node = graph.node(candidate.node)?;
+    for satisfied in &satisfying {
+        let node = graph.node(satisfied.node)?;
         let branch = node.branch.clone().unwrap_or_default();
         let shown = match node.answer {
             Some(answer) => format!("answer: {answer}"),
             None => branch.clone(),
         };
-        let from = lineage.explored_from(candidate.node);
+        let from = lineage.explored_from(satisfied.node);
         let behind = from.and_then(|o| lineage.behind(o)).unwrap_or(0);
-        let adopted = lineage.absorbed_by(candidate.node);
+        let adopted = lineage.absorbed_by(satisfied.node);
         if listing.format == ListingFormat::Json {
             json_line(&json!({
-                "node": candidate.node,
-                "goal": candidate.goal,
-                "score": candidate.score,
+                "node": satisfied.node,
+                "goal": satisfied.goal,
+                "score": satisfied.score,
                 "explored_from": from,
                 "behind": behind,
                 "adopted_into": adopted,
@@ -53,14 +53,14 @@ pub(crate) fn ls(start: &Path, listing: &ListingArgs) -> Result<(), CliError> {
                 "answer": node.answer,
                 "head_commit": node.head_commit,
                 "title": node.title,
-                "reason": candidate.reason,
+                "reason": satisfied.reason,
             }))?;
             continue;
         }
         table.row(vec![
-            candidate.node.to_string(),
-            candidate.goal.to_string(),
-            candidate.score.to_string(),
+            satisfied.node.to_string(),
+            satisfied.goal.to_string(),
+            satisfied.score.to_string(),
             match (from, behind) {
                 (Some(origin), 0) => origin.to_string(),
                 (Some(origin), n) => format!("{origin} ({n} behind)"),
@@ -69,7 +69,7 @@ pub(crate) fn ls(start: &Path, listing: &ListingArgs) -> Result<(), CliError> {
             adopted.map_or_else(|| "-".to_owned(), |o| o.to_string()),
             shown,
             clip(&node.title, 40),
-            clip(&candidate.reason, 60),
+            clip(&satisfied.reason, 60),
         ]);
     }
     if listing.format == ListingFormat::Table {
