@@ -402,7 +402,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
         EventKind::OriginAdvanced => {
             if subject.kind != NodeKind::Origin || subject.status != NodeStatus::Active {
                 return Ok(Reaction::ignore(format!(
-                    "{} is a {} {}; the trunk has moved on",
+                    "{} is {} ({}); the trunk has moved on",
                     subject.id, subject.status, subject.kind
                 )));
             }
@@ -484,7 +484,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
         EventKind::NodeEvaluated => {
             if subject.kind != NodeKind::Step || subject.status != NodeStatus::Completed {
                 return Ok(Reaction::ignore(format!(
-                    "{} is a {} {}",
+                    "{} is {} ({})",
                     subject.id, subject.status, subject.kind
                 )));
             }
@@ -503,7 +503,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
         EventKind::NodeFailed => {
             if subject.kind != NodeKind::Step || subject.status != NodeStatus::Failed {
                 return Ok(Reaction::ignore(format!(
-                    "{} is a {} {}",
+                    "{} is {} ({})",
                     subject.id, subject.status, subject.kind
                 )));
             }

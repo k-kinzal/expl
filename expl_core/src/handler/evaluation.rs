@@ -197,7 +197,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     };
     if !judged {
         return Ok(Reaction::ignore(format!(
-            "{id} is a {} {}",
+            "{id} is {} ({})",
             node.status, node.kind
         )));
     }
