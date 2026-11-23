@@ -155,11 +155,13 @@ impl Cluster {
         }
         for job in fs::read_dir(self.root.join("requests"))? {
             let path = job?.path();
+            // A job that cannot be read (it is being withdrawn, or the entry
+            // is not a job at all) is nobody's load.
             if !path.join("result").exists()
-                && let Some(Request {
+                && let Ok(Some(Request {
                     target: Target::Compute(peer),
                     ..
-                }) = read_optional(&path.join("request"))?
+                })) = read_optional(&path.join("request"))
                 && let Some((load, current)) = loads.get_mut(&peer.name)
                 && *current == peer
             {
@@ -187,6 +189,7 @@ impl Cluster {
             .join(stage.path().file_name().expect("job name"));
         fs::rename(stage.path(), &path)?;
         Ok(Pending {
+            cluster: self.clone(),
             path,
             _owner: owner,
         })
@@ -268,41 +271,68 @@ impl Cluster {
         for item in fs::read_dir(self.root.join("requests"))? {
             let item = item?;
             let job = item.path();
-            if !occupied(&job.join("owner"))? {
-                // An orphan that is already executing is left to its
-                // supervisor, which will stop it before dropping its lock.
-                if !occupied(&job.join("active"))? {
-                    drop(fs::remove_dir_all(&job));
-                }
+            // One entry that cannot be examined must not end the daemon and
+            // every worker with it: it is left for the next scan. Its
+            // requester may be withdrawing it this instant, or it is not a
+            // job at all (a file something else dropped into the queue).
+            let Ok(eligible) = self.examine(&job, peer, leader) else {
                 continue;
-            }
-            let Some(request) = read_optional::<Request>(&job.join("request"))? else {
-                continue;
-            };
-            let eligible = match request.target {
-                Target::Control(via) => {
-                    if via == *peer
-                        && !job.join("forwarded").exists()
-                        && let Err(error) = fs::write(job.join("forwarded"), [])
-                        && error.kind() != ErrorKind::NotFound
-                    {
-                        return Err(error);
-                    }
-                    leader && (via == *peer || job.join("forwarded").exists())
-                }
-                Target::Compute(target) => target == *peer,
             };
             let name = item.file_name().to_string_lossy().into_owned();
-            if eligible
-                && !job.join("cancel").exists()
-                && !job.join("result").exists()
-                && !job.join("started").exists()
-                && !children.iter().any(|(active, _)| active == &name)
-            {
+            if eligible && !children.iter().any(|(active, _)| active == &name) {
                 children.push((name.clone(), supervisor(&name, peer)?));
             }
         }
         Ok(())
+    }
+
+    /// Whether `peer` should start supervising `job` now. Removes the job
+    /// when its requester is gone and nothing is executing it.
+    fn examine(&self, job: &Path, peer: &Peer, leader: bool) -> io::Result<bool> {
+        if !occupied(&job.join("owner"))? {
+            // An orphan that is already executing is left to its
+            // supervisor, which will stop it before dropping its lock.
+            if !occupied(&job.join("active"))? {
+                self.withdraw(job);
+            }
+            return Ok(false);
+        }
+        let Some(request) = read_optional::<Request>(&job.join("request"))? else {
+            return Ok(false);
+        };
+        let eligible = match request.target {
+            Target::Control(via) => {
+                if via == *peer
+                    && !job.join("forwarded").exists()
+                    && let Err(error) = fs::write(job.join("forwarded"), [])
+                    && error.kind() != ErrorKind::NotFound
+                {
+                    return Err(error);
+                }
+                leader && (via == *peer || job.join("forwarded").exists())
+            }
+            Target::Compute(target) => target == *peer,
+        };
+        Ok(eligible
+            && !job.join("cancel").exists()
+            && !job.join("result").exists()
+            && !job.join("started").exists())
+    }
+
+    /// Take `job` out of the queue and delete it. The rename is atomic, so
+    /// whoever scans the queue sees the whole job or none of it. Deleting it
+    /// in place would show a daemon a job with some of its files gone: one
+    /// that looks as if it had never started, in a directory that refuses
+    /// new files while it is being removed.
+    fn withdraw(&self, job: &Path) {
+        let Ok(done) = tempfile::Builder::new()
+            .prefix("done-")
+            .tempdir_in(self.root.join("staging"))
+        else {
+            return;
+        };
+        // Lost to another withdrawal, or never queued: nothing to delete.
+        drop(fs::rename(job, done.path().join("job")));
     }
 
     /// Supervise one queued command in a dedicated process. `prepare` can
@@ -389,6 +419,7 @@ impl Cluster {
 }
 
 struct Pending {
+    cluster: Cluster,
     path: PathBuf,
     _owner: File,
 }
@@ -397,7 +428,7 @@ impl Drop for Pending {
     fn drop(&mut self) {
         // Leave a running command's spool available to its supervisor.
         if !occupied(&self.path.join("active")).unwrap_or(true) {
-            drop(fs::remove_dir_all(&self.path));
+            self.cluster.withdraw(&self.path);
         }
     }
 }
@@ -435,5 +466,167 @@ impl Tail {
             return Ok(copied);
         }
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    /// A cluster with one member whose session is held, as a serving
+    /// daemon holds it.
+    fn cluster_with_member() -> (tempfile::TempDir, Cluster, Peer, tempfile::NamedTempFile) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cluster = Cluster::open(dir.path()).expect("cluster");
+        let session = tempfile::Builder::new()
+            .prefix("peer-")
+            .tempfile_in(cluster.root().join("sessions"))
+            .expect("session");
+        session.as_file().lock().expect("hold the session");
+        let peer = Peer {
+            name: "local".to_owned(),
+            session: session
+                .path()
+                .file_name()
+                .expect("session name")
+                .to_string_lossy()
+                .into_owned(),
+        };
+        atomic_json(&cluster.root().join("members").join(&peer.name), &peer).expect("member");
+        (dir, cluster, peer, session)
+    }
+
+    fn request(target: Target) -> Request {
+        Request {
+            target,
+            command: CommandSpec::capture(&Command::new("true"), Path::new(".")),
+            timeout: None,
+        }
+    }
+
+    fn queued(cluster: &Cluster) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(cluster.root().join("requests"))
+            .expect("queue")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn requesters_withdrawing_their_jobs_never_fail_a_scan_of_the_queue() {
+        let (_dir, cluster, peer, _session) = cluster_with_member();
+        let stop = AtomicBool::new(false);
+        thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        // Queue a control operation and take it back, as a
+                        // command that has read its result does.
+                        let job = cluster
+                            .submit(&request(Target::Control(peer.clone())), &[])
+                            .expect("submit");
+                        drop(job);
+                    }
+                });
+            }
+            // A member that is not the leader marks the operations sent
+            // through it as forwarded and starts none: every scan writes
+            // into jobs that are being withdrawn at that very moment.
+            let mut children = Vec::new();
+            let mut never = |_: &str, _: &Peer| -> io::Result<Child> {
+                Err(io::Error::other(
+                    "a member that is not the leader started a control job",
+                ))
+            };
+            let until = Instant::now() + Duration::from_secs(2);
+            let mut scan = Ok(());
+            while scan.is_ok() && Instant::now() < until {
+                scan = cluster.dispatch(&peer, false, &mut children, &mut never);
+            }
+            stop.store(true, Ordering::Relaxed);
+            scan.expect("a scan failed on a job its requester was withdrawing");
+        });
+        assert_eq!(queued(&cluster), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_entry_that_is_not_a_job_stops_neither_the_daemon_nor_scheduling() {
+        let (_dir, cluster, peer, _session) = cluster_with_member();
+        // What a file browser leaves behind in a directory it was shown.
+        let stray = cluster.root().join("requests").join(".DS_Store");
+        fs::write(&stray, b"not a job").expect("stray file");
+        // A job directory whose request is unreadable, with a live requester.
+        let broken = cluster.root().join("requests").join("job-broken");
+        fs::create_dir(&broken).expect("broken job");
+        let owner = File::create(broken.join("owner")).expect("owner");
+        owner.lock().expect("hold the broken job");
+        fs::write(broken.join("request"), b"{").expect("truncated request");
+
+        assert_eq!(cluster.choose_member().expect("schedule"), peer);
+        let job = cluster
+            .submit(&request(Target::Compute(peer.clone())), &[])
+            .expect("submit");
+        let name = job
+            .path
+            .file_name()
+            .expect("job name")
+            .to_string_lossy()
+            .into_owned();
+
+        let mut started = Vec::new();
+        let mut children = Vec::new();
+        cluster
+            .dispatch(&peer, true, &mut children, &mut |job: &str, _: &Peer| {
+                started.push(job.to_owned());
+                Command::new("true").spawn()
+            })
+            .expect("scan");
+        for (_, mut child) in children {
+            child.wait().expect("reap");
+        }
+        assert_eq!(started, std::slice::from_ref(&name));
+        // Neither is the daemon's to delete: one has a live requester, the
+        // other is not a job.
+        let mut left = vec![".DS_Store", "job-broken", name.as_str()];
+        left.sort_unstable();
+        assert_eq!(queued(&cluster), left);
+    }
+
+    #[test]
+    fn a_job_whose_requester_is_gone_leaves_the_queue_whole() {
+        let (_dir, cluster, peer, _session) = cluster_with_member();
+        let orphan = cluster.root().join("requests").join("job-orphan");
+        fs::create_dir(&orphan).expect("orphan");
+        // Its requester died: the owner file is there, and nobody holds it.
+        fs::write(orphan.join("owner"), []).expect("owner");
+        atomic_json(
+            &orphan.join("request"),
+            &request(Target::Compute(peer.clone())),
+        )
+        .expect("request");
+
+        let mut children = Vec::new();
+        cluster
+            .dispatch(&peer, true, &mut children, &mut |_: &str, _: &Peer| {
+                Err(io::Error::other("an orphan was started"))
+            })
+            .expect("scan");
+        assert_eq!(queued(&cluster), Vec::<String>::new());
+        // Nothing of it lingers where jobs are staged either.
+        assert_eq!(
+            fs::read_dir(cluster.root().join("staging"))
+                .expect("staging")
+                .count(),
+            0
+        );
     }
 }
