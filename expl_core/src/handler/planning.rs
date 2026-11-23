@@ -25,6 +25,7 @@
 //! whose predecessors are completed records `node.ready`, which is what
 //! sets verification in motion.
 
+use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -36,6 +37,7 @@ use crate::graph::{
 };
 use crate::handler::{HandlerError, Reaction, Report, digest};
 use crate::prompt::Prompt;
+use crate::telemetry;
 
 /// What one planning did.
 #[derive(Debug, Clone, Serialize)]
@@ -171,6 +173,12 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     // What the agent is shown is all it plans: steps proposed while it
     // works are left, with their events, to the next planning.
     let shown = graph.snapshot()?;
+    telemetry::attributes([
+        KeyValue::new("expl.origin.id", origin.id.0),
+        KeyValue::new("expl.graph.nodes", shown.nodes.len() as i64),
+        KeyValue::new("expl.graph.edges", shown.edges.len() as i64),
+        KeyValue::new("expl.graph.evaluations", shown.evaluations.len() as i64),
+    ]);
     let prompt = prompt(reaction, &shown, &schema);
     let response: Response = reaction.invoke_read_only(graph, None, &scratch, &prompt, &schema)?;
     drop(scratch);

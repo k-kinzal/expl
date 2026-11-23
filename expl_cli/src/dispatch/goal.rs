@@ -8,10 +8,17 @@ use crate::cli::{GoalCommand, GoalLsArgs, ListingFormat};
 use crate::dispatch::open;
 use crate::error::CliError;
 use crate::output::{Table, clip, json_line, print, println, status};
+use crate::telemetry::graph_command;
 
 pub(crate) fn goal(start: &Path, command: GoalCommand) -> Result<(), CliError> {
-    let (_, mut graph) = open(start)?;
-    match command {
+    let (project, mut graph) = open(start)?;
+    let operation = match command {
+        GoalCommand::Ls(args) => return ls(&graph, &args),
+        GoalCommand::Add(_) => "goal.add",
+        GoalCommand::Nest(_) => "goal.nest",
+        GoalCommand::Retire(_) => "goal.retire",
+    };
+    graph_command(&project, operation, || match command {
         GoalCommand::Add(args) => {
             let objective = args.objective.unwrap_or_else(|| args.title.clone());
             let id = graph.add_goal(&args.title, &objective, args.counter, &args.under)?;
@@ -47,7 +54,7 @@ pub(crate) fn goal(start: &Path, command: GoalCommand) -> Result<(), CliError> {
             status(&format!("retired goal {}", args.node));
             Ok(())
         }
-    }
+    })
 }
 
 fn ls(graph: &expl_core::Graph, args: &GoalLsArgs) -> Result<(), CliError> {

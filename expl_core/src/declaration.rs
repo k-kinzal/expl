@@ -127,6 +127,9 @@ pub struct Declaration {
     pub trunk: Option<String>,
     /// How changes are taken in.
     pub workspace: WorkspaceDeclaration,
+    /// OpenTelemetry export for this project.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<TelemetryDeclaration>,
     /// Named event consumers.
     pub consumer: BTreeMap<String, ConsumerDeclaration>,
     /// Named routers, whose targets are consumers or other routers.
@@ -142,6 +145,8 @@ struct DeclarationFile {
     trunk: Option<String>,
     #[serde(default)]
     workspace: WorkspaceDeclaration,
+    #[serde(default)]
+    telemetry: Option<TelemetryDeclaration>,
     #[serde(default)]
     consumer: BTreeMap<String, ConsumerDeclaration>,
     #[serde(default)]
@@ -196,6 +201,7 @@ impl DeclarationFile {
         let declaration = Declaration {
             trunk: self.trunk,
             workspace: self.workspace,
+            telemetry: self.telemetry,
             consumer: self.consumer,
             router: self.router,
             routing: self.routing,
@@ -203,6 +209,14 @@ impl DeclarationFile {
         declaration.validate()?;
         Ok(declaration)
     }
+}
+
+/// `[telemetry]` configures the project's OTLP HTTP export destination.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryDeclaration {
+    /// Base URL of the OTLP HTTP receiver, before `/v1/traces` or `/v1/metrics`.
+    pub endpoint: String,
 }
 
 /// `[workspace]`.

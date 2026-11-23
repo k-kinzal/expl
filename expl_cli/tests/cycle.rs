@@ -182,12 +182,13 @@ fn git(repo: &Path, args: &[&str]) -> String {
 }
 
 fn expl(repo: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_expl"))
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .expect("expl")
+    expl_command(repo).args(args).output().expect("expl")
+}
+
+fn expl_command(repo: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_expl"));
+    command.env("OTEL_SDK_DISABLED", "true").arg("-C").arg(repo);
+    command
 }
 
 fn ok(repo: &Path, args: &[&str]) -> String {
@@ -778,9 +779,7 @@ fn planning_settles_only_the_proposals_it_was_shown() {
 
     // A step proposed while the planner's agent is working.
     sandbox.marker("slow-planning", true);
-    let mut planner = Command::new(env!("CARGO_BIN_EXE_expl"))
-        .arg("-C")
-        .arg(repo)
+    let mut planner = expl_command(repo)
         .args(["run", "planner", "--once"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -885,9 +884,7 @@ fn an_invalid_plan_falls_over_to_the_alternative_cli() {
     // Two plannings in one process: its routes start at different CLIs, so
     // one of them starts at the invalid one.
     sandbox.marker("slow-planning", true);
-    let mut planner = Command::new(env!("CARGO_BIN_EXE_expl"))
-        .arg("-C")
-        .arg(repo)
+    let mut planner = expl_command(repo)
         .args(["run", "planner", "--exit-when-idle"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

@@ -5,14 +5,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use opentelemetry::KeyValue;
 use thiserror::Error;
 
 use crate::event::{Consumer, Delivery, EventKind, Inbox, InboxError, Lease};
 use crate::graph::{Graph, GraphError, NodeId};
 use crate::handler::{Abandonment, Context, Handler, HandlerError, Reaction, Report};
 use crate::process::capacity::Capacity;
+use crate::process::telemetry::{Phase, WorkerTelemetry};
 use crate::process::{HEARTBEAT_SECONDS, Interrupt, ProcessId, ProcessRecord, Processes};
 use crate::store::StoreError;
+use crate::telemetry;
 use crate::trunk::{Advance, Trunk};
 
 /// How long an idle process waits before looking at its inbox again.
@@ -163,13 +166,15 @@ impl<'a> Process<'a> {
         if !processes.start(self.id, std::process::id())? {
             return Err(ProcessError::NotAdoptable(self.id));
         }
-        observer.observe(&ProcessActivity::Started(&processes.get(self.id)?));
+        let record = processes.get(self.id)?;
+        let telemetry = WorkerTelemetry::new(observer, self.consumer, &record);
+        telemetry.observe(&ProcessActivity::Started(&record));
 
         let finished = AtomicBool::new(false);
         let held = Held::default();
         let result = thread::scope(|scope| {
             scope.spawn(|| self.beat(&finished, &held));
-            let result = self.serve(&processes, &held, options, observer);
+            let result = self.serve(&processes, &held, options, &telemetry);
             finished.store(true, Ordering::SeqCst);
             result
         });
@@ -177,7 +182,7 @@ impl<'a> Process<'a> {
             Ok(reason) => reason.clone(),
             Err(error) => format!("error: {error}"),
         };
-        observer.observe(&ProcessActivity::Exiting(&reason));
+        telemetry.observe(&ProcessActivity::Exiting(&reason));
         processes.exit(self.id, &reason)?;
         result
     }
@@ -228,7 +233,7 @@ impl<'a> Process<'a> {
         processes: &Processes,
         held: &Held,
         options: ProcessOptions,
-        observer: &dyn ProcessObserver,
+        observer: &WorkerTelemetry<'_>,
     ) -> Result<String, ProcessError> {
         let project = self.context.project();
         let database = project.database_path();
@@ -257,6 +262,7 @@ impl<'a> Process<'a> {
         // Starts the first cooldown: a fresh process reacts to its backlog
         // before it wanders.
         let mut last_reaction = Instant::now();
+        observer.state(Phase::WaitingForEvents);
         loop {
             if self.interrupt.is_raised() {
                 return Ok("stopped".to_owned());
@@ -292,6 +298,7 @@ impl<'a> Process<'a> {
             )? {
                 Lease::Granted(delivery, slots) => (delivery, slots),
                 Lease::AtCapacity => {
+                    observer.state(Phase::WaitingForCapacity);
                     if activity != "waiting for capacity" {
                         activity = "waiting for capacity";
                         processes.set_activity(self.id, Some(activity))?;
@@ -300,6 +307,7 @@ impl<'a> Process<'a> {
                     continue;
                 }
                 Lease::Idle => {
+                    observer.state(Phase::WaitingForEvents);
                     if options.exit_when_idle {
                         return Ok("idle".to_owned());
                     }
@@ -321,6 +329,8 @@ impl<'a> Process<'a> {
                     continue;
                 }
             };
+            let trace = observer.delivery(&inbox, &delivery);
+            observer.state(Phase::Reacting);
             // Legacy weighted consumers react only to the events
             // assigned to them; the others are theirs to acknowledge. The
             // assignment is recorded before either, so processes that
@@ -361,6 +371,7 @@ impl<'a> Process<'a> {
                 } else {
                     observer.observe(&ProcessActivity::LeaseLost(&delivery));
                 }
+                observer.state(Phase::WaitingForEvents);
                 continue;
             }
             processes.set_activity(self.id, Some(&format!("reacting to {}", delivery.event)))?;
@@ -469,6 +480,8 @@ impl<'a> Process<'a> {
                     }
                 }
             }
+            drop(trace);
+            observer.state(Phase::WaitingForEvents);
             last_reaction = Instant::now();
             processes.set_activity(self.id, None)?;
             if options.once {
@@ -566,7 +579,16 @@ fn revisit_at_random(graph: &mut Graph, ahead: bool) -> Result<bool, ProcessErro
     if points.is_empty() {
         return Ok(false);
     }
-    graph.revisit(points[random_below(points.len())].id, ahead)?;
+    let node = points[random_below(points.len())].id;
+    telemetry::operation(
+        "expl.exploration.revisit",
+        vec![
+            KeyValue::new("expl.node.id", node.0),
+            KeyValue::new("expl.exploration.speculate", ahead),
+        ],
+        "graph",
+        || graph.revisit(node, ahead),
+    )?;
     Ok(true)
 }
 

@@ -28,6 +28,10 @@
 # starts again from there.
 trunk = "main"
 
+# GPU server OTLP HTTP receiver for expl's own exploration.
+[telemetry]
+endpoint = "http://192.168.10.4:4318"
+
 # Markdown is frozen while exploring: a step's commit keeps every *.md as
 # it was where the step started, whatever the verifier did to it.
 [workspace]

@@ -4,6 +4,8 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
+use opentelemetry::KeyValue;
+use opentelemetry::trace::TraceContextExt;
 use serde::de::DeserializeOwned;
 
 use crate::agent::{AgentError, Invocation};
@@ -12,6 +14,7 @@ use crate::graph::{AgentRunStatus, Graph, NodeId};
 use crate::handler::{Context, HandlerError, Report};
 use crate::process::{Interrupt, ProcessId};
 use crate::prompt::Prompt;
+use crate::telemetry;
 use crate::workspace::{AgentClone, ScratchWorkspace};
 
 /// Everything a handler needs to react to one event.
@@ -179,6 +182,32 @@ impl<'a> Reaction<'a> {
             Some(self.event().id),
             node,
         )?;
+        let context = telemetry::span(
+            "expl.agent.run",
+            vec![
+                KeyValue::new("expl.agent.run.id", run_id.0),
+                KeyValue::new(
+                    "expl.workspace.kind",
+                    if scratch.is_some() {
+                        "scratch"
+                    } else {
+                        "change"
+                    },
+                ),
+            ],
+        );
+        let _scope = context.clone().attach();
+        if let Some(node) = node {
+            context
+                .span()
+                .set_attribute(KeyValue::new("expl.node.id", node.0));
+        }
+        if let Some(scratch) = scratch {
+            context.span().set_attribute(KeyValue::new(
+                "expl.workspace.commit",
+                scratch.head().to_owned(),
+            ));
+        }
         let logs = self.context.project().logs_dir();
         std::fs::create_dir_all(&logs)?;
         let log = logs.join(format!("{:05}-{}.log", run_id.0, self.consumer.name()));
@@ -254,6 +283,10 @@ impl<'a> Reaction<'a> {
                     session_id.as_deref(),
                     None,
                 )?;
+                context.span().set_attribute(KeyValue::new(
+                    "expl.agent.run.status",
+                    AgentRunStatus::Succeeded.as_str(),
+                ));
                 Ok(decoded)
             }
             Err(error) => {
@@ -263,6 +296,10 @@ impl<'a> Reaction<'a> {
                     AgentRunStatus::Failed
                 };
                 graph.finish_agent_run(run_id, status, None, Some(&error.to_string()))?;
+                context
+                    .span()
+                    .set_attribute(KeyValue::new("expl.agent.run.status", status.as_str()));
+                telemetry::error(&context, error.telemetry_kind());
                 Err(error)
             }
         }

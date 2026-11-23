@@ -161,10 +161,34 @@ fn event_from_row(row: &Row<'_>) -> rusqlite::Result<Event> {
 // ------------------------------------------------- connection-level helpers
 
 fn emit(conn: &Connection, kind: EventKind, node: Option<NodeId>) -> Result<(), GraphError> {
+    use opentelemetry::trace::TraceContextExt;
+    use opentelemetry::{Context, KeyValue};
+
+    let headers = crate::telemetry::inject();
     conn.execute(
-        "INSERT INTO events (kind, node_id) VALUES (?1, ?2)",
-        params![kind.as_str(), node.map(|n| n.0)],
+        "INSERT INTO events (kind, node_id, traceparent, tracestate) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            kind.as_str(),
+            node.map(|n| n.0),
+            headers.get("traceparent"),
+            headers.get("tracestate")
+        ],
     )?;
+    let context = Context::current();
+    if context.span().is_recording() {
+        let mut attributes = vec![
+            KeyValue::new("expl.event.id", conn.last_insert_rowid()),
+            KeyValue::new("expl.event.kind", kind.as_str()),
+        ];
+        if let Some(node) = node {
+            attributes.push(KeyValue::new("expl.node.id", node.0));
+        }
+        // This is the insert inside the graph transaction. The consumer
+        // can read its trace context only if the transaction commits.
+        context
+            .span()
+            .add_event("expl.graph.event.inserted", attributes);
+    }
     Ok(())
 }
 

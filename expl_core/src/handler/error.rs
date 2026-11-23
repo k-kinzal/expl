@@ -49,3 +49,19 @@ pub enum HandlerError {
         changes: ScratchChanges,
     },
 }
+
+impl HandlerError {
+    pub(crate) fn telemetry_kind(&self) -> &'static str {
+        match self {
+            Self::Graph(error) if error.is_busy() => "graph.busy",
+            Self::Graph(_) => "graph",
+            Self::Workspace(_) => "workspace",
+            Self::Agent(error) => error.telemetry_kind(),
+            Self::Declaration(_) => "declaration",
+            Self::Store(_) => "store",
+            Self::Io(_) => "io",
+            Self::Malformed { .. } => "malformed_event",
+            Self::ScratchModified { .. } => "scratch_modified",
+        }
+    }
+}

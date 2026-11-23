@@ -34,6 +34,7 @@ pub mod process;
 pub mod project;
 pub mod prompt;
 pub mod store;
+mod telemetry;
 pub mod testing;
 pub mod trunk;
 pub mod workspace;
@@ -41,7 +42,7 @@ pub mod workspace;
 pub use agent::{Agent, AgentDriver, AgentError, AgentRun, DriverKind};
 pub use declaration::{
     CliDeclaration, ConsumerDeclaration, Declaration, DeclarationError, RouterDeclaration,
-    RoutingPolicy, Timeout, TimeoutError,
+    RoutingPolicy, TelemetryDeclaration, Timeout, TimeoutError,
 };
 pub use doctor::{Doctor, DoctorError, Inconsistency, Repair};
 pub use event::{Consumer, Delivery, Event, EventId, EventKind, Inbox, InboxError, LeaseToken};

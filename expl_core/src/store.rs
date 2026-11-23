@@ -215,6 +215,11 @@ UPDATE nodes SET proposed_by = (
 UPDATE agent_runs SET role = 'verification' WHERE role = 'execution';
 UPDATE assignments SET role = 'verification' WHERE role = 'execution';
 ",
+    r"
+-- A delivery can link to the span that produced its event, across workers.
+ALTER TABLE events ADD COLUMN traceparent TEXT;
+ALTER TABLE events ADD COLUMN tracestate TEXT;
+",
 ];
 
 const CONCLUSIONS_MIGRATION: &str = r"

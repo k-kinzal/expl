@@ -37,6 +37,7 @@
 
 use std::collections::BTreeSet;
 
+use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -48,6 +49,7 @@ use crate::graph::{
 };
 use crate::handler::{HandlerError, Reaction, Report, digest};
 use crate::prompt::Prompt;
+use crate::telemetry;
 
 /// How many times one step is continued, at most: past that, evaluation
 /// decides between done and abandoned.
@@ -184,6 +186,7 @@ fn goals_schema() -> serde_json::Value {
 pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, HandlerError> {
     let id = reaction.subject()?;
     let node = graph.node(id)?;
+    telemetry::subject(&node);
     let event = reaction.event();
     let judged = if event.kind == EventKind::OriginAdvanced {
         node.kind == NodeKind::Origin
@@ -226,6 +229,11 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
         .filter(|c| c.decision == Decision::Continue && c.reopened)
         .count();
     let may_continue = continued < CONTINUATIONS;
+    telemetry::related_goals(&goals);
+    telemetry::attributes([
+        KeyValue::new("expl.evaluation.continuations", continued as i64),
+        KeyValue::new("expl.evaluation.may_continue", may_continue),
+    ]);
 
     let scratch = if node.head_commit.is_some() {
         reaction.context().workspaces().scratch(&node)?
@@ -314,6 +322,7 @@ fn judge_origin(
 ) -> Result<Report, HandlerError> {
     let id = node.id;
     let goals = graph.goals()?;
+    telemetry::related_goals(&goals);
     let evaluations = if goals.is_empty() {
         Vec::new()
     } else {

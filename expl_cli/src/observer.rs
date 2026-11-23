@@ -9,6 +9,8 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use expl_core::{ProcessActivity, ProcessObserver};
+use opentelemetry::Context;
+use opentelemetry::trace::TraceContextExt;
 
 /// See the [module docs](self).
 #[derive(Debug)]
@@ -27,7 +29,15 @@ impl ActivityLog {
     }
 
     fn line(&self, message: &str) {
-        let line = format!("{} {} | {message}\n", timestamp(), self.name);
+        let context = Context::current();
+        let span = context.span();
+        let trace = span.span_context();
+        let correlation = if trace.is_sampled() {
+            format!(" trace_id={} span_id={}", trace.trace_id(), trace.span_id())
+        } else {
+            String::new()
+        };
+        let line = format!("{} {}{correlation} | {message}\n", timestamp(), self.name);
         std::io::stderr().lock().write_all(line.as_bytes()).ok();
         if let Some(tee) = &self.tee {
             let mut file = tee

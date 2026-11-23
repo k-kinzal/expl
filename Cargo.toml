@@ -29,6 +29,8 @@ tempfile = "3"
 signal-hook = "0.3"
 humantime = "2"
 gpui = "0.2.2"
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
 
 [profile.release]
 lto = "thin"

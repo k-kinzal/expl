@@ -47,3 +47,18 @@ pub enum AgentError {
     #[error("agent response does not match its schema: {0}")]
     Mismatch(#[source] serde_json::Error),
 }
+
+impl AgentError {
+    pub(crate) fn telemetry_kind(&self) -> &'static str {
+        match self {
+            Self::Launch(_) => "agent.launch",
+            Self::Io(_) => "agent.io",
+            Self::Failed { .. } => "agent.failed",
+            Self::Interrupted => "agent.interrupted",
+            Self::TimedOut { .. } => "agent.timeout",
+            Self::Lingering { .. } => "agent.lingering_processes",
+            Self::InvalidResponse(_) => "agent.invalid_response",
+            Self::Mismatch(_) => "agent.schema_mismatch",
+        }
+    }
+}

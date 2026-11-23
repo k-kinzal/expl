@@ -35,6 +35,7 @@
 //! Each ready step is its own event, so as many steps run at once as there
 //! are verification processes.
 
+use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -108,6 +109,7 @@ fn schema() -> serde_json::Value {
 pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, HandlerError> {
     let id = reaction.subject()?;
     let node = graph.node(id)?;
+    crate::telemetry::subject(&node);
     if node.kind != NodeKind::Step {
         return Ok(Reaction::ignore(format!("{id} is a {} node", node.kind)));
     }
@@ -156,6 +158,13 @@ fn realise(
         predecessors.push(graph.origin()?);
     }
     let continued = continuations(graph, id)?;
+    crate::telemetry::attributes([
+        KeyValue::new(
+            "expl.verification.predecessor_ids",
+            crate::telemetry::node_ids(predecessors.iter().map(|node| node.id)),
+        ),
+        KeyValue::new("expl.verification.continuations", continued.len() as i64),
+    ]);
     if node.investigation {
         return investigate(reaction, graph, node, &predecessors, &continued);
     }
@@ -246,6 +255,14 @@ fn carry_out(
             Err(error) => return fail(graph, token, node, branch, None, error.to_string()),
         };
         let prompt = resolution_prompt(reaction, node, workspace, &schema);
+        let _scope = crate::telemetry::span(
+            "expl.verification.resolve_merge",
+            vec![KeyValue::new(
+                "expl.workspace.conflict_count",
+                workspace.conflicts().len() as i64,
+            )],
+        )
+        .attach();
         let (resolved, summary) = invoke(reaction, graph, id, &clone, &prompt, &schema)?;
         if !resolved {
             return fail(
@@ -307,7 +324,16 @@ fn carry_out(
     drop(clone);
     pause(Window::Commit);
     let message = format!("{}\n\n{}", node.title, summary);
-    let head = match workspace.commit(&message) {
+    let committed = crate::telemetry::operation(
+        "expl.workspace.commit",
+        vec![
+            KeyValue::new("expl.node.id", id.0),
+            KeyValue::new("expl.workspace.branch", branch.to_owned()),
+        ],
+        "workspace.commit",
+        || workspace.commit(&message),
+    );
+    let head = match committed {
         Ok(head) => head,
         Err(error) => {
             return fail(

@@ -17,6 +17,7 @@ mod interrupt;
 mod process;
 mod processes;
 mod record;
+mod telemetry;
 
 pub use interrupt::Interrupt;
 pub use process::{

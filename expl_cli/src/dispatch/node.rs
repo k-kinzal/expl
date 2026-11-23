@@ -9,6 +9,7 @@ use crate::cli::{ListingFormat, NodeAddArgs, NodeCommand, NodeLsArgs, NodeRefArg
 use crate::dispatch::open;
 use crate::error::CliError;
 use crate::output::{Table, clip, json_line, json_pretty, print, println, short_commit, status};
+use crate::telemetry::graph_command;
 
 pub(crate) fn node(start: &Path, command: NodeCommand) -> Result<(), CliError> {
     match command {
@@ -16,30 +17,34 @@ pub(crate) fn node(start: &Path, command: NodeCommand) -> Result<(), CliError> {
         NodeCommand::Inspect(args) => inspect(start, &args),
         NodeCommand::Add(args) => add(start, &args),
         NodeCommand::Retry(args) => {
-            let (_, mut graph) = open(start)?;
-            let node = graph.node(args.node)?;
-            if node.kind != NodeKind::Step || node.status != NodeStatus::Failed {
-                return Err(CliError::Usage(format!(
-                    "{} is a {} {}; only failed steps can be retried",
-                    args.node, node.status, node.kind
-                )));
-            }
-            graph.replan(args.node)?;
-            status(&format!("re-planned {}", args.node));
-            Ok(())
+            let (project, mut graph) = open(start)?;
+            graph_command(&project, "node.retry", || {
+                let node = graph.node(args.node)?;
+                if node.kind != NodeKind::Step || node.status != NodeStatus::Failed {
+                    return Err(CliError::Usage(format!(
+                        "{} is a {} {}; only failed steps can be retried",
+                        args.node, node.status, node.kind
+                    )));
+                }
+                graph.replan(args.node)?;
+                status(&format!("re-planned {}", args.node));
+                Ok(())
+            })
         }
         NodeCommand::Prune(args) => {
-            let (_, mut graph) = open(start)?;
-            let node = graph.node(args.node)?;
-            if node.kind != NodeKind::Step {
-                return Err(CliError::Usage(format!(
-                    "{} is a {}; retire goals with `expl goal retire`",
-                    args.node, node.kind
-                )));
-            }
-            graph.prune(args.node, &format!("pruned: {}", args.reason))?;
-            status(&format!("pruned {}", args.node));
-            Ok(())
+            let (project, mut graph) = open(start)?;
+            graph_command(&project, "node.prune", || {
+                let node = graph.node(args.node)?;
+                if node.kind != NodeKind::Step {
+                    return Err(CliError::Usage(format!(
+                        "{} is a {}; retire goals with `expl goal retire`",
+                        args.node, node.kind
+                    )));
+                }
+                graph.prune(args.node, &format!("pruned: {}", args.reason))?;
+                status(&format!("pruned {}", args.node));
+                Ok(())
+            })
         }
         NodeCommand::Logs(args) => logs(start, &args),
     }
@@ -113,26 +118,28 @@ fn describe(graph: &Graph, id: expl_core::NodeId) -> Result<serde_json::Value, C
 }
 
 fn add(start: &Path, args: &NodeAddArgs) -> Result<(), CliError> {
-    let (_, mut graph) = open(start)?;
-    let mut after = args.after.clone();
-    if after.is_empty() {
-        after.push(graph.origin()?.id);
-    }
-    let objective = args.objective.clone().unwrap_or_else(|| args.title.clone());
-    let id = graph.propose(&expl_core::NewStep {
-        investigation: args.investigation,
-        title: &args.title,
-        objective: &objective,
-        after: &after,
-        before: &args.before,
-        derived_from: args.derived_from,
-        proposed_by: None,
-    })?;
-    if let Some(priority) = args.priority {
-        graph.plan_step(id, priority)?;
-    }
-    status(&format!("proposed {id}"));
-    println(&id.0.to_string())
+    let (project, mut graph) = open(start)?;
+    graph_command(&project, "node.add", || {
+        let mut after = args.after.clone();
+        if after.is_empty() {
+            after.push(graph.origin()?.id);
+        }
+        let objective = args.objective.clone().unwrap_or_else(|| args.title.clone());
+        let id = graph.propose(&expl_core::NewStep {
+            investigation: args.investigation,
+            title: &args.title,
+            objective: &objective,
+            after: &after,
+            before: &args.before,
+            derived_from: args.derived_from,
+            proposed_by: None,
+        })?;
+        if let Some(priority) = args.priority {
+            graph.plan_step(id, priority)?;
+        }
+        status(&format!("proposed {id}"));
+        println(&id.0.to_string())
+    })
 }
 
 /// The newest agent log about a node.

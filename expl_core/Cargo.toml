@@ -17,6 +17,8 @@ rusqlite.workspace = true
 tempfile.workspace = true
 signal-hook.workspace = true
 humantime.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
 
 [lints]
 workspace = true

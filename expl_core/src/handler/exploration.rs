@@ -46,6 +46,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
+use opentelemetry::{ContextGuard, KeyValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -56,6 +57,7 @@ use crate::graph::{
 };
 use crate::handler::{Direction, Handler, HandlerError, Reaction, Report, digest};
 use crate::prompt::Prompt;
+use crate::telemetry;
 
 /// What one exploration did.
 #[derive(Debug, Clone, Serialize)]
@@ -360,6 +362,7 @@ fn reached_subgoals(
 
 pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, HandlerError> {
     let subject = graph.node(reaction.subject()?)?;
+    telemetry::subject(&subject);
     if reaction.event().kind == EventKind::NodeFailed
         && reaction
             .context()
@@ -617,6 +620,27 @@ fn breadth(reaction: &Reaction<'_>) -> usize {
     reaction.consumer().declaration().breadth.unwrap_or(1)
 }
 
+fn search_span(
+    direction: Direction,
+    start: NodeId,
+    ground: NodeId,
+    aim: &Aim,
+    breadth: usize,
+) -> ContextGuard {
+    let scope = telemetry::span(
+        "expl.exploration.search",
+        vec![
+            KeyValue::new("expl.exploration.direction", direction.as_str()),
+            KeyValue::new("expl.exploration.from.id", start.0),
+            KeyValue::new("expl.exploration.base.id", ground.0),
+            KeyValue::new("expl.exploration.breadth", breadth as i64),
+        ],
+    )
+    .attach();
+    telemetry::related_goals(&aim.goals);
+    scope
+}
+
 /// Explore from `start` toward `goals`, forward or backward. Forward
 /// proposals build on `start` and lead to `goals`; backward proposals
 /// (`start` is the goal) build on the origin and lead to `start`.
@@ -635,6 +659,7 @@ fn explore(
         (start, vec![start.id])
     };
     let breadth = breadth(reaction);
+    let _scope = search_span(direction, start.id, ground.id, aim, breadth);
     let known = if backward {
         known_steps(graph, graph.predecessors(start.id)?)?
     } else {
@@ -775,6 +800,7 @@ fn explore_failure(
     }
     let known = known_steps(graph, around)?;
     let breadth = breadth(reaction);
+    let _scope = search_span(Direction::Failure, failed.id, ground.id, &aim, breadth);
 
     let mut attempt = format!("- {}\n", failed.title);
     if !failed.objective.trim().is_empty() {
@@ -911,6 +937,7 @@ fn explore_ahead(
     let aim = Aim::from(graph, start)?;
     let known = known_steps(graph, graph.successors(start.id)?)?;
     let breadth = breadth(reaction);
+    let _scope = search_span(Direction::Ahead, start.id, ground.id, &aim, breadth);
 
     let mut steps = String::new();
     for step in &assumed {
@@ -1015,6 +1042,7 @@ fn survey(
     let lineage = graph.lineage()?;
     let snapshot = graph.snapshot()?;
     let breadth = breadth(reaction);
+    let _scope = search_span(Direction::Survey, origin.id, origin.id, aim, breadth);
     let task = format!(
         "## Task\n\n\
          Below is the whole map of the work toward the goals: every step proposed so far, what \

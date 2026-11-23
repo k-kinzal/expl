@@ -18,6 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use opentelemetry::trace::TraceContextExt;
+use opentelemetry::{Context, KeyValue};
 use serde::de::DeserializeOwned;
 
 use crate::agent::{
@@ -27,6 +29,7 @@ use crate::agent::{
 use crate::declaration::{CliDeclaration, TimeoutError};
 use crate::process::Interrupt;
 use crate::prompt::Prompt;
+use crate::telemetry;
 
 /// How long an interrupted or timed-out invocation gets to exit after
 /// SIGTERM.
@@ -201,13 +204,35 @@ impl Agent {
                 }
                 writeln!(log, "=== falling over to the next CLI ===")?;
             }
-            match self
-                .attempt(cli, invocation, log.try_clone()?)
-                .and_then(AgentRun::decode)
-                .and_then(|run| {
-                    validate(&run.response)?;
-                    Ok(run)
-                }) {
+            let attempt_log = log.try_clone()?;
+            let context = telemetry::span(
+                "expl.agent.attempt",
+                vec![
+                    KeyValue::new("expl.agent.driver", cli.driver.kind().label()),
+                    KeyValue::new("expl.agent.attempt", (offset + 1) as i64),
+                    KeyValue::new("expl.agent.fallback", offset > 0),
+                ],
+            );
+            if let Some(timeout) = cli.timeout {
+                context.span().set_attribute(KeyValue::new(
+                    "expl.agent.timeout_seconds",
+                    timeout.as_secs_f64(),
+                ));
+            }
+            let result = {
+                let _scope = context.clone().attach();
+                self.attempt(cli, invocation, attempt_log)
+                    .and_then(AgentRun::decode)
+                    .and_then(|run| {
+                        validate(&run.response)?;
+                        Ok(run)
+                    })
+            };
+            if let Err(error) = &result {
+                telemetry::error(&context, error.telemetry_kind());
+            }
+            context.span().end();
+            match result {
                 Ok(run) => return Ok(run),
                 Err(AgentError::Interrupted) => return Err(AgentError::Interrupted),
                 // The directory is still in use: no other CLI may start on it.
@@ -270,6 +295,10 @@ impl Agent {
                 command.process.get_program().display()
             ))
         })?;
+        let telemetry = Context::current();
+        telemetry
+            .span()
+            .set_attribute(KeyValue::new("expl.agent.pid", i64::from(child.id())));
         let deadline = cli
             .timeout
             .map(|timeout| (Instant::now() + timeout, timeout));
@@ -297,6 +326,13 @@ impl Agent {
             .map(|pipe| tee(pipe, Arc::clone(&log), "[stderr] "));
 
         let end = wait(&mut child, invocation.interrupt, deadline.map(|(at, _)| at))?;
+        if let End::Exited(status) = end
+            && let Some(code) = status.code()
+        {
+            telemetry
+                .span()
+                .set_attribute(KeyValue::new("process.exit.code", i64::from(code)));
+        }
         // However the leader ended (by itself, or stopped on a timeout or an
         // interrupt), members of its group may outlive it: stop them and see
         // them gone before the working directory goes to the next CLI or to

@@ -207,6 +207,18 @@ pub enum Direction {
     Survey,
 }
 
+impl Direction {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Forward => "forward",
+            Self::Backward => "backward",
+            Self::Failure => "failure",
+            Self::Ahead => "ahead",
+            Self::Survey => "survey",
+        }
+    }
+}
+
 impl fmt::Display for Direction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {

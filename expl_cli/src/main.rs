@@ -7,6 +7,7 @@ mod dispatch;
 mod error;
 mod observer;
 mod output;
+mod telemetry;
 
 use std::process::ExitCode;
 

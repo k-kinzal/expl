@@ -22,6 +22,7 @@ use crate::dispatch::{load, processes};
 use crate::error::CliError;
 use crate::observer::ActivityLog;
 use crate::output::{println, status};
+use crate::telemetry::Telemetry;
 
 pub(crate) fn run(start: &Path, args: &RunArgs) -> Result<(), CliError> {
     let context = load(start)?;
@@ -63,6 +64,7 @@ pub(crate) fn run(start: &Path, args: &RunArgs) -> Result<(), CliError> {
         once: args.once,
         exit_when_idle: args.exit_when_idle,
     };
+    let _telemetry = Telemetry::start(project, context.declaration().telemetry.as_ref(), true);
     Process::new(&context, &consumer, record.id, interrupt).run(options, &observer)?;
     Ok(())
 }

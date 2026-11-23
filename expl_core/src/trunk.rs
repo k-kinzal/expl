@@ -21,12 +21,15 @@
 
 use std::collections::BTreeSet;
 
+use opentelemetry::KeyValue;
+use opentelemetry::trace::TraceContextExt;
 use serde::Serialize;
 use thiserror::Error;
 
 use crate::git::{Git, GitError};
 use crate::graph::{Graph, GraphError, NewOrigin, NodeFilter, NodeId, NodeKind, NodeStatus};
 use crate::project::Project;
+use crate::telemetry;
 
 /// Following the trunk failed.
 #[derive(Debug, Error)]
@@ -150,8 +153,27 @@ impl Trunk {
             let Some(seen) = observation else {
                 return Ok(None);
             };
+            let context = telemetry::span(
+                "expl.trunk.advance",
+                vec![
+                    KeyValue::new("expl.trunk.branch", seen.branch.clone()),
+                    KeyValue::new("expl.trunk.commit", seen.origin.commit.clone()),
+                    KeyValue::new("expl.origin.previous.id", seen.origin.previous.0),
+                    KeyValue::new("expl.trunk.descends", seen.descends),
+                    KeyValue::new(
+                        "expl.trunk.adopted_ids",
+                        telemetry::node_ids(seen.origin.adopted.iter().copied()),
+                    ),
+                ],
+            );
+            let _scope = context.clone().attach();
             match graph.advance_origin(&seen.origin) {
                 Ok(recorded) => {
+                    if let Some(origin) = recorded {
+                        context
+                            .span()
+                            .set_attribute(KeyValue::new("expl.origin.id", origin.0));
+                    }
                     return Ok(recorded.map(|origin| Advance {
                         origin,
                         previous: seen.origin.previous,
@@ -161,8 +183,16 @@ impl Trunk {
                         descends: seen.descends,
                     }));
                 }
-                Err(GraphError::OriginMoved { .. }) => observation = self.observe(graph)?,
-                Err(error) => return Err(error.into()),
+                Err(GraphError::OriginMoved { .. }) => {
+                    context
+                        .span()
+                        .set_attribute(KeyValue::new("expl.trunk.outcome", "superseded"));
+                    observation = self.observe(graph)?;
+                }
+                Err(error) => {
+                    telemetry::error(&context, "graph");
+                    return Err(error.into());
+                }
             }
         }
     }

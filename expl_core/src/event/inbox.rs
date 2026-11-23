@@ -171,6 +171,20 @@ impl Inbox {
         &self.consumer
     }
 
+    /// Trace context of the producer of this durable event, if it had one.
+    /// A telemetry lookup must never affect delivery of the event itself.
+    pub(crate) fn cause(&self, id: EventId) -> Option<opentelemetry::trace::SpanContext> {
+        let (parent, state) = self
+            .conn
+            .query_row(
+                "SELECT traceparent, tracestate FROM events WHERE id = ?1",
+                [id.0],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get(1)?)),
+            )
+            .ok()?;
+        crate::telemetry::extract(parent?, state)
+    }
+
     /// Lease the next deliverable event of `kinds` to `process`: the
     /// oldest, except that `node.ready` events go first, highest current
     /// priority of their step first, so the most promising step is tried
@@ -748,6 +762,10 @@ impl Inbox {
 mod tests {
     use super::*;
     use crate::graph::Graph;
+    use opentelemetry::Context;
+    use opentelemetry::trace::{
+        SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
+    };
 
     struct Fixture {
         _dir: tempfile::TempDir,
@@ -773,6 +791,44 @@ mod tests {
     }
 
     const PROPOSED: &[EventKind] = &[EventKind::NodeProposed];
+
+    #[test]
+    fn event_producer_trace_context_survives_a_new_connection_and_redelivery() {
+        let mut f = fixture();
+        let producer = SpanContext::new(
+            TraceId::from(123_u128),
+            SpanId::from(456_u64),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::from_key_value([("vendor", "state")]).expect("trace state"),
+        );
+        {
+            let _scope = Context::new()
+                .with_remote_span_context(producer.clone())
+                .attach();
+            f.graph
+                .add_goal("traced", "traced", false, &[])
+                .expect("goal");
+        }
+
+        let mut inbox = Inbox::open(&f.db, "exploration").expect("inbox");
+        let kinds = &[EventKind::GoalAdded];
+        let earlier = inbox
+            .lease(kinds, ProcessId(1), false, 3)
+            .expect("lease")
+            .expect("event");
+        assert!(inbox.cause(earlier.event.id).is_none());
+        inbox.ack(&earlier, None).expect("ack");
+        for attempt in 1..=2 {
+            let delivery = inbox
+                .lease(kinds, ProcessId(attempt), false, 3)
+                .expect("lease")
+                .expect("event");
+            assert_eq!(delivery.attempts, attempt);
+            assert_eq!(inbox.cause(delivery.event.id), Some(producer.clone()));
+            assert!(inbox.fail(&delivery, "retry", 3).expect("retry"));
+        }
+    }
 
     /// Let the lease on `event` run out, as if its holder stopped renewing.
     fn expire(db: &Path, agent: &str, event: EventId) {

@@ -136,6 +136,23 @@ A router considers only members of the group that subscribe to the event. `first
 
 `concurrency` limits simultaneous reactions across all workers of a consumer or all assigned descendants of a router. `replicas` controls how many workers `expl up` starts. Workers started with `expl run` share the same limits. Restart workers after editing their configuration.
 
+### OpenTelemetry
+
+Set an OTLP HTTP base URL in `expl.toml` to export traces and metrics. This repository sends its exploration telemetry to the GPU server.
+
+```toml
+[telemetry]
+endpoint = "http://192.168.10.4:4318"
+```
+
+Expl uses OTLP over HTTP with Protobuf and appends `/v1/traces` or `/v1/metrics` to the base URL. `OTEL_EXPORTER_OTLP_ENDPOINT` overrides the project URL. `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` take full URLs and override the base for their respective signals. The SDK also reads the standard OTLP headers and timeouts, `OTEL_SERVICE_NAME` (default `expl`), and `OTEL_RESOURCE_ATTRIBUTES`. Use `OTEL_SDK_DISABLED=true` to turn off all export, or set the respective `OTEL_TRACES_EXPORTER` or `OTEL_METRICS_EXPORTER` to `none`.
+
+- Filter delivery traces by `expl.consumer`, `expl.handler`, `expl.event.kind`, `expl.event.id`, or `expl.node.id`. A traced producer leaves a link on its event that survives worker restarts. Child spans show the search direction and target goals, workspace operations, and agent attempts. Delivery results include proposal IDs, plan changes, change commits or investigation answers, and evaluation decisions and scores.
+- Use `expl.worker.state` to see workers waiting for events, waiting for capacity, or reacting. `expl.delivery.count` counts delivery outcomes, including retries, lost leases, and failed verifications. `expl.delivery.duration` measures time from lease to settlement, and `expl.delivery.queue_age` measures event age at lease. Both durations are in seconds. Workers export metrics every 15 seconds by default. Set `OTEL_METRIC_EXPORT_INTERVAL` in milliseconds to change this.
+- Process logs include `trace_id` and `span_id` for sampled reactions. Prompts, agent output, and finding evidence stay in the local logs and graph.
+
+In Tempo, search for `{ resource.service.name = "expl" && span.expl.handler = "verification" }`. In Prometheus, `expl_worker_state{expl_worker_phase="reacting"} == 1` shows the workers currently handling a delivery.
+
 ### Existing projects
 
 Existing `[agent.<name>]` declarations still load with the former event sets and routing. To migrate, rename each table to `[consumer.<name>]`, replace `role` with `handler`, and add the corresponding `on` list from the default cycle above. For explicit routing, keep the existing `[routing]` keys and set `group` to the former role on each routed consumer. Convert inline `weight` settings to a weighted router and use the former role as the group name. Keep consumer names to preserve their delivery history. The CLI also accepts `expl agent ls` and `expl event ls --agent` for existing scripts.

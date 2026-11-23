@@ -4,10 +4,13 @@ use std::collections::{HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
+use opentelemetry::KeyValue;
+
 use crate::event::LeaseToken;
 use crate::git::{BranchBlocker, Git, GitError};
 use crate::graph::{Node, NodeId};
 use crate::project::Project;
+use crate::telemetry;
 use crate::workspace::WorkspaceError;
 use crate::workspace::clone::{AgentClone, Start, identity_args};
 
@@ -175,62 +178,80 @@ impl Workspaces {
         predecessors: &[Node],
         trunk: &[String],
     ) -> Result<Workspace, WorkspaceError> {
-        let mut commits = Vec::new();
-        for predecessor in predecessors {
-            let commit = predecessor
-                .head_commit
-                .clone()
-                .ok_or(WorkspaceError::PredecessorNotRealized(predecessor.id))?;
-            if !commits.contains(&commit) {
-                commits.push(commit);
-            }
-        }
-        let Some((base, joins)) = commits.split_first() else {
-            return Err(WorkspaceError::PredecessorNotRealized(node.id));
-        };
+        telemetry::operation(
+            "expl.workspace.allocate",
+            vec![
+                KeyValue::new("expl.node.id", node.id.0),
+                KeyValue::new("expl.workspace.predecessors", predecessors.len() as i64),
+            ],
+            "workspace.allocate",
+            || {
+                let mut commits = Vec::new();
+                for predecessor in predecessors {
+                    let commit = predecessor
+                        .head_commit
+                        .clone()
+                        .ok_or(WorkspaceError::PredecessorNotRealized(predecessor.id))?;
+                    if !commits.contains(&commit) {
+                        commits.push(commit);
+                    }
+                }
+                let Some((base, joins)) = commits.split_first() else {
+                    return Err(WorkspaceError::PredecessorNotRealized(node.id));
+                };
 
-        let base = self.repository.resolve_commit(base)?;
-        let path = self.path_of(node.id, lease);
-        let branch = {
-            let _guard = lock(&self.lock)?;
-            let registered = self.registered()?;
-            if path.try_exists()?
-                || registered
-                    .iter()
-                    .any(|(_, existing)| existing.file_name() == path.file_name())
-            {
-                return Err(WorkspaceError::AttemptExists(path));
-            }
-            let branch = self.allocate_branch_locked(node.id, &base, trunk)?;
-            std::fs::create_dir_all(&self.root)?;
-            let path_text = path.display().to_string();
-            if let Err(error) = self
-                .repository
-                .run(&["worktree", "add", &path_text, &branch])
-            {
-                // The branch was made just now, at `base`: take it back
-                // unless something moved it meanwhile.
-                let reference = format!("refs/heads/{branch}");
-                self.repository
-                    .run(&["update-ref", "-d", &reference, &base])
-                    .ok();
-                return Err(error.into());
-            }
-            branch
-        };
+                let base = self.repository.resolve_commit(base)?;
+                let path = self.path_of(node.id, lease);
+                let branch = {
+                    let _guard = lock(&self.lock)?;
+                    let registered = self.registered()?;
+                    if path.try_exists()?
+                        || registered
+                            .iter()
+                            .any(|(_, existing)| existing.file_name() == path.file_name())
+                    {
+                        return Err(WorkspaceError::AttemptExists(path));
+                    }
+                    let branch = self.allocate_branch_locked(node.id, &base, trunk)?;
+                    std::fs::create_dir_all(&self.root)?;
+                    let path_text = path.display().to_string();
+                    if let Err(error) = self
+                        .repository
+                        .run(&["worktree", "add", &path_text, &branch])
+                    {
+                        // The branch was made just now, at `base`: take it back
+                        // unless something moved it meanwhile.
+                        let reference = format!("refs/heads/{branch}");
+                        self.repository
+                            .run(&["update-ref", "-d", &reference, &base])
+                            .ok();
+                        return Err(error.into());
+                    }
+                    branch
+                };
 
-        let mut workspace = Workspace {
-            node: node.id,
-            path,
-            branch,
-            lock: self.lock.clone(),
-            pending: joins.iter().cloned().collect(),
-            predecessors: commits,
-            merging: None,
-            conflicts: Vec::new(),
-        };
-        workspace.merge_pending()?;
-        Ok(workspace)
+                let mut workspace = Workspace {
+                    node: node.id,
+                    path,
+                    branch,
+                    lock: self.lock.clone(),
+                    pending: joins.iter().cloned().collect(),
+                    predecessors: commits,
+                    merging: None,
+                    conflicts: Vec::new(),
+                };
+                workspace.merge_pending()?;
+                telemetry::attributes([
+                    KeyValue::new("expl.workspace.branch", workspace.branch.clone()),
+                    KeyValue::new(
+                        "expl.workspace.conflict_count",
+                        workspace.conflicts.len() as i64,
+                    ),
+                    KeyValue::new("expl.workspace.joined", workspace.is_joined()),
+                ]);
+                Ok(workspace)
+            },
+        )
     }
 
     /// Of `commits`, the one whose history holds every other — the single
@@ -276,22 +297,32 @@ impl Workspaces {
         node: NodeId,
         commit: &str,
     ) -> Result<ScratchWorkspace, WorkspaceError> {
-        let commit = self.repository.resolve_commit(commit)?;
-        let clone = AgentClone::create(
-            &self.repository,
-            &self.root,
-            &format!("scratch-{}", node.0),
-            Start {
-                commit: commit.clone(),
-                branch: None,
-                merging: None,
+        telemetry::operation(
+            "expl.workspace.scratch",
+            vec![
+                KeyValue::new("expl.node.id", node.0),
+                KeyValue::new("expl.workspace.commit", commit.to_owned()),
+            ],
+            "workspace.scratch",
+            || {
+                let commit = self.repository.resolve_commit(commit)?;
+                let clone = AgentClone::create(
+                    &self.repository,
+                    &self.root,
+                    &format!("scratch-{}", node.0),
+                    Start {
+                        commit: commit.clone(),
+                        branch: None,
+                        merging: None,
+                    },
+                )?;
+                Ok(ScratchWorkspace {
+                    repository: self.repository.clone(),
+                    clone,
+                    head: commit,
+                })
             },
-        )?;
-        Ok(ScratchWorkspace {
-            repository: self.repository.clone(),
-            clone,
-            head: commit,
-        })
+        )
     }
 
     /// A private clone for the agent working on `workspace`'s step: at the
@@ -305,15 +336,27 @@ impl Workspaces {
     /// [`WorkspaceError::Git`] when git fails; [`WorkspaceError::Io`] on
     /// filesystem failure.
     pub fn clone_for(&self, workspace: &Workspace) -> Result<AgentClone, WorkspaceError> {
-        let commit = Git::in_worktree(&workspace.path).resolve_commit("HEAD")?;
-        AgentClone::create(
-            &self.repository,
-            &self.root,
-            &format!("node-{}", workspace.node.0),
-            Start {
-                commit,
-                branch: Some(workspace.branch.clone()),
-                merging: workspace.merging.clone(),
+        telemetry::operation(
+            "expl.workspace.clone",
+            vec![
+                KeyValue::new("expl.node.id", workspace.node.0),
+                KeyValue::new("expl.workspace.branch", workspace.branch.clone()),
+                KeyValue::new("expl.workspace.joined", workspace.is_joined()),
+            ],
+            "workspace.clone",
+            || {
+                let commit = Git::in_worktree(&workspace.path).resolve_commit("HEAD")?;
+                telemetry::attributes([KeyValue::new("expl.workspace.commit", commit.clone())]);
+                AgentClone::create(
+                    &self.repository,
+                    &self.root,
+                    &format!("node-{}", workspace.node.0),
+                    Start {
+                        commit,
+                        branch: Some(workspace.branch.clone()),
+                        merging: workspace.merging.clone(),
+                    },
+                )
             },
         )
     }
