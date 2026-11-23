@@ -41,6 +41,9 @@ pub const MAX_ATTEMPTS: i64 = 3;
 /// agent left behind, and the time a killed process group takes to vanish.
 pub const REACTION_GRACE: Duration = Duration::from_secs(20);
 
+/// Why a worker told to stop exits.
+const STOPPED: &str = "stopped";
+
 /// How long a worker waits before it asks again for a cleanup that could
 /// not be made.
 const CLEANUP_RETRY: Duration = Duration::from_secs(30);
@@ -309,7 +312,13 @@ impl Worker<'_> {
         };
         telemetry.observe(&Activity::Exiting(&reason));
         if self.authority.is_none_or(Authority::is_live) {
-            processes.exit(self.id, &reason)?;
+            if reason == STOPPED {
+                // Stopped by its record or by a signal: only the former
+                // retires the worker.
+                processes.interrupted(self.id, &reason)?;
+            } else {
+                processes.exit(self.id, &reason)?;
+            }
         }
         result
     }
@@ -373,7 +382,7 @@ impl Worker<'_> {
                 self.interrupt.raise();
             }
             if self.interrupt.is_raised() {
-                return Ok("stopped".to_owned());
+                return Ok(STOPPED.to_owned());
             }
             for (name, task) in tasks.due()? {
                 let ran = self.run_command(
@@ -499,7 +508,7 @@ impl Worker<'_> {
                         lost();
                     }
                     if stopping {
-                        return Ok("stopped".to_owned());
+                        return Ok(STOPPED.to_owned());
                     }
                     thread::sleep(POLL * 4);
                 }
@@ -511,7 +520,7 @@ impl Worker<'_> {
                     } else {
                         lost();
                     }
-                    return Ok("stopped".to_owned());
+                    return Ok(STOPPED.to_owned());
                 }
                 // Counted and retried; the last attempt gives the event up.
                 // A command that reported the failure itself has cleaned up
@@ -1041,6 +1050,17 @@ mod tests {
             let record = Processes::over(self.conn(), self.dir.path())
                 .create(CONSUMER, None, false)
                 .expect("record");
+            self.run_as(&record, options, interrupt, authority)
+        }
+
+        /// Run the worker recorded as `record`.
+        fn run_as(
+            &self,
+            record: &ProcessRecord,
+            options: ProcessOptions,
+            interrupt: Interrupt,
+            authority: Option<&Authority>,
+        ) -> (String, Vec<String>) {
             let seen = Seen::default();
             let reason = Worker {
                 directory: self.dir.path(),
@@ -1286,6 +1306,24 @@ mod tests {
             "{seen:?}"
         );
         assert_eq!(seen[seen.len() - 2..], ["reacted e1: -", "exiting: idle"]);
+    }
+
+    #[test]
+    fn a_worker_stopped_by_a_signal_is_started_again_by_the_next_term() {
+        let explorer = Explorer::new("exit 0");
+        let mut table = Processes::over(explorer.conn(), explorer.dir.path());
+        let record = table
+            .create_resumable(CONSUMER, None, ProcessOptions::default())
+            .expect("record");
+        // The signal: an interrupt nobody recorded a request for.
+        let interrupt = Interrupt::default();
+        interrupt.raise();
+        let (reason, _) = explorer.run_as(&record, ProcessOptions::default(), interrupt, None);
+        assert_eq!(reason, "stopped");
+        assert!(table.list(false).expect("list").is_empty());
+        let again = table.recover().expect("recover");
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].0.id, record.id);
     }
 
     #[test]

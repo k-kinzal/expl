@@ -161,7 +161,8 @@ impl Processes {
         self.get(ProcessId(id))
     }
 
-    /// Retire restart requests from dead workers being replaced by `up`.
+    /// Retire restart requests from workers that are gone (dead, or
+    /// [interrupted](Self::interrupted)) and are being replaced by `up`.
     ///
     /// # Errors
     ///
@@ -169,9 +170,9 @@ impl Processes {
     pub fn retire_dead(&self, consumer: &str) -> rusqlite::Result<()> {
         self.conn.execute(
             &format!(
-                "UPDATE processes SET resume = 0 WHERE resume = 1
-                      AND agent = ?1 AND status = 'running'
-                      AND heartbeat_at < {EPOCH} - {STALE_SECONDS}"
+                "UPDATE processes SET resume = 0 WHERE resume = 1 AND agent = ?1
+                      AND (status = 'exited' OR (status = 'running'
+                      AND heartbeat_at < {EPOCH} - {STALE_SECONDS}))"
             ),
             [consumer],
         )?;
@@ -410,6 +411,25 @@ impl Processes {
         Ok(())
     }
 
+    /// The process was interrupted and is over. Only a recorded request
+    /// to stop retires it: without one (a signal sent to the process
+    /// itself, as when the machine shuts down) the request to keep it
+    /// running stands, and the next term starts it again.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failure.
+    pub fn interrupted(&self, id: ProcessId, reason: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            &format!(
+                "UPDATE processes SET status = 'exited', activity = NULL, exit_reason = ?2, \
+                 resume = (resume = 1 AND stop_requested = 0), finished_at = {NOW} WHERE id = ?1"
+            ),
+            params![id.0, reason],
+        )?;
+        Ok(())
+    }
+
     /// Forget a record. Rows of the application that refer to it must be
     /// detached first.
     ///
@@ -443,6 +463,49 @@ mod tests {
                 [id.0],
             )
             .expect("age");
+    }
+
+    #[test]
+    fn an_interrupted_worker_is_started_again_unless_it_was_asked_to_stop() {
+        let (_dir, mut table) = table();
+        let options = ProcessOptions::default();
+        let kept = table
+            .create_resumable("explorer", None, options)
+            .expect("create");
+        let asked = table
+            .create_resumable("planner", None, options)
+            .expect("create");
+        for record in [&kept, &asked] {
+            assert!(table.start(record.id, 1).expect("start"));
+        }
+        table.request_stop(asked.id).expect("request");
+        table.interrupted(kept.id, "stopped").expect("interrupted");
+        table.interrupted(asked.id, "stopped").expect("interrupted");
+        // Both are over, and say so.
+        assert!(table.list(false).expect("list").is_empty());
+        // The next term starts the one nobody asked to stop.
+        let again = table.recover().expect("recover");
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].0.id, kept.id);
+        assert!(table.start(kept.id, 2).expect("start"));
+    }
+
+    #[test]
+    fn an_interrupted_worker_replaced_by_up_is_not_started_again() {
+        let (_dir, mut table) = table();
+        let options = ProcessOptions::default();
+        let gone = table
+            .create_resumable("explorer", None, options)
+            .expect("create");
+        assert!(table.start(gone.id, 1).expect("start"));
+        table.interrupted(gone.id, "stopped").expect("interrupted");
+        table.retire_dead("explorer").expect("retire");
+        let replacement = table
+            .create_resumable("explorer", None, options)
+            .expect("create");
+        let again = table.recover().expect("recover");
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].0.id, replacement.id);
     }
 
     #[test]
