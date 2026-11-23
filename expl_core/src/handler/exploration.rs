@@ -688,9 +688,9 @@ fn explore(
         )
     };
     let schema = schema(!backward);
-    let map = Map::of(graph)?;
-    let prompt = prompt(reaction, &task, &known, &map, &schema);
     let scratch = reaction.context().workspaces().scratch(ground)?;
+    let map = Map::of(graph, scratch.directory())?;
+    let prompt = prompt(reaction, &task, &known, &map, &schema);
     let response: Response =
         reaction.invoke_read_only(graph, Some(start.id), &scratch, &prompt, &schema)?;
     drop(scratch);
@@ -864,9 +864,9 @@ fn explore_failure(
         goals = aim.describe(graph)?,
     );
     let schema = schema(true);
-    let map = Map::of(graph)?;
-    let prompt = prompt(reaction, &task, &known, &map, &schema);
     let scratch = reaction.context().workspaces().scratch(&ground)?;
+    let map = Map::of(graph, scratch.directory())?;
+    let prompt = prompt(reaction, &task, &known, &map, &schema);
     let response: Response =
         reaction.invoke_read_only(graph, Some(failed.id), &scratch, &prompt, &schema)?;
     drop(scratch);
@@ -960,9 +960,9 @@ fn explore_ahead(
         goals = aim.describe(graph)?,
     );
     let schema = schema(true);
-    let map = Map::of(graph)?;
-    let prompt = prompt(reaction, &task, &known, &map, &schema);
     let scratch = reaction.context().workspaces().scratch(&ground)?;
+    let map = Map::of(graph, scratch.directory())?;
+    let prompt = prompt(reaction, &task, &known, &map, &schema);
     let response: Response =
         reaction.invoke_read_only(graph, Some(start.id), &scratch, &prompt, &schema)?;
     drop(scratch);
@@ -1072,9 +1072,9 @@ fn survey(
         map = digest::graph(&snapshot),
     );
     let schema = survey_schema();
-    let map = Map::of(graph)?;
-    let prompt = prompt(reaction, &task, &[], &map, &schema);
     let scratch = reaction.context().workspaces().scratch(&origin)?;
+    let map = Map::of(graph, scratch.directory())?;
+    let prompt = prompt(reaction, &task, &[], &map, &schema);
     let response: SurveyResponse =
         reaction.invoke_read_only(graph, None, &scratch, &prompt, &schema)?;
     drop(scratch);
@@ -1152,16 +1152,23 @@ fn prompt(
     ))
 }
 
-/// The whole graph as a JSON file outside the working directory, for an
-/// exploration to analyse beyond what its prompt shows. Removed when
-/// dropped, once the agent is done.
+/// The whole graph as a JSON file beside the working directory, for an
+/// exploration to analyse beyond what its prompt shows. It is removed with
+/// the clone it was written beside, once the agent is done.
 struct Map {
-    _dir: tempfile::TempDir,
-    path: std::path::PathBuf,
+    /// Where it was written.
+    file: std::path::PathBuf,
 }
 
 impl Map {
-    fn of(graph: &Graph) -> Result<Self, HandlerError> {
+    /// The file's name, in the directory that holds the working directory.
+    const FILE: &'static str = "map.json";
+
+    /// Write the map into `directory`, the one holding the agent's working
+    /// directory. The agent may run on another cluster member, which shares
+    /// the project's storage but not this machine's temporary directory, so
+    /// the map travels with the clone.
+    fn of(graph: &Graph, directory: &std::path::Path) -> Result<Self, HandlerError> {
         let snapshot = graph.snapshot()?;
         let map = serde_json::json!({
             "origin": graph.origin()?.id,
@@ -1171,20 +1178,25 @@ impl Map {
             "conclusions": snapshot.conclusions,
             "plan": graph.latest_plan()?,
         });
-        let dir = tempfile::Builder::new().prefix("map-").tempdir()?;
-        let path = dir.path().join("map.json");
-        std::fs::write(&path, map.to_string())?;
-        Ok(Self { _dir: dir, path })
+        let file = directory.join(Self::FILE);
+        std::fs::write(&file, map.to_string())?;
+        Ok(Self { file })
     }
 
-    /// The prompt section pointing at it.
+    /// The prompt section pointing at it, relative to the working directory:
+    /// the same file wherever the clone is mounted.
     fn section(&self) -> String {
+        let file = self
+            .file
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default();
         format!(
             "\n## The whole map\n\n\
              This prompt shows only part of the work so far. All of it is in a JSON file you may \
              read and analyse as freely as you like, with whatever tools suit you. It is a \
-             copy: nothing you do to it changes anything.\n\n\
-             `{path}`\n\n\
+             copy: nothing you do to it changes anything. It is beside the working directory:\n\n\
+             `../{file}`\n\n\
              It holds `nodes` (every origin, step and goal, with its status, objective, and \
              outcome or finding), `edges` (`source` to `target`: the target builds on the source, \
              or a step heads for a goal), `evaluations` (verdicts on steps and origins against \
@@ -1192,7 +1204,6 @@ impl Map {
              continued, the hypothesis it stood for, what was found, and what that changes) and \
              `plan` (the latest prioritised paths). Look there for what earlier steps \
              established, and why others failed, before you propose.\n",
-            path = self.path.display()
         )
     }
 }
@@ -1251,6 +1262,34 @@ mod tests {
             .expect("judge");
         let aim = Aim::from(&graph, &completed).expect("aim");
         assert_eq!(aim.default, [goal]);
+    }
+
+    #[test]
+    fn the_map_travels_with_the_clone_the_agent_works_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut graph = Graph::open(&dir.path().join("expl.db")).expect("graph");
+        graph
+            .create_origin("o", Some("main"), "abc")
+            .expect("origin");
+        // What a clone looks like: its own directory, holding the checkout.
+        let clone = dir.path().join("clone");
+        let checkout = clone.join("checkout");
+        std::fs::create_dir_all(&checkout).expect("checkout");
+
+        let map = Map::of(&graph, &clone).expect("map");
+        // Named relative to the working directory, never by a path of this
+        // machine: a temporary directory here is not one on another member.
+        let section = map.section();
+        assert!(section.contains("`../map.json`"), "{section}");
+        assert!(
+            !section.contains(&dir.path().display().to_string()),
+            "{section}"
+        );
+        let written = std::fs::read_to_string(checkout.join("../map.json")).expect("read");
+        let written: serde_json::Value = serde_json::from_str(&written).expect("json");
+        assert_eq!(written["nodes"].as_array().map(Vec::len), Some(1));
+        // Beside the repository's files, not among them.
+        assert_eq!(std::fs::read_dir(&checkout).expect("checkout").count(), 0);
     }
 
     #[test]

@@ -29,6 +29,13 @@ impl AgentClone {
         self.0.path()
     }
 
+    /// The clone's own directory, which holds the checkout: files handed
+    /// to the agent alongside the repository go here.
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        self.0.directory()
+    }
+
     /// Restore the clone to the state it had before the agent ran.
     ///
     /// # Errors

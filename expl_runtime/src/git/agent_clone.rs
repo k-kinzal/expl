@@ -40,7 +40,7 @@ pub struct Start {
 /// the agent controls. Removed on drop.
 #[derive(Debug)]
 pub struct AgentClone {
-    _directory: TempDir,
+    directory: TempDir,
     /// The project's repository, which the clone reads from.
     repository: Git,
     path: PathBuf,
@@ -78,7 +78,7 @@ impl AgentClone {
         let clone = Self {
             path: directory.path().join("checkout"),
             index: directory.path().join("index"),
-            _directory: directory,
+            directory,
             repository: repository.clone(),
             start,
         };
@@ -90,6 +90,17 @@ impl AgentClone {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The clone's own directory, which holds the checkout
+    /// ([`path`](Self::path) is `checkout` inside it). Files the agent is
+    /// handed alongside the repository go here: the agent reaches them as
+    /// `..`, they are never part of a [`snapshot`](Self::snapshot), a
+    /// [`reset`](Self::reset) leaves them, and they are removed with the
+    /// clone.
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        self.directory.path()
     }
 
     /// Put the clone back as it was created, whatever the agent left in

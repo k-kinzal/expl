@@ -861,6 +861,14 @@ impl ScratchWorkspace {
         self.clone.path()
     }
 
+    /// The clone's own directory, which holds the checkout: files handed
+    /// to the agent alongside the repository go here, and are removed with
+    /// the clone.
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        self.clone.directory()
+    }
+
     /// The commit the clone was created at.
     #[must_use]
     pub fn head(&self) -> &str {
