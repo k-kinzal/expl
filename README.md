@@ -11,7 +11,7 @@ Graph changes produce **events**. A goal command, a process following the trunk,
 | `node.ready` | `verification` | Test the highest-priority ready hypothesis in a private clone and record a commit or finding |
 | `node.completed`, `node.failed`, `origin.advanced` | `evaluation` | Record whether a hypothesis held and how far the result moves each goal |
 
-A **worker** is a process that leases an event, runs the handler, and acknowledges the result. Replicas share the same inbox, so independent events can run in parallel. The graph, event log, deliveries, and process records live in SQLite under `.expl/`. Exploration continues until a human stops it.
+A **worker** is a process that leases an event, executes the consumer's reaction as a command, and settles the delivery from its outcome. Replicas share the same inbox, so independent events can run in parallel. The graph, event log, deliveries, and process records live in SQLite under `.expl/`. Exploration continues until a human stops it.
 
 expl follows the **trunk**, the default branch named by `trunk` in `expl.toml`. To adopt a hypothesis, merge its branch with git, resolving conflicts as usual. Running processes notice that the trunk moved, record its new position as the **origin**, and start exploring from there. A step counts as adopted when the trunk contains its commits, whether by merge, fast-forward, squash merge, or cherry-pick. The previous origins stay in the graph with what was adopted into each, so you can always see what was chosen and when, and still adopt a hypothesis that was left behind on an older origin.
 
@@ -66,6 +66,41 @@ The checkout remembers its daemon directory, and `EXPL_MEMBER` selects the local
 
 The shared election lock admits one leader. If it exits, a surviving member takes over after the previous leader's application processes release their guards. It recovers the deliveries and restarts the detached workers that were still requested. An interrupted CLI operation can be inspected through the new leader. Stop workers with `expl down` before shutting down the daemons if the workers should stay stopped.
 
+### Several explorers on one daemon
+
+A daemon hosts every explorer registered with it. `expl daemon` inside a project registers that project. To host more, start the daemon on a directory of its own and let projects join it:
+
+```sh
+expl --cluster /shared/expl-cluster daemon             # hosts whatever is registered
+expl -C project-a --cluster /shared/expl-cluster join  # the project registers itself
+expl -C project-a up                                   # its workers start under the daemon
+expl --cluster /shared/expl-cluster cluster status     # leader, explorers, agent limits in use
+```
+
+A command typed inside a project is about that project. Elsewhere, name the explorer with `--explorer NAME` (or `EXPL_EXPLORER`). A project registers under its directory name, so two projects with the same directory name cannot join one daemon.
+
+An explorer that is not an expl project registers from a file and is managed with `expl explorer`. See [Building a specialized explorer](#building-a-specialized-explorer).
+
+### Agent control
+
+The daemon's operator controls the agents of every explorer it hosts, in `daemon.toml` in the daemon directory. Without the file there are no limits.
+
+```toml
+[agents]
+concurrency = 2                 # agent invocations at once, across every explorer
+
+[pool.specialized]
+agents = 1                      # across the explorers that register pool = "specialized"
+
+[agent.claude]                  # a named agent, for consumers that say agents = ["claude"]
+driver = "claude_code"
+command = ["claude"]
+args = ["--permission-mode", "bypassPermissions"]
+timeout = "30m"
+```
+
+An agent invocation takes one slot of the daemon and one of its explorer's pool before it starts, and waits while none is free. The limits are read again for each invocation, so editing the file needs no restart. An explorer's pool is the `pool` it registers (top-level `pool = "…"` in `expl.toml`), or one named after the explorer. A consumer in `expl.toml` can name the daemon's agents with `agents = ["claude", "cursor"]` in place of `driver`, `command` and `args`. Its own `env`, `timeout` and alternatives still apply. `expl cluster status` shows the limits and the slots in use.
+
 ### Git remote
 
 In a managed or unmanaged checkout, set `remote = "origin"` under `[workspace]` to follow the remote trunk and publish change-step branches to that remote. The leader fetches the trunk into a private tracking ref, so the local checkout can stay where it is. Agents still work in isolated clones. Adopt a branch from your own checkout with Git, then push the updated trunk. The configured Git remote must allow the daemon's account to fetch the trunk and create branch refs.
@@ -78,19 +113,53 @@ frozen = []
 
 ## Building a specialized explorer
 
-[`expl_runtime`](expl_runtime/src/lib.rs) is the reusable event and agent orchestration crate. [`expl_core`](expl_core/src/lib.rs) is its general-purpose exploration application. The runtime has no dependency on Expl's graph, goal types, or four handlers.
+[`expl_runtime`](expl_runtime/src/lib.rs) is the framework. [`expl_core`](expl_core/src/lib.rs) is the general-purpose explorer, one application of it. A specialized explorer is another application of the same framework. It has no dependency on expl's graph, goal types, or four handlers, and expl has none on it.
 
-- [`event::EventLog`](expl_runtime/src/event.rs) stores named events with application-defined payloads and provides a durable inbox. Publish in the same SQLite transaction as the application change that produced the event. Implement different routing or priority rules by selecting a candidate in your own transaction and using `event::Lease` to grant, renew, and settle it. Expl uses its own graph-aware selection with those same lease operations.
-- [`worker::with_heartbeat`](expl_runtime/src/worker.rs) keeps an in-flight lease alive and interrupts the handler when its lease is replaced. Your application defines its handlers, the state they write, and the events they emit.
-- [`agent::Agent`](expl_runtime/src/agent/mod.rs) runs typed command/response contracts with built-in or custom drivers. [`git::AgentClone`](expl_runtime/src/git/agent_clone.rs) provides isolated Git workspaces with restoration and file snapshots. [`cluster::Cluster`](expl_runtime/src/cluster/mod.rs) gives the same application an elected daemon, forwarded control operations, and distributed command execution.
+The framework owns delivery. An explorer keeps its state and its events in one SQLite database, registers its consumers, and supplies the command executed for one event. The daemon's workers do the rest: lease the next event, execute the command, keep the lease alive, settle the delivery, retry or give up.
 
-For example, a mathematical explorer can define a literature-search event, store the resulting references in its own data model, and schedule a proof check as a command in the relevant Git workspace. The application decides how that command's result changes the search and which event to emit next.
+1. **Store and publish.** [`store::open`](expl_runtime/src/store.rs) opens the database and `store::initialize` creates the framework's tables in it. Add your own tables beside them. [`event::EventLog::publish`](expl_runtime/src/event.rs) appends an event with a kind, an optional subject and payload. Publish in the same transaction as the change that produced the event. `EventLog::prioritize` ranks an event: delivery is by priority, then age.
+2. **Register.** Describe the explorer in a file and add it to a daemon.
+
+   ```toml
+   name = "prover"
+   database = ".prover/prover.db"
+   pool = "specialized"                 # whose agent limit its work counts against
+
+   [consumer.checker]
+   on = ["proof.proposed"]
+   run = ["prover", "check"]            # executed for ONE event
+   placement = "any"                    # on any member; "leader" (default) beside the database
+   replicas = 1
+   concurrency = 1
+
+   [task.sweep]                         # a command run every 60 seconds
+   every = 60
+   run = ["prover", "sweep"]
+   ```
+
+   ```sh
+   expl --cluster DIR explorer add prover.toml
+   expl --cluster DIR explorer up prover
+   expl --cluster DIR explorer ps prover
+   ```
+
+   Consumers can share events through `group`, `[routing]` and `[router.<name>]` exactly as in `expl.toml`. `exclusive = true` allows one reaction at a time whatever the number of workers. `coalesce = true` lets one reaction cover every earlier event of the subscription. `idle = { after = 600, run = [...] }` runs a command when the consumer has had nothing to react to for that long.
+3. **React.** The command finds the delivery in its environment (see [`reaction`](expl_runtime/src/reaction.rs)): `EXPL_CONSUMER`, `EXPL_EVENT_ID`, `EXPL_EVENT`, `EXPL_SUBJECT`, `EXPL_ATTEMPTS`, `EXPL_MAX_ATTEMPTS`, `EXPL_LEASE`, and `EXPL_REACTION` (`react`, or `abandon` to clean up after a holder that died on the last attempt). Exiting with success acknowledges the event. Failing asks for it again, up to three attempts. For more, write an outcome to the file named by `EXPL_OUTCOME`: acknowledge with a note, release without counting the attempt, or retry with the reason. A Rust command reads all of this with `reaction::Reaction::from_env()` and answers with `Reaction::report`.
+4. **Use agents and clones.** [`agent::Agent`](expl_runtime/src/agent/mod.rs) runs a prompt and a response schema through an agent CLI. Call [`daemon::govern`](expl_runtime/src/daemon.rs) on it first, so the invocation runs on a member and under the daemon's agent limits. [`git::AgentClone`](expl_runtime/src/git/agent_clone.rs) provides isolated Git workspaces with restoration and file snapshots.
+
+For example, a mathematical explorer can publish a `literature.wanted` event, register a consumer whose command searches and stores the references in its own tables, and publish `proof.proposed` for a consumer that runs a proof check in the relevant Git workspace. Each command decides how its result changes the search and which event to publish next.
+
+`expl explorer publish NAME KIND [--subject N] [--payload JSON]` appends an event from the command line, which is enough to drive an explorer whose commands are shell scripts.
 
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
-| `expl daemon` / `expl cluster status` | Serve a standalone or clustered project / show the selected member and current leader |
+| `expl daemon` / `expl cluster status` | Serve the registered explorers as leader or member / show the selected member, the leader, the explorers, and the agent limits in use |
+| `expl join` | Register this project with the daemon named by `--cluster` |
+| `expl explorer ls` / `add FILE` / `rm NAME` | List the daemon's explorers / register one from a file / remove one |
+| `expl explorer up NAME [CONSUMER…]` / `down NAME` / `ps NAME` | Start, stop, or list a registered explorer's workers |
+| `expl explorer publish NAME KIND [--subject N] [--payload JSON]` | Append an event to a registered explorer's log |
 | `expl init [--base REV] [--trunk BRANCH]` | Initialise; the first origin starts at `REV`, and the trunk to follow (default: the current branch) is written to `expl.toml` |
 | `expl goal add TITLE [--objective TEXT] [--counter] [--under GOAL]…` | Add a goal (`goal.added`); `--counter` also explores backward from it; `--under` makes it a subgoal of those goals |
 | `expl goal nest ID [--under GOAL]…` | Place an existing goal under other goals as their subgoal (none: back to the top level) |

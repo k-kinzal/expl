@@ -79,6 +79,22 @@ while processes run; if state must be repaired, `expl down` first and keep a cop
   writing failed at once with `SQLITE_BUSY_SNAPSHOT` when another process had
   committed. Writes now take the lock up front, and a reaction that still finds the
   database busy hands its event back and continues.
+- A command dispatched to another cluster member could not read the exploration's
+  map: it was written to the worker's local temporary directory. It is now written
+  beside the clone's checkout and named `../map.json` in the prompt.
+- The daemon exited with `daemon: Invalid argument (os error 22)` and every worker
+  stopped with it: a requester deleted its finished job in place while the daemon
+  scanned the queue, and on macOS creating a file in a directory under removal
+  fails with EINVAL. Jobs now leave the queue by an atomic rename, and an entry
+  that cannot be examined is skipped instead of ending the daemon.
+- Delivery, the worker loop and the daemon lived in `expl_core`/`expl_cli`, so the
+  daemon could host one project and knew nothing of other explorers. They moved to
+  `expl_runtime`: a worker executes the registered command for one event
+  (`expl react` for expl), a daemon hosts every registered explorer, and agent
+  limits are the daemon's (`daemon.toml`). Under a daemon, `expl ps` processes are
+  `expl runtime-worker`; a reaction that fails shows its command's last output in
+  the worker log (`expl logs <process>`), and the daemon's own log carries what
+  went wrong recovering an explorer after an election.
 - `install.sh` built the working tree, so an install while editing shipped
   uncommitted code. It now refuses when `*.rs`/`*.toml`/`Cargo.lock` are dirty —
   develop larger changes in a separate worktree (`git worktree add … -b work/…`).

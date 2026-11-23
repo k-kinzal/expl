@@ -96,6 +96,25 @@ yourself — expl does. You only fix what blocks expl from continuing to explore
   copy-and-rename: plain `cp` over a binary makes macOS kill every later launch).
   Running processes keep the binary they started with until restarted.
 
+## Under a daemon
+
+`expl daemon` in the checkout serves it standalone; `expl --cluster DIR daemon`
+hosts every explorer registered there (`expl join`, `expl explorer add FILE`).
+The same commands work either way: they are forwarded to the leader.
+
+- Workers are the framework's (`expl runtime-worker`, built from the registered
+  record). `expl up` refreshes the record from `expl.toml` before starting them, so
+  an edited declaration still applies only after `expl up` / a restart.
+- A reaction is one `expl react <consumer>` command per event. Its failure shows
+  in the worker's log with the command's last output.
+- Agent limits belong to the daemon: `<daemon directory>/daemon.toml` sets
+  `[agents] concurrency` (every explorer together) and `[pool.<name>] agents`
+  (the explorers registering that `pool`). It is read for each invocation, so an
+  edit needs no restart. `expl cluster status` shows limits and slots in use.
+  `[router.all] concurrency` still limits this project's reactions.
+- Stop workers with `expl down` before stopping the daemon if they should stay
+  stopped; otherwise the next leader restarts them.
+
 ## Where things are
 
 | What | Where |
