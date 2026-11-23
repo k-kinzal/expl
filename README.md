@@ -45,7 +45,8 @@ expl down
 | Command | Purpose |
 | --- | --- |
 | `expl init [--base REV] [--trunk BRANCH]` | Initialise; the first origin starts at `REV`, and the trunk to follow (default: the current branch) is written to `expl.toml` |
-| `expl goal add TITLE [--objective TEXT] [--counter]` | Add a goal (`goal.added`); `--counter` also explores backward from it |
+| `expl goal add TITLE [--objective TEXT] [--counter] [--under GOAL]…` | Add a goal (`goal.added`); `--counter` also explores backward from it; `--under` makes it a subgoal of those goals |
+| `expl goal nest ID [--under GOAL]…` | Place an existing goal under other goals as their subgoal (none: back to the top level) |
 | `expl goal ls [-a]` / `expl goal retire ID` | List goals (`-a`: retired ones too) / retire a goal |
 | `expl node ls [--kind K] [--status S]` | List nodes |
 | `expl node inspect ID` | Node with edges, evaluations, agent runs |

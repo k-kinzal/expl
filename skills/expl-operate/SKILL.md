@@ -153,8 +153,15 @@ Exploration is never paused by the backlog (there is no `max_pending`).
 ```sh
 expl goal ls -a                     # tree order; UNDER = the goals a subgoal serves
 expl goal add "TITLE" --objective "measurable condition" [--counter] [--under GOAL]...
+expl goal nest <id> --under <goal>... # place an existing goal under others (no --under: top level)
 expl goal retire <id>
 ```
+
+**Converging and diverging.** Goals under one top-level goal converge: the subgoals
+are stages on the way and the work ends at that goal (exploring expl itself converges
+on the vision goal). Several top-level goals diverge: they are parallel possibilities
+explored side by side ("prove it holds" / "prove it fails"). Keep a goal that is part
+of another under it (`expl goal nest`); keep only truly independent aims at the top.
 
 Write objectives as checkable conditions (tests pass, behaviour X observable).
 Add new goals only when the owner asks or when the vision goal clearly needs a

@@ -24,6 +24,20 @@ pub(crate) fn goal(start: &Path, command: GoalCommand) -> Result<(), CliError> {
             println(&id.0.to_string())
         }
         GoalCommand::Ls(args) => ls(&graph, &args),
+        GoalCommand::Nest(args) => {
+            graph.set_goal_parents(args.goal, &args.under)?;
+            if args.under.is_empty() {
+                status(&format!("goal {} is a top-level goal", args.goal));
+            } else {
+                let parents: Vec<String> = args.under.iter().map(ToString::to_string).collect();
+                status(&format!(
+                    "goal {} is under {}",
+                    args.goal,
+                    parents.join(", ")
+                ));
+            }
+            Ok(())
+        }
         GoalCommand::Retire(args) => {
             let node = graph.node(args.node)?;
             if node.kind != NodeKind::Goal {

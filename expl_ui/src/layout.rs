@@ -5,8 +5,12 @@
 //!   longest path reaching it, counting both what it builds on and, for a
 //!   step on a planned path, the steps the planner put before it — so
 //!   every edge points rightwards and a path reads in the order it is to
-//!   be carried out. Goals are pinned to one column after the deepest step:
-//!   they are where everything heads.
+//!   be carried out. Goals are pinned to the columns after the deepest
+//!   step: they are where everything heads. A subgoal is a stage on the
+//!   way to the goals it serves, so it comes before them in time: the
+//!   top-level goals share the last column, and each level of subgoals
+//!   sits one column further left, so subgoals converge into their goals
+//!   while separate top-level goals stand side by side.
 //! - **The trunk is a straight line.** Every origin sits on row `0`; since
 //!   each origin builds on the previous one and on what it adopted, origins
 //!   march rightwards as the trunk advances, with history to the left.
@@ -41,7 +45,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use expl_core::{Edge, Node, NodeId, NodeKind, NodeStatus, PlannedPath};
+use expl_core::{Edge, GoalTree, Node, NodeId, NodeKind, NodeStatus, PlannedPath};
 
 /// Horizontal room between one column's rightmost node and the next
 /// column's start, in rows.
@@ -256,9 +260,18 @@ impl Layout {
         for node in nodes.iter().filter(|n| n.kind != NodeKind::Goal) {
             depth_of(node.id, &preds, &mut depth, &mut visiting);
         }
+        // Goals after every step: top-level goals last, each level of
+        // subgoals one column before the goals it serves.
+        let goal_tree = GoalTree::of(nodes, edges);
+        let goal_depth: HashMap<NodeId, usize> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Goal)
+            .map(|n| (n.id, goal_tree.depth(n.id)))
+            .collect();
+        let deepest_goal = goal_depth.values().copied().max().unwrap_or(0);
         let goal_column = depth.values().max().map_or(0, |d| d + 1);
         let column_of = |id: &NodeId| match kind(id) {
-            Some(NodeKind::Goal) => goal_column,
+            Some(NodeKind::Goal) => goal_column + deepest_goal - goal_depth[id],
             Some(NodeKind::Origin | NodeKind::Step) | None => depth[id],
         };
 
@@ -534,34 +547,43 @@ impl Layout {
             }
         }
 
-        // Goals: one straight list, in the order of what leads to them.
-        let mut goals: Vec<NodeId> = nodes
-            .iter()
-            .filter(|n| n.kind == NodeKind::Goal)
-            .map(|n| n.id)
-            .collect();
-        let mean_row = |id: &NodeId| {
-            let rows: Vec<f32> = toward
-                .get(id)
-                .into_iter()
-                .flatten()
-                .filter_map(|s| slots.get(s).map(|slot| slot.row))
-                .collect();
-            if rows.is_empty() {
-                0.0
-            } else {
-                rows.iter().sum::<f32>() / index_as_f32(rows.len())
+        // Goals: one straight list per column, in the order of what leads
+        // to them — the steps heading for them and, for a goal with
+        // subgoals, the subgoals (placed first, since they lie further
+        // left).
+        let mut by_goal_column: BTreeMap<usize, Vec<NodeId>> = BTreeMap::new();
+        for node in nodes.iter().filter(|n| n.kind == NodeKind::Goal) {
+            by_goal_column
+                .entry(column_of(&node.id))
+                .or_default()
+                .push(node.id);
+        }
+        for goals in by_goal_column.values() {
+            let mean_row = |id: &NodeId| {
+                let rows: Vec<f32> = toward
+                    .get(id)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .chain(goal_tree.children(*id))
+                    .filter_map(|s| slots.get(&s).map(|slot| slot.row))
+                    .collect();
+                if rows.is_empty() {
+                    0.0
+                } else {
+                    rows.iter().sum::<f32>() / index_as_f32(rows.len())
+                }
+            };
+            let mut keyed: Vec<(f32, NodeId)> =
+                goals.iter().map(|id| (mean_row(id), *id)).collect();
+            keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let centre = index_as_f32(keyed.len().saturating_sub(1)) / 2.0;
+            for (index, (_, id)) in keyed.into_iter().enumerate() {
+                slots.insert(
+                    id,
+                    at(id, x_of(&id), (index_as_f32(index) - centre) * SPACING),
+                );
             }
-        };
-        let mut keyed: Vec<(f32, NodeId)> = goals.iter().map(|id| (mean_row(id), *id)).collect();
-        keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        goals = keyed.into_iter().map(|(_, id)| id).collect();
-        let centre = index_as_f32(goals.len().saturating_sub(1)) / 2.0;
-        for (index, id) in goals.iter().enumerate() {
-            slots.insert(
-                *id,
-                at(*id, x_of(id), (index_as_f32(index) - centre) * SPACING),
-            );
         }
 
         let width = slots.values().map(|s| s.x).fold(0.0_f32, f32::max);
@@ -804,6 +826,44 @@ mod tests {
         assert_eq!(column(4), 2, "a merge sits after its deepest source");
         assert_eq!(column(2), 3, "goals sit after the deepest step");
         assert_eq!(layout.columns, 4);
+    }
+
+    #[test]
+    fn subgoals_come_before_the_goals_they_serve() {
+        // Goal 2 ← subgoal 6 ← subsubgoal 7; goal 8 stands alone beside 2.
+        // 1 → 3 → 4 toward 7, 1 → 5 toward 2 directly.
+        let nodes = [
+            node(1, NodeKind::Origin),
+            node(2, NodeKind::Goal),
+            node(3, NodeKind::Step),
+            node(4, NodeKind::Step),
+            node(5, NodeKind::Step),
+            node(6, NodeKind::Goal),
+            node(7, NodeKind::Goal),
+            node(8, NodeKind::Goal),
+        ];
+        let edges = [
+            edge(1, 3),
+            edge(3, 4),
+            edge(4, 7),
+            edge(1, 5),
+            edge(5, 2),
+            edge(6, 2),
+            edge(7, 6),
+            edge(5, 8),
+        ];
+        let layout = layout(&nodes, &edges);
+        let column = |id| layout.slots[&NodeId(id)].column;
+        assert_eq!(column(4), 2);
+        assert_eq!(column(7), 3, "the deepest subgoal right after the steps");
+        assert_eq!(column(6), 4, "a subgoal before the goal it serves");
+        assert_eq!(column(2), 5, "top-level goals last");
+        assert_eq!(column(8), 5, "top-level goals side by side");
+        for e in &edges {
+            let (s, t) = (layout.slots[&e.source], layout.slots[&e.target]);
+            assert!(s.x < t.x, "{e:?}: {s:?} → {t:?}");
+        }
+        assert_apart(&layout);
     }
 
     #[test]

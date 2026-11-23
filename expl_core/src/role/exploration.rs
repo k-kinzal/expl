@@ -199,6 +199,9 @@ fn schema(aiming: bool) -> serde_json::Value {
 struct Aim {
     goals: Vec<Node>,
     default: Vec<NodeId>,
+    /// Subgoals the starting point already looks to meet: stages reached,
+    /// so the work goes on past them toward the goals they serve.
+    reached: Vec<NodeId>,
 }
 
 impl Aim {
@@ -207,6 +210,7 @@ impl Aim {
         Self {
             goals: vec![goal.clone()],
             default: vec![goal.id],
+            reached: Vec::new(),
         }
     }
 
@@ -224,6 +228,7 @@ impl Aim {
         Ok(Self {
             goals,
             default: vec![goal.id],
+            reached: Vec::new(),
         })
     }
 
@@ -233,12 +238,18 @@ impl Aim {
         let goals = graph.goals()?;
         let ids: Vec<NodeId> = goals.iter().map(|g| g.id).collect();
         let default = graph.goal_tree()?.roots(&ids);
-        Ok(Self { goals, default })
+        Ok(Self {
+            goals,
+            default,
+            reached: Vec::new(),
+        })
     }
 
     /// The active goals `start` leads to (a subgoal brings the goals it
     /// serves); proposals that name none head for the most specific of
-    /// them. From the origin, or a step that leads to no active goal:
+    /// them that `start` does not already look to meet — a subgoal it meets
+    /// is a stage reached, and the work converges past it on the goals it
+    /// serves. From the origin, or a step that leads to no active goal:
     /// [`everywhere`](Self::everywhere).
     fn from(graph: &Graph, start: &Node) -> Result<Self, RoleError> {
         if start.kind == NodeKind::Origin {
@@ -253,8 +264,19 @@ impl Aim {
             return Self::everywhere(graph);
         }
         let ids: Vec<NodeId> = goals.iter().map(|g| g.id).collect();
-        let default = graph.goal_tree()?.leaves(&ids);
-        Ok(Self { goals, default })
+        let tree = graph.goal_tree()?;
+        let reached = reached_subgoals(graph, start, &ids, &tree)?;
+        let open: Vec<NodeId> = ids
+            .iter()
+            .filter(|id| !reached.contains(id))
+            .copied()
+            .collect();
+        let default = tree.leaves(if open.is_empty() { &ids } else { &open });
+        Ok(Self {
+            goals,
+            default,
+            reached,
+        })
     }
 
     fn is_empty(&self) -> bool {
@@ -281,6 +303,21 @@ impl Aim {
     fn describe(&self, graph: &Graph) -> Result<String, RoleError> {
         let tree = graph.goal_tree()?;
         let mut out = digest::numbered_goals(&self.goals, &tree);
+        if !self.reached.is_empty() {
+            let reached: Vec<String> = self
+                .reached
+                .iter()
+                .map(|id| format!("[{}]", id.0))
+                .collect();
+            let _ = write!(
+                out,
+                "\nThe work you start from already looks to meet subgoal{s} {list}: a stage \
+                 reached, not an end. Head past it, toward the goals it serves, unless a \
+                 sounder way to reach it is worth proposing.\n",
+                s = if reached.len() == 1 { "" } else { "s" },
+                list = reached.join(", "),
+            );
+        }
         if self.goals.len() > 1 {
             let default: Vec<String> = self
                 .default
@@ -296,6 +333,29 @@ impl Aim {
         }
         Ok(out)
     }
+}
+
+/// The subgoals among `goals` that completed step `start` looks to meet,
+/// by its latest verdict on each: goals that serve another of `goals`.
+fn reached_subgoals(
+    graph: &Graph,
+    start: &Node,
+    goals: &[NodeId],
+    tree: &crate::graph::GoalTree,
+) -> Result<Vec<NodeId>, RoleError> {
+    if start.kind != NodeKind::Step || start.status != NodeStatus::Completed {
+        return Ok(Vec::new());
+    }
+    let mut latest: BTreeMap<NodeId, bool> = BTreeMap::new();
+    for evaluation in graph.evaluations_of(start.id)? {
+        latest.insert(evaluation.goal, evaluation.satisfied);
+    }
+    Ok(goals
+        .iter()
+        .filter(|id| latest.get(id).copied().unwrap_or(false))
+        .filter(|id| tree.parents(**id).iter().any(|p| goals.contains(p)))
+        .copied()
+        .collect())
 }
 
 pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, RoleError> {
@@ -678,7 +738,8 @@ fn judgement(graph: &Graph, start: &Node) -> Result<String, RoleError> {
     for evaluation in latest.values() {
         let _ = writeln!(
             out,
-            "  Judged {}/100 ({}): {}",
+            "  Judged against [{}]: {}/100 ({}): {}",
+            evaluation.goal.0,
             evaluation.score,
             if evaluation.satisfied {
                 "satisfied"
@@ -1115,6 +1176,56 @@ mod tests {
     use super::*;
     use crate::event::Inbox;
     use crate::process::ProcessId;
+
+    #[test]
+    fn past_a_subgoal_met_the_work_converges_on_the_goal_it_serves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("expl.db");
+        let mut graph = Graph::open(&db).expect("graph");
+        let origin = graph
+            .create_origin("o", Some("main"), "abc")
+            .expect("origin");
+        let goal = graph.add_goal("g", "g", false, &[]).expect("goal");
+        let sub = graph.add_goal("s", "s", false, &[goal]).expect("sub");
+        let step = graph
+            .propose_step("toward s", "x", &[origin], &[sub])
+            .expect("step");
+        graph.plan_step(step, 1).expect("plan");
+        let delivery = Inbox::open(&db, "verifier")
+            .expect("inbox")
+            .lease(&[EventKind::NodeReady], ProcessId(1), false, 3)
+            .expect("lease")
+            .expect("node.ready");
+        assert!(graph.claim(step, &delivery.token).expect("claim"));
+        graph
+            .complete(step, &delivery.token, "done")
+            .expect("complete");
+        let completed = graph.node(step).expect("node");
+        // Not judged yet: the subgoal is still what it heads for.
+        let aim = Aim::from(&graph, &completed).expect("aim");
+        assert_eq!(aim.default, [sub]);
+        assert!(aim.reached.is_empty());
+        let verdict = |goal, satisfied| crate::graph::NewEvaluation {
+            goal,
+            satisfied,
+            score: if satisfied { 90 } else { 40 },
+            reason: String::new(),
+        };
+        graph
+            .record_evaluations(step, &[verdict(sub, true), verdict(goal, false)])
+            .expect("judge");
+        let aim = Aim::from(&graph, &completed).expect("aim");
+        assert_eq!(aim.reached, [sub]);
+        assert_eq!(aim.default, [goal], "past the subgoal, toward its goal");
+        let told = aim.describe(&graph).expect("describe");
+        assert!(told.contains(&format!("subgoal [{}]", sub.0)), "{told}");
+        // A goal met at the top stays the aim: better ways are still sought.
+        graph
+            .record_evaluations(step, &[verdict(sub, true), verdict(goal, true)])
+            .expect("judge");
+        let aim = Aim::from(&graph, &completed).expect("aim");
+        assert_eq!(aim.default, [goal]);
+    }
 
     #[test]
     fn a_survey_names_only_failed_steps_as_what_a_proposal_grew_from() {

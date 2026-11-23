@@ -3,7 +3,10 @@
 //!
 //! - **Nodes are dots.** State is brightness and shape: a hollow ring is
 //!   waiting (proposed, planned), a solid dot is realised, a rippling dot is
-//!   running, a speck is pruned. Goals are larger rings on the right.
+//!   running, a speck is pruned. Goals are larger rings on the right:
+//!   top-level goals in the last column, side by side, and subgoals —
+//!   stages on the way to them — a column before the goals they serve,
+//!   joined to them by a line, so a tree of subgoals converges on its goal.
 //!   Amber marks what satisfies a goal; red marks what failed.
 //! - **The trunk is the spine.** Origins — every position the default
 //!   branch has held — sit on one straight line, oldest on the left. The
@@ -27,7 +30,7 @@
 //!   step to each new hypothesis grown from its failure.
 //! - **Goals** are listed top right, with where the trunk stands on each
 //!   and the best hypothesis not adopted yet, subgoals indented under the
-//!   goals they serve (and joined to them by a faint line in the graph).
+//!   goals they serve.
 //!   Selecting a goal focuses the graph on it: what leads to it, and what
 //!   was judged against it.
 //! - **The trunk's history** is listed bottom right: each origin, newest

@@ -171,8 +171,22 @@ pub(crate) enum GoalCommand {
     Add(GoalAddArgs),
     /// List active goals (with --all, retired ones too).
     Ls(GoalLsArgs),
+    /// Place a goal under other goals, as a subgoal of each, or with no
+    /// --under back at the top level.
+    Nest(GoalNestArgs),
     /// Retire a goal (records `goal.retired`).
     Retire(PruneArgs),
+}
+
+/// `expl goal nest`.
+#[derive(Debug, Args)]
+pub(crate) struct GoalNestArgs {
+    /// The goal to place.
+    pub(crate) goal: NodeId,
+    /// The goals it is a subgoal of from now on, replacing the ones it had
+    /// (repeatable; none makes it a top-level goal).
+    #[arg(long, value_name = "GOAL")]
+    pub(crate) under: Vec<NodeId>,
 }
 
 /// `expl goal add`.

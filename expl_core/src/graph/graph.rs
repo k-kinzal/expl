@@ -592,6 +592,40 @@ impl Graph {
         Ok(id)
     }
 
+    /// Set which goals active goal `goal` is a subgoal of: exactly
+    /// `parents` (active goals), or none — a top-level goal — when empty.
+    /// Subgoals often become visible only after some exploration, so a goal
+    /// added on its own can be placed under another later, and moved back.
+    /// The tree is read afresh by every role, so no event is recorded.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError::NotInStatus`] when `goal` or a parent is not an active
+    /// goal; [`GraphError::Cycle`] when a parent is `goal` or one of its
+    /// subgoals. Nothing changes then.
+    pub fn set_goal_parents(&mut self, goal: NodeId, parents: &[NodeId]) -> Result<(), GraphError> {
+        let tx = self.write()?;
+        for id in std::iter::once(&goal).chain(parents) {
+            let node = node_in(&tx, *id)?;
+            if node.kind != NodeKind::Goal || node.status != NodeStatus::Active {
+                return Err(GraphError::NotInStatus {
+                    node: *id,
+                    expected: "an active goal",
+                });
+            }
+        }
+        tx.execute(
+            "DELETE FROM edges WHERE source_id = ?1 \
+             AND target_id IN (SELECT id FROM nodes WHERE kind = 'goal')",
+            params![goal.0],
+        )?;
+        for parent in parents {
+            connect_in(&tx, goal, *parent)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Propose a step with its edges, atomically. Records `node.proposed`.
     ///
     /// # Errors
@@ -2118,6 +2152,44 @@ mod tests {
         // And the trunk never takes in an investigation.
         let lineage = graph.lineage().expect("lineage");
         assert!(!lineage.in_trunk(question) && !lineage.in_trunk(on_change));
+    }
+
+    #[test]
+    fn a_goal_can_be_placed_under_another_later() {
+        let (mut graph, origin, goal) = seeded();
+        let other = graph.add_goal("other", "apart", false, &[]).expect("goal");
+        let sub = graph
+            .add_goal("sub", "a route", false, &[other])
+            .expect("sub");
+        let step = graph
+            .propose_step("s", "s", &[origin], &[other])
+            .expect("step");
+        graph.set_goal_parents(other, &[goal]).expect("nest");
+        let tree = graph.goal_tree().expect("tree");
+        assert_eq!(tree.ancestors(sub), [other, goal]);
+        // Steps keep heading where they headed.
+        assert!(
+            graph
+                .successors(step)
+                .expect("succ")
+                .iter()
+                .any(|n| n.id == other)
+        );
+        // No cycles, and only active goals.
+        assert!(matches!(
+            graph.set_goal_parents(goal, &[sub]),
+            Err(GraphError::Cycle { .. })
+        ));
+        assert!(matches!(
+            graph.set_goal_parents(other, &[step]),
+            Err(GraphError::NotInStatus { node, .. }) if node == step
+        ));
+        assert_eq!(graph.goal_tree().expect("tree").parents(other), [goal]);
+        // Back to a top-level goal.
+        graph.set_goal_parents(other, &[]).expect("unnest");
+        let tree = graph.goal_tree().expect("tree");
+        assert!(tree.parents(other).is_empty());
+        assert_eq!(tree.parents(sub), [other]);
     }
 
     #[test]
