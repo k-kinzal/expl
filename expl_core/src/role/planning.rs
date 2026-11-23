@@ -7,6 +7,12 @@
 //! while the agent works are neither planned nor covered; they wait, with
 //! their events, for the next planning.
 //!
+//! Planning judges a path by its whole route — from the origin through the
+//! subgoals it passes to its goal. It is shown how far each route has come
+//! (what already meets each goal and subgoal, and which open steps go on
+//! past a subgoal that is met), and a path may name the subgoals it passes
+//! as waypoints among its steps.
+//!
 //! Planning combines paths: a `join` makes an open step also build on other
 //! steps (`A → C`, `B → C`), so its branch starts from their merge.
 //! Exploration only ever proposes steps from one node; combinations are
@@ -108,7 +114,7 @@ fn schema() -> serde_json::Value {
                     "required": ["goal", "nodes", "rationale"],
                     "properties": {
                         "goal": {"type": "integer", "description": "Goal id."},
-                        "nodes": {"type": "array", "items": {"type": "integer"}, "description": "Step ids in the order they are verified (omit origin and goal)."},
+                        "nodes": {"type": "array", "items": {"type": "integer"}, "description": "Step ids in the order they are verified (omit origin and goal); a subgoal of the goal the path passes through goes, by its id, where the steps before it reach it."},
                         "rationale": {"type": "string"}
                     }
                 }
@@ -179,21 +185,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     };
     let open = |id: NodeId| is_open(shown.node(id)) && is_open(now.iter().find(|n| n.id == id));
 
-    let paths: Vec<PlannedPath> = response
-        .paths
-        .into_iter()
-        .filter(|p| kind_of(NodeId(p.goal)) == Some(NodeKind::Goal))
-        .map(|p| PlannedPath {
-            goal: NodeId(p.goal),
-            nodes: p
-                .nodes
-                .into_iter()
-                .map(NodeId)
-                .filter(|id| kind_of(*id) == Some(NodeKind::Step))
-                .collect(),
-            rationale: p.rationale,
-        })
-        .collect();
+    let paths = planned_paths(response.paths, &shown);
     let plan = graph.record_plan(&response.summary, &paths)?;
 
     let mut pruned = Vec::new();
@@ -281,17 +273,49 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     }))
 }
 
+/// The paths an agent stated, kept to what `shown` holds: each to a goal,
+/// through steps — with the subgoals of that goal it passes through as
+/// waypoints where they are reached.
+fn planned_paths(paths: Vec<PathResponse>, shown: &Snapshot) -> Vec<PlannedPath> {
+    let tree = GoalTree::of(&shown.nodes, &shown.edges);
+    let kind_of = |id: NodeId| shown.node(id).map(|n| n.kind);
+    paths
+        .into_iter()
+        .filter(|p| kind_of(NodeId(p.goal)) == Some(NodeKind::Goal))
+        .map(|p| {
+            let goal = NodeId(p.goal);
+            PlannedPath {
+                goal,
+                nodes: p
+                    .nodes
+                    .into_iter()
+                    .map(NodeId)
+                    .filter(|id| match kind_of(*id) {
+                        Some(NodeKind::Step) => true,
+                        Some(NodeKind::Goal) => tree.ancestors(*id).contains(&goal),
+                        Some(NodeKind::Origin) | None => false,
+                    })
+                    .collect(),
+                rationale: p.rationale,
+            }
+        })
+        .collect()
+}
+
 /// The prompt: the goals and the steps toward them in `shown` — what
 /// planning works on. Its previous plan is left out, so each plan starts
 /// from the steps as they stand.
 fn prompt(reaction: &Reaction<'_>, shown: &Snapshot, schema: &serde_json::Value) -> Prompt {
+    let tree = GoalTree::of(&shown.nodes, &shown.edges);
     Prompt::from(format!(
         "## Task\n\n\
          Below are goals and the steps that could lead to them: each step's state, what it \
          builds on (`after`) and leads to (`before`), and how completed steps were judged \
          against the goals. Decide where effort goes next.\n\n\
          - `paths`: for each goal, the most promising combinations of steps that could reach \
-           it, in order. Several paths per goal are welcome; paths may share and merge steps.\n\
+           it, in order. Several paths per goal are welcome; paths may share and merge steps. \
+           A path to a goal may pass through its subgoals: list each subgoal it passes, by id, \
+           right after the steps that reach it, then the steps that go on from there.\n\
          - `priorities`: an integer for every `proposed` step and for any `planned` step whose \
            priority should change. Higher goes first. A planned step starts as soon as the \
            steps it builds on are completed.\n\
@@ -320,13 +344,55 @@ fn prompt(reaction: &Reaction<'_>, shown: &Snapshot, schema: &serde_json::Value)
          steps on paths whose judgements are improving with untried alternatives. Subgoals \
          are hypotheses about routes toward the goals they serve: favour paths through the \
          most promising subgoals, keep alternatives to them alive, and remember that a goal \
-         can be reached without any of its subgoals. Do not modify files in the working \
-         directory.\n\
-         \n## Goals\n\n{goals}\n## Steps\n\n{graph}{instructions}{response}",
-        goals = digest::numbered_goals(&shown.goals(), &GoalTree::of(&shown.nodes, &shown.edges)),
+         can be reached without any of its subgoals.\n\n\
+         Judge a path by its whole route — from the origin through the subgoals it passes to \
+         its goal — not step by step. `## Routes` shows how far each route has come. A \
+         subgoal already met is a stage behind the work: steps past it, built on what meets \
+         it and heading on for the goals it serves, carry a route that is partly realised and \
+         usually deserve a higher priority than steps still circling it; another step toward \
+         a subgoal already met needs a reason (simpler, sounder, or met where the first was \
+         not). A route with no stage met yet is still worth keeping alive at a lower priority. \
+         Do not modify files in the working directory.\n\
+         \n## Goals\n\n{goals}\n## Routes\n\n{routes}\n## Steps\n\n{graph}{instructions}{response}",
+        goals = digest::numbered_goals(&shown.goals(), &tree),
+        routes = digest::routes(shown, &tree),
         graph = digest::graph(shown),
         kinds = digest::STEP_KINDS,
         instructions = super::instructions_section(reaction.agent()),
         response = super::response_section(schema),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_path_passes_only_through_subgoals_of_its_goal() {
+        let mut graph = Graph::in_memory().expect("graph");
+        let origin = graph.create_origin("o", None, "abc").expect("origin");
+        let goal = graph.add_goal("g", "g", false, &[]).expect("goal");
+        let sub = graph.add_goal("s", "s", false, &[goal]).expect("sub");
+        let apart = graph.add_goal("a", "a", false, &[]).expect("apart");
+        let first = graph
+            .propose_step("first", "x", &[origin], &[sub])
+            .expect("step");
+        let then = graph
+            .propose_step("then", "x", &[first], &[goal])
+            .expect("step");
+        let shown = graph.snapshot().expect("snapshot");
+        let path = |goal: NodeId| PathResponse {
+            goal: goal.0,
+            nodes: vec![origin.0, first.0, sub.0, apart.0, then.0, 9999],
+            rationale: String::new(),
+        };
+        let paths = planned_paths(vec![path(goal), path(sub), path(NodeId(first.0))], &shown);
+        assert_eq!(paths.len(), 2, "a path ends at a goal");
+        assert_eq!(paths[0].nodes, [first, sub, then], "through its subgoal");
+        assert_eq!(
+            paths[1].nodes,
+            [first, then],
+            "a subgoal has none of its own here"
+        );
+    }
 }

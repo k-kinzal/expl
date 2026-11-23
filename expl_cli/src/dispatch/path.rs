@@ -29,7 +29,15 @@ pub(crate) fn ls(start: &Path, listing: &ListingArgs) -> Result<(), CliError> {
     status(&format!("plan {}: {}", plan.id.0, clip(&plan.summary, 200)));
     let mut table = Table::new(&["GOAL", "PATH", "RATIONALE"]);
     for path in &plan.paths {
-        let nodes: Vec<String> = path.nodes.iter().map(ToString::to_string).collect();
+        // Subgoals the path passes through show as `[id]`.
+        let nodes: Vec<String> = path
+            .nodes
+            .iter()
+            .map(|id| match graph.node(*id) {
+                Ok(node) if node.kind == expl_core::NodeKind::Goal => format!("[{}]", id.0),
+                _ => id.to_string(),
+            })
+            .collect();
         table.row(vec![
             path.goal.to_string(),
             nodes.join(" → "),

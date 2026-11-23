@@ -1,9 +1,11 @@
 //! Rendering the graph as text for prompts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
-use crate::graph::{Conclusion, Decision, Evaluation, GoalTree, Node, NodeId, NodeKind, Snapshot};
+use crate::graph::{
+    Conclusion, Decision, Evaluation, GoalTree, Node, NodeId, NodeKind, NodeStatus, Snapshot,
+};
 
 /// Longest excerpt of free text (step objectives, outcomes, reasons) quoted per node.
 const EXCERPT: usize = 600;
@@ -75,7 +77,7 @@ pub(crate) const STEP_KINDS: &str = "Steps come in two kinds. A `change` step ch
 pub(crate) fn findings(nodes: &[Node]) -> String {
     let mut out = String::new();
     for node in nodes {
-        if node.investigation && node.status == crate::graph::NodeStatus::Completed {
+        if node.investigation && node.status == NodeStatus::Completed {
             let answer = node.answer.map_or("unknown", |a| a.as_str());
             let _ = writeln!(out, "- {} — {}: {answer}", node.id, node.title);
             if let Some(evidence) = &node.outcome {
@@ -171,6 +173,147 @@ pub(crate) fn numbered_goals(goals: &[Node], tree: &GoalTree) -> String {
     out
 }
 
+/// Most steps a route names in one list; the rest are counted.
+const ROUTE_LIST: usize = 12;
+
+/// How far each route toward the active goals of `snapshot` has come, in
+/// tree order: what already looks to meet each goal (the trunk, or
+/// completed steps by their latest verdict), how many open steps head for
+/// it, and — for a subgoal that is met — the open steps built on what
+/// meets it, which carry the route on toward the goals it serves. Empty
+/// without active goals.
+pub(crate) fn routes(snapshot: &Snapshot, tree: &GoalTree) -> String {
+    let goals = snapshot.goals();
+    if goals.is_empty() {
+        return String::new();
+    }
+    let mut latest: BTreeMap<(NodeId, NodeId), &Evaluation> = BTreeMap::new();
+    for evaluation in &snapshot.evaluations {
+        latest.insert((evaluation.node, evaluation.goal), evaluation);
+    }
+    let status = |id: NodeId| snapshot.node(id).map(|n| (n.kind, n.status));
+    let open = |id: NodeId| {
+        matches!(
+            status(id),
+            Some((
+                NodeKind::Step,
+                NodeStatus::Proposed | NodeStatus::Planned | NodeStatus::Running
+            ))
+        )
+    };
+    let mut succs: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+    let mut toward: BTreeMap<NodeId, usize> = BTreeMap::new();
+    for edge in &snapshot.edges {
+        match status(edge.target).map(|(kind, _)| kind) {
+            Some(NodeKind::Step) => succs.entry(edge.source).or_default().push(edge.target),
+            Some(NodeKind::Goal) if open(edge.source) => {
+                *toward.entry(edge.target).or_default() += 1;
+            }
+            _ => {}
+        }
+    }
+    let trunk = snapshot
+        .nodes
+        .iter()
+        .find(|n| n.kind == NodeKind::Origin && n.status == NodeStatus::Active)
+        .map(|n| n.id);
+    let priority = |id: &NodeId| snapshot.node(*id).map_or(0, |n| n.priority);
+    let listed = |mut ids: Vec<NodeId>, by: &dyn Fn(&NodeId) -> i64| {
+        ids.sort_by_key(|id| (std::cmp::Reverse(by(id)), *id));
+        let more = ids.len().saturating_sub(ROUTE_LIST);
+        let mut text = ids
+            .iter()
+            .take(ROUTE_LIST)
+            .map(|id| format!("{id} ({})", by(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if more > 0 {
+            let _ = write!(text, ", +{more} more");
+        }
+        text
+    };
+
+    let mut out = String::new();
+    let refs: Vec<&Node> = goals.iter().collect();
+    for goal in tree.ordered(&refs) {
+        let met = |node: NodeId| latest.get(&(node, goal.id)).is_some_and(|e| e.satisfied);
+        let reaching: Vec<NodeId> = snapshot
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Step && n.status == NodeStatus::Completed)
+            .map(|n| n.id)
+            .filter(|id| met(*id))
+            .collect();
+        let in_trunk = trunk.is_some_and(met);
+        let depth = tree.ancestors(goal.id).len().min(tree.depth(goal.id));
+        let indent = "  ".repeat(depth);
+        let parents = tree.parents(goal.id);
+        let _ = write!(out, "{indent}- [{}] {}", goal.id.0, goal.title);
+        if !parents.is_empty() {
+            let list: Vec<String> = parents.iter().map(|p| format!("[{}]", p.0)).collect();
+            let _ = write!(out, " (subgoal of {})", list.join(", "));
+        }
+        out.push('\n');
+        let score = |id: &NodeId| latest.get(&(*id, goal.id)).map_or(0, |e| e.score);
+        let _ = writeln!(
+            out,
+            "{indent}  met by: {}{}",
+            if in_trunk {
+                "the trunk (active origin); "
+            } else {
+                ""
+            },
+            if reaching.is_empty() {
+                "no step".to_owned()
+            } else {
+                format!("steps {} (score)", listed(reaching.clone(), &score))
+            },
+        );
+        let _ = writeln!(
+            out,
+            "{indent}  open steps heading for it: {}",
+            toward.get(&goal.id).copied().unwrap_or(0)
+        );
+        if parents.is_empty() {
+            continue;
+        }
+        if in_trunk {
+            let _ = writeln!(
+                out,
+                "{indent}  past it: everything that builds on the active origin"
+            );
+        } else if !reaching.is_empty() {
+            let mut past: BTreeSet<NodeId> = BTreeSet::new();
+            let mut stack = reaching.clone();
+            let mut seen: BTreeSet<NodeId> = BTreeSet::new();
+            while let Some(id) = stack.pop() {
+                if !seen.insert(id) {
+                    continue;
+                }
+                for next in succs.get(&id).into_iter().flatten() {
+                    if open(*next) {
+                        past.insert(*next);
+                    }
+                    stack.push(*next);
+                }
+            }
+            let _ = writeln!(
+                out,
+                "{indent}  open steps past it, built on what meets it: {}",
+                if past.is_empty() {
+                    "none yet".to_owned()
+                } else {
+                    format!(
+                        "{} (priority)",
+                        listed(past.into_iter().collect(), &priority)
+                    )
+                }
+            );
+        }
+    }
+    out
+}
+
 /// The steps for planning: every non-pruned node of `snapshot` with its
 /// edges, outcome, and latest evaluation per goal.
 pub(crate) fn graph(snapshot: &Snapshot) -> String {
@@ -199,7 +342,7 @@ pub(crate) fn graph(snapshot: &Snapshot) -> String {
     let mut out = String::new();
     let mut pruned = Vec::new();
     for node in &snapshot.nodes {
-        if node.status == crate::graph::NodeStatus::Pruned {
+        if node.status == NodeStatus::Pruned {
             pruned.push(node.id.to_string());
             continue;
         }
@@ -454,5 +597,81 @@ mod tests {
             assert!(rendered.contains(&format!("    {label}{}…\n", &value[..EXCERPT])));
             assert!(!rendered.contains(&value));
         }
+    }
+
+    #[test]
+    fn routes_show_what_meets_each_subgoal_and_what_goes_on_past_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("expl.db");
+        let mut graph = Graph::open(&db).expect("graph");
+        let origin = graph.create_origin("Start", None, "abc").expect("origin");
+        let goal = graph.add_goal("Goal", "g", false, &[]).expect("goal");
+        let sub = graph.add_goal("Sub", "s", false, &[goal]).expect("sub");
+        let other = graph.add_goal("Other", "o", false, &[goal]).expect("other");
+        let reach = graph
+            .propose_step("reach", "x", &[origin], &[sub])
+            .expect("step");
+        let circling = graph
+            .propose_step("circling", "x", &[origin], &[sub])
+            .expect("step");
+        graph.plan_step(reach, 1).expect("plan");
+        let delivery = Inbox::open(&db, "verifier")
+            .expect("inbox")
+            .lease(&[EventKind::NodeReady], ProcessId(1), false, 3)
+            .expect("lease")
+            .expect("node.ready");
+        assert!(graph.claim(reach, &delivery.token).expect("claim"));
+        graph
+            .complete(reach, &delivery.token, "done")
+            .expect("complete");
+        graph
+            .record_evaluations(
+                reach,
+                &[
+                    NewEvaluation {
+                        goal: sub,
+                        satisfied: true,
+                        score: 90,
+                        reason: String::new(),
+                    },
+                    NewEvaluation {
+                        goal,
+                        satisfied: false,
+                        score: 40,
+                        reason: String::new(),
+                    },
+                ],
+            )
+            .expect("evaluation");
+        let past = graph
+            .propose_step("past", "x", &[reach], &[goal])
+            .expect("step");
+        graph.plan_step(past, 7).expect("plan");
+
+        let snapshot = graph.snapshot().expect("snapshot");
+        let tree = GoalTree::of(&snapshot.nodes, &snapshot.edges);
+        let routes = routes(&snapshot, &tree);
+        let at = |needle: &str| {
+            routes
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {routes}"))
+        };
+        // In tree order, the goal's own line first.
+        assert!(at(&format!("- [{}] Goal", goal.0)) < at(&format!("  - [{}] Sub", sub.0)));
+        assert!(
+            routes.contains(&format!("met by: steps {reach} (90)")),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(&format!(
+                "open steps past it, built on what meets it: {past} (7)"
+            )),
+            "{routes}"
+        );
+        // Unmet: no step meets it, and nothing is past it.
+        let other_part = &routes[at(&format!("[{}] Other", other.0))..];
+        assert!(other_part.contains("met by: no step"), "{routes}");
+        assert!(!other_part.contains("past it"), "{routes}");
+        assert!(!routes.contains(&format!("{circling} (")), "{routes}");
     }
 }
