@@ -983,7 +983,7 @@ mod tests {
             let node = self.graph.node(self.step).expect("node");
             let origin = self.graph.origin().expect("origin");
             self.workspaces
-                .create(&node, &LeaseToken::for_test(attempt), &[origin], trunk)
+                .create(&node, &crate::event::test_token(attempt), &[origin], trunk)
         }
 
         /// A branch `name` at a commit of its own, not checked out.
@@ -1117,7 +1117,7 @@ mod tests {
         );
         assert!(
             !fx.workspaces
-                .path_of(fx.step, &LeaseToken::for_test(1))
+                .path_of(fx.step, &crate::event::test_token(1))
                 .exists()
         );
     }
@@ -1136,7 +1136,7 @@ mod tests {
         assert_eq!(fx.tip("expl"), blocker);
         assert!(
             !fx.workspaces
-                .path_of(fx.step, &LeaseToken::for_test(1))
+                .path_of(fx.step, &crate::event::test_token(1))
                 .exists()
         );
     }
@@ -1168,7 +1168,7 @@ mod tests {
         let mut workspace = workspaces
             .create(
                 &graph.node(step).expect("step node"),
-                &LeaseToken::for_test(1),
+                &crate::event::test_token(1),
                 &[origin],
                 &[],
             )
@@ -1281,7 +1281,7 @@ mod tests {
             let mut workspace = workspaces
                 .create(
                     &graph.node(step).expect("step node"),
-                    &LeaseToken::for_test(1),
+                    &crate::event::test_token(1),
                     &[origin],
                     &[],
                 )
@@ -1408,7 +1408,7 @@ mod tests {
         let workspace = workspaces
             .create(
                 &graph.node(step).expect("step node"),
-                &LeaseToken::for_test(1),
+                &crate::event::test_token(1),
                 &[origin],
                 &[],
             )
@@ -1517,7 +1517,7 @@ mod tests {
         let workspace = workspaces
             .create(
                 &graph.node(step).expect("step node"),
-                &LeaseToken::for_test(1),
+                &crate::event::test_token(1),
                 &[origin],
                 &[],
             )

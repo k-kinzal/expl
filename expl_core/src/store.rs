@@ -3,12 +3,11 @@
 //! its weighted assignments), and the
 //! [`Processes`](crate::process::Processes) table.
 //!
-//! Every expl process opens its own connection. WAL mode lets readers run
-//! beside the single writer, and the busy timeout makes concurrent writers
-//! wait instead of failing.
+//! The runtime opens the file ([`expl_runtime::store::open`]) and owns the
+//! shape of the event log, deliveries and assignments; the migrations here
+//! create them along with the graph's own tables.
 
 use std::path::Path;
-use std::time::Duration;
 
 use rusqlite::Connection;
 
@@ -229,7 +228,34 @@ ALTER TABLE processes ADD COLUMN resume INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE processes ADD COLUMN run_once INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE processes ADD COLUMN exit_when_idle INTEGER NOT NULL DEFAULT 0;
 ",
+    EVENT_LOG_MIGRATION,
 ];
+
+const EVENT_LOG_MIGRATION: &str = r"
+-- The event log takes the shape the runtime delivers from, for any
+-- explorer: an event is about a subject (here, a node), may carry a
+-- payload, and has a priority that orders its delivery. A `node.ready`
+-- event carries its step's current priority, so the most promising step is
+-- verified first however long ago it became ready.
+ALTER TABLE events RENAME COLUMN node_id TO subject;
+ALTER TABLE events ADD COLUMN payload TEXT;
+ALTER TABLE events ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+UPDATE events SET priority = COALESCE(
+    (SELECT n.priority FROM nodes n WHERE n.id = events.subject), 0)
+WHERE kind = 'node.ready';
+CREATE TRIGGER events_ready_priority AFTER INSERT ON events
+WHEN NEW.kind = 'node.ready' AND NEW.subject IS NOT NULL
+BEGIN
+    UPDATE events SET priority = COALESCE(
+        (SELECT n.priority FROM nodes n WHERE n.id = NEW.subject), 0)
+    WHERE id = NEW.id;
+END;
+CREATE TRIGGER nodes_priority_ready AFTER UPDATE OF priority ON nodes
+BEGIN
+    UPDATE events SET priority = NEW.priority
+    WHERE subject = NEW.id AND kind = 'node.ready';
+END;
+";
 
 const CONCLUSIONS_MIGRATION: &str = r"
 -- What evaluation concluded about a step it judged, before (and apart
@@ -266,43 +292,18 @@ CREATE UNIQUE INDEX deliveries_token ON deliveries (lease_token) WHERE lease_tok
 ///
 /// [`StoreError`] on SQLite failure or a too-new schema.
 pub fn open(path: &Path) -> Result<Connection, StoreError> {
-    let mut conn = Connection::open(path)?;
-    conn.busy_timeout(Duration::from_secs(30))?;
-    let shared = path
-        .parent()
-        .is_some_and(|dir| dir.join("cluster").is_file());
-    journal(&conn, if shared { "DELETE" } else { "WAL" })?;
-    if shared {
-        conn.pragma_update(None, "synchronous", "FULL")?;
-    }
-    conn.pragma_update(None, "foreign_keys", true)?;
+    let mut conn = expl_runtime::store::open(path)?;
     migrate(&mut conn)?;
     Ok(conn)
 }
 
-/// Use rollback journaling on clustered storage. The WAL index is only
-/// shared by processes on one host. Switching modes needs exclusive access;
-/// SQLite can report a busy database at once rather than waiting, so a process
-/// opening it alongside another retries for as long as the busy timeout.
-fn journal(conn: &Connection, mode: &'static str) -> Result<(), StoreError> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        match conn
-            .pragma_update_and_check(None, "journal_mode", mode, |row| row.get::<_, String>(0))
-        {
-            Err(rusqlite::Error::SqliteFailure(error, _))
-                if error.code == rusqlite::ErrorCode::DatabaseBusy
-                    && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(Duration::from_millis(20));
+impl From<expl_runtime::store::StoreError> for StoreError {
+    fn from(error: expl_runtime::store::StoreError) -> Self {
+        match error {
+            expl_runtime::store::StoreError::Sqlite(error) => Self::Sqlite(error),
+            expl_runtime::store::StoreError::JournalMode { expected, actual } => {
+                Self::JournalMode { expected, actual }
             }
-            Ok(actual) if !actual.eq_ignore_ascii_case(mode) => {
-                return Err(StoreError::JournalMode {
-                    expected: mode,
-                    actual,
-                });
-            }
-            result => return result.map(drop).map_err(StoreError::from),
         }
     }
 }
@@ -374,7 +375,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("project directory");
         let path = dir.path().join("expl.db");
         let conn = Connection::open(&path).expect("database");
-        let version = MIGRATIONS.len() - 1;
+        let version = MIGRATIONS
+            .iter()
+            .position(|sql| sql.contains("ADD COLUMN resume"))
+            .expect("the daemon migration");
         for sql in &MIGRATIONS[..version] {
             conn.execute_batch(sql).expect("old migration");
         }
@@ -401,6 +405,66 @@ mod tests {
             )
             .expect("new columns");
         assert_eq!(columns, 3);
+    }
+
+    #[test]
+    fn an_older_event_log_gains_subjects_and_ready_events_follow_their_step() {
+        let dir = tempfile::tempdir().expect("project directory");
+        let path = dir.path().join("expl.db");
+        let conn = Connection::open(&path).expect("database");
+        let version = MIGRATIONS
+            .iter()
+            .position(|sql| *sql == EVENT_LOG_MIGRATION)
+            .expect("the event log migration");
+        for sql in &MIGRATIONS[..version] {
+            conn.execute_batch(sql).expect("old migration");
+        }
+        conn.pragma_update(None, "user_version", version as i64)
+            .expect("old version");
+        conn.execute_batch(
+            "INSERT INTO nodes (id, kind, status, title, objective, priority)
+                 VALUES (7, 'step', 'planned', 'a', 'a', 40), (8, 'step', 'planned', 'b', 'b', 5);
+             INSERT INTO events (kind, node_id) VALUES ('node.proposed', 7), ('node.ready', 7);",
+        )
+        .expect("an existing log");
+        drop(conn);
+
+        let conn = open(&path).expect("migrate");
+        let log = |conn: &Connection| -> Vec<(String, Option<i64>, i64)> {
+            conn.prepare("SELECT kind, subject, priority FROM events ORDER BY id")
+                .expect("query")
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .expect("rows")
+                .collect::<Result<_, _>>()
+                .expect("events")
+        };
+        // Only a ready event takes its step's priority.
+        assert_eq!(
+            log(&conn),
+            [
+                ("node.proposed".to_owned(), Some(7), 0),
+                ("node.ready".to_owned(), Some(7), 40)
+            ]
+        );
+        // A step that becomes ready later, and one whose priority changes.
+        conn.execute_batch(
+            "INSERT INTO events (kind, subject) VALUES ('node.ready', 8), ('goal.added', NULL);
+             UPDATE nodes SET priority = 90 WHERE id = 7;",
+        )
+        .expect("new events");
+        assert_eq!(
+            log(&conn)
+                .into_iter()
+                .map(|(_, subject, priority)| (subject, priority))
+                .collect::<Vec<_>>(),
+            [(Some(7), 0), (Some(7), 90), (Some(8), 5), (None, 0)]
+        );
+        let payload: Option<String> = conn
+            .query_row("SELECT payload FROM events WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("payload column");
+        assert_eq!(payload, None);
     }
 
     #[test]

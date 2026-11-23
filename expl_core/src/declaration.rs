@@ -13,11 +13,9 @@ use crate::handler::Handler;
 use crate::project::Project;
 
 pub use expl_runtime::command::{CliDeclaration, Timeout, TimeoutError};
-
-mod routing;
-
-pub(crate) use routing::Route;
-pub use routing::{RouterDeclaration, RoutingPolicy};
+pub(crate) use expl_runtime::registration::Route;
+use expl_runtime::registration::{ConsumerRegistration, Registration};
+pub use expl_runtime::registration::{RouterDeclaration, RoutingPolicy};
 
 /// Reading or validating `expl.toml` failed.
 #[derive(Debug, Error)]
@@ -74,6 +72,10 @@ pub struct Declaration {
     pub router: BTreeMap<String, RouterDeclaration>,
     /// Name of each consumer group and its routing target.
     pub routing: BTreeMap<String, String>,
+    /// What the runtime delivers by: the consumers' subscriptions, groups
+    /// and limits, and the routers, as loaded.
+    #[serde(skip)]
+    registration: Registration,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +138,16 @@ impl DeclarationFile {
             }
             self.consumer = self.agent;
         }
+        let registration = Registration {
+            consumer: self
+                .consumer
+                .iter()
+                .map(|(name, consumer)| (name.clone(), consumer.registration()))
+                .collect(),
+            router: self.router.clone(),
+            routing: self.routing.clone(),
+            ..Registration::default()
+        };
         let declaration = Declaration {
             trunk: self.trunk,
             workspace: self.workspace,
@@ -143,6 +155,7 @@ impl DeclarationFile {
             consumer: self.consumer,
             router: self.router,
             routing: self.routing,
+            registration,
         };
         declaration.validate()?;
         Ok(declaration)
@@ -247,6 +260,24 @@ pub enum Scope {
 }
 
 impl ConsumerDeclaration {
+    /// What the runtime needs to deliver this consumer's events: its
+    /// subscription, group and limits.
+    fn registration(&self) -> ConsumerRegistration {
+        ConsumerRegistration {
+            on: self
+                .on
+                .iter()
+                .map(|kind| kind.as_str().to_owned())
+                .collect(),
+            group: self.group.clone(),
+            replicas: self.replicas,
+            concurrency: self.concurrency,
+            exclusive: self.handler.is_exclusive(),
+            coalesce: self.handler.coalesces(),
+            ..ConsumerRegistration::default()
+        }
+    }
+
     /// Inline routing weight of a legacy consumer, if declared.
     #[must_use]
     pub fn legacy_weight(&self) -> Option<u32> {
@@ -484,7 +515,26 @@ concurrency = 1
                 }
             }
         }
-        self.validate_routing()
+        self.registration
+            .validate()
+            .map_err(|error| DeclarationError::Invalid(error.to_string()))
+    }
+
+    /// The consumers' subscriptions, groups and limits, and the routers,
+    /// as the runtime delivers by them.
+    #[must_use]
+    pub fn registration(&self) -> &Registration {
+        &self.registration
+    }
+
+    /// Whether this consumer is reachable through its delivery group's router.
+    #[must_use]
+    pub fn is_assigned(&self, name: &str) -> bool {
+        self.registration.is_assigned(name)
+    }
+
+    pub(crate) fn route_for(&self, name: &str) -> Option<Route<'_>> {
+        self.registration.route_for(name)
     }
 
     /// When the agent named `agent` shares its role's events by weight,
@@ -625,8 +675,8 @@ execution = "check"
         let declaration = Declaration::parse(config).expect("legacy declaration");
         assert_eq!(declaration.consumer["check"].on, [EventKind::NodeReady]);
         let route = declaration.route_for("check").expect("route");
-        assert_eq!(route.group, "verification");
-        assert_eq!(route.select(EventKind::NodeReady, EventId(1)), "check");
+        assert_eq!(route.group(), "verification");
+        assert_eq!(route.select("node.ready", EventId(1)), "check");
     }
 
     #[test]
@@ -688,6 +738,98 @@ execution = "check"
         );
         let error = Declaration::parse(&empty).expect_err("empty command");
         assert!(error.to_string().contains("`command` is empty"), "{error}");
+    }
+
+    const ROUTERS: &str = r#"
+[routing]
+exploration = "all"
+verification = "all"
+
+[router.all]
+targets = ["verifier", "explorers"]
+policy = "first"
+concurrency = 2
+
+[router.explorers]
+targets = ["explorer", "fringe"]
+policy = "weighted"
+weights = { explorer = 4 }
+concurrency = 1
+
+[consumer.fringe]
+on = ["goal.added"]
+handler = "exploration"
+group = "exploration"
+driver = "generic"
+command = ["fringe"]
+replicas = 1
+breadth = 2
+"#;
+
+    fn template_with_groups() -> String {
+        Declaration::TEMPLATE
+            .replace(
+                "handler = \"exploration\"",
+                "handler = \"exploration\"\ngroup = \"exploration\"",
+            )
+            .replace(
+                "handler = \"verification\"",
+                "handler = \"verification\"\ngroup = \"verification\"",
+            )
+    }
+
+    #[test]
+    fn nested_routing_applies_policies_after_filtering_for_the_event_and_group() {
+        let declaration = Declaration::parse(&format!("{}{ROUTERS}", template_with_groups()))
+            .expect("declaration");
+        let exploration = declaration.route_for("explorer").expect("route");
+        let verification = declaration.route_for("verifier").expect("route");
+        let fringes = (1..=4000)
+            .filter(|id| exploration.select("goal.added", EventId(*id)) == "fringe")
+            .count();
+        assert!((700..900).contains(&fringes), "{fringes}");
+        assert_eq!(verification.select("node.ready", EventId(1)), "verifier");
+        for id in 1..=100 {
+            assert_eq!(
+                exploration.select("node.evaluated", EventId(id)),
+                "explorer"
+            );
+        }
+        assert_eq!(
+            exploration
+                .groups("explorer")
+                .map(|(name, n)| (name, n.get()))
+                .collect::<Vec<_>>(),
+            [("all", 2), ("explorers", 1)]
+        );
+        assert_eq!(verification.groups("verifier").count(), 1);
+    }
+
+    #[test]
+    fn routing_rejects_invalid_graphs_and_limits() {
+        let base = format!("{}{ROUTERS}", template_with_groups());
+        for (from, to, problem) in [
+            (
+                "\"verifier\", \"explorers\"",
+                "\"missing\"",
+                "unknown routing target",
+            ),
+            (
+                "\"explorer\", \"fringe\"",
+                "\"explorer\", \"fringe\", \"all\"",
+                "router cycle",
+            ),
+            (
+                "exploration = \"all\"",
+                "exploration = \"verifier\"",
+                "no consumer in this group",
+            ),
+            ("explorer = 4", "explorer = 0", "weights"),
+            ("concurrency = 2", "concurrency = 0", "concurrency"),
+        ] {
+            let error = Declaration::parse(&base.replacen(from, to, 1)).expect_err(problem);
+            assert!(error.to_string().contains(problem), "{error}");
+        }
     }
 
     fn with_timeouts(agent: &str, alternative: &str) -> Result<Declaration, DeclarationError> {

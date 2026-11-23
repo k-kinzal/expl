@@ -1164,7 +1164,7 @@ fn losing_the_lease_interrupts_the_reaction() {
         .query_row(
             "SELECT status, process_id, lease_token FROM deliveries \
              WHERE agent = 'verifier' AND event_id = (SELECT MAX(id) FROM events \
-             WHERE kind = 'node.ready' AND node_id = ?1)",
+             WHERE kind = 'node.ready' AND subject = ?1)",
             [a.parse::<i64>().expect("id")],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )

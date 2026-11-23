@@ -25,3 +25,10 @@ pub use consumer::Consumer;
 pub use event::{Event, EventId, EventKind};
 pub(crate) use inbox::Lease;
 pub use inbox::{Delivery, Inbox, InboxError, LEASE_SECONDS, LeaseToken};
+
+/// A deterministic lease token for tests that create worktrees without an
+/// inbox.
+#[cfg(test)]
+pub(crate) fn test_token(value: u128) -> LeaseToken {
+    LeaseToken::new(format!("{value:032x}"))
+}

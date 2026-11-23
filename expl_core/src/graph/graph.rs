@@ -166,7 +166,7 @@ fn emit(conn: &Connection, kind: EventKind, node: Option<NodeId>) -> Result<(), 
 
     let headers = crate::telemetry::inject();
     conn.execute(
-        "INSERT INTO events (kind, node_id, traceparent, tracestate) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO events (kind, subject, traceparent, tracestate) VALUES (?1, ?2, ?3, ?4)",
         params![
             kind.as_str(),
             node.map(|n| n.0),
@@ -355,7 +355,7 @@ fn orphaned() -> String {
     format!(
         "n.kind = 'step' AND n.status = 'running' AND NOT EXISTS ( \
              SELECT 1 FROM deliveries d JOIN events e ON e.id = d.event_id \
-             WHERE e.node_id = n.id AND e.kind = '{ready}' AND d.status = 'leased')",
+             WHERE e.subject = n.id AND e.kind = '{ready}' AND d.status = 'leased')",
         ready = EventKind::NodeReady.as_str(),
     )
 }
@@ -968,7 +968,7 @@ impl Graph {
             &format!(
                 "SELECT EXISTS (SELECT 1 FROM deliveries d JOIN events e ON e.id = d.event_id \
                  WHERE d.lease_token = ?2 AND d.status = 'leased' AND d.leased_until >= {EPOCH} \
-                 AND e.kind = 'node.ready' AND e.node_id = ?1)"
+                 AND e.kind = 'node.ready' AND e.subject = ?1)"
             ),
             params![id.0, token.as_str()],
             |row| row.get(0),
@@ -1353,7 +1353,7 @@ impl Graph {
             });
         }
         let restarted: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM events WHERE node_id = ?1 AND kind = ?2 AND id > ?3)",
+            "SELECT EXISTS (SELECT 1 FROM events WHERE subject = ?1 AND kind = ?2 AND id > ?3)",
             params![node.0, EventKind::NodeStarted.as_str(), event.0],
             |row| row.get(0),
         )?;
@@ -1767,7 +1767,7 @@ impl Graph {
     /// [`GraphError`] on SQLite failure.
     pub fn events(&self, after: Option<EventId>, limit: usize) -> Result<Vec<Event>, GraphError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, kind, node_id, created_at FROM events WHERE id > ?1 ORDER BY id LIMIT ?2",
+            "SELECT id, kind, subject, created_at FROM events WHERE id > ?1 ORDER BY id LIMIT ?2",
         )?;
         let rows = stmt.query_map(
             params![after.map_or(0, |e| e.0), limit as i64],

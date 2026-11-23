@@ -461,7 +461,7 @@ fn owner(graph: &Graph, node: NodeId) -> Result<Owner, GraphError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{Delivery, EventKind, Inbox, LeaseToken};
+    use crate::event::{Delivery, EventKind, Inbox};
     use crate::graph::{ChangeResult, NewOrigin};
     use crate::process::{ProcessId, Processes};
     use crate::store::{self, EPOCH};
@@ -862,9 +862,9 @@ mod tests {
         );
         let running = fx.verifying();
         std::fs::remove_dir_all(&unknown_path).expect("remove");
-        let empty_attempt = workspaces.path_of(completed, &LeaseToken::for_test(2));
+        let empty_attempt = workspaces.path_of(completed, &crate::event::test_token(2));
         std::fs::create_dir(&empty_attempt).expect("empty leftover");
-        let dirty_attempt = workspaces.path_of(dirty, &LeaseToken::for_test(2));
+        let dirty_attempt = workspaces.path_of(dirty, &crate::event::test_token(2));
         std::fs::create_dir(&dirty_attempt).expect("leftover");
         std::fs::write(dirty_attempt.join("wip.txt"), "wip").expect("write");
 

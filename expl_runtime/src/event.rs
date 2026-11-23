@@ -1,9 +1,13 @@
-//! Durable SQLite event delivery. Applications can use [`EventLog`] as an
-//! ordered inbox for their own payloads, or use [`Lease`] from their own
-//! selection transaction to implement different priorities and routing.
+//! The durable event log. An application appends events with
+//! [`EventLog`], in the same SQLite transaction as the change that produced
+//! them. Consumers receive them through the
+//! [`Inbox`](crate::delivery::Inbox), which grants, renews and settles each
+//! delivery as a [`Lease`].
+
+use std::fmt;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Timestamp expression for the event and delivery tables.
 pub const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
@@ -12,26 +16,15 @@ pub const EPOCH: &str = "CAST(strftime('%s','now') AS INTEGER)";
 
 const HELD: &str = "status = 'leased' AND lease_token = ?3";
 
-/// A leased event with data of the application's choosing.
-#[derive(Debug)]
-pub struct Event<T> {
-    /// Stable event identifier.
-    pub id: i64,
-    /// Application-defined subscription name.
-    pub kind: String,
-    /// Application event payload.
-    pub payload: T,
-}
+/// Position of an event in an explorer's log; strictly increasing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EventId(pub i64);
 
-/// An event and its current lease.
-#[derive(Debug)]
-pub struct Delivery<T> {
-    /// The event.
-    pub event: Event<T>,
-    /// Number of attempts, including this one.
-    pub attempts: i64,
-    /// Token required for renewal and settlement.
-    pub token: String,
+impl fmt::Display for EventId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "e{}", self.0)
+    }
 }
 
 /// The identity of one delivery attempt across all workers.
@@ -160,110 +153,101 @@ impl Lease<'_> {
     }
 }
 
-/// A generic event log over an application's SQLite connection.
+/// The event log in an application's SQLite database (see
+/// [`store::initialize`](crate::store::initialize) for its tables).
 pub struct EventLog;
 
 impl EventLog {
-    /// Create the event and delivery tables in the application's database.
+    /// Append an event of `kind` about `subject`, using the caller's
+    /// transaction when the connection is in one.
+    ///
+    /// The subject is whatever the application's events are about (a row
+    /// of its own): a consumer reacts to one event per subject at a time.
     ///
     /// # Errors
     ///
     /// SQLite failure.
-    pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
-        conn.execute_batch(&format!(
-            "CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS events_kind ON events (kind, id);
-             CREATE TABLE IF NOT EXISTS deliveries (
-                agent TEXT NOT NULL, event_id INTEGER NOT NULL REFERENCES events (id),
-                status TEXT NOT NULL, process_id INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
-                leased_until INTEGER, lease_token TEXT, note TEXT,
-                updated_at TEXT NOT NULL DEFAULT ({NOW}), PRIMARY KEY (agent, event_id)
-             );"
-        ))
-    }
-
-    /// Append the event, using the caller's transaction when supplied.
-    ///
-    /// # Errors
-    ///
-    /// SQLite or payload serialization failure.
     pub fn publish(
         conn: &Connection,
         kind: &str,
-        payload: &impl Serialize,
-    ) -> Result<i64, EventError> {
-        let payload = serde_json::to_string(payload)?;
-        Ok(conn.query_row(
-            "INSERT INTO events (kind, payload) VALUES (?1, ?2) RETURNING id",
-            params![kind, payload],
-            |row| row.get(0),
-        )?)
+        subject: Option<i64>,
+    ) -> rusqlite::Result<EventId> {
+        conn.query_row(
+            "INSERT INTO events (kind, subject) VALUES (?1, ?2) RETURNING id",
+            params![kind, subject],
+            |row| row.get(0).map(EventId),
+        )
     }
 
-    /// Lease the oldest matching event for this subscription. An expired
-    /// last attempt is recorded as failed. Applications with additional
-    /// recovery rules can select candidates and call [`Lease::grant`] directly.
+    /// Append an event that carries `payload`, as [`publish`](Self::publish)
+    /// does.
     ///
     /// # Errors
     ///
     /// SQLite or payload serialization failure.
-    pub fn lease<T: DeserializeOwned>(
-        conn: &mut Connection,
-        consumer: &str,
-        kinds: &[&str],
-        worker: i64,
-        max_attempts: i64,
-        seconds: i64,
-    ) -> Result<Option<Delivery<T>>, EventError> {
-        let kinds = serde_json::to_string(kinds)?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        tx.execute(
-            &format!("UPDATE deliveries SET status = 'failed', lease_token = NULL,
-                 leased_until = NULL, note = 'last lease expired', updated_at = {NOW}
-                 WHERE agent = ?1 AND status = 'leased' AND leased_until < {EPOCH} AND attempts >= ?2"),
-            params![consumer, max_attempts],
-        )?;
-        let row = tx
+    pub fn publish_with(
+        conn: &Connection,
+        kind: &str,
+        subject: Option<i64>,
+        payload: &impl Serialize,
+    ) -> Result<EventId, EventError> {
+        let payload = serde_json::to_string(payload)?;
+        Ok(conn.query_row(
+            "INSERT INTO events (kind, subject, payload) VALUES (?1, ?2, ?3) RETURNING id",
+            params![kind, subject, payload],
+            |row| row.get(0).map(EventId),
+        )?)
+    }
+
+    /// The payload `event` was published with, if it has one.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failure, or a payload that does not decode into `T`.
+    pub fn payload<T: DeserializeOwned>(
+        conn: &Connection,
+        event: EventId,
+    ) -> Result<Option<T>, EventError> {
+        let payload: Option<String> = conn
             .query_row(
-                &format!(
-                    "SELECT e.id, e.kind, e.payload, COALESCE(d.attempts, 0)
-                FROM events e LEFT JOIN deliveries d ON d.event_id = e.id AND d.agent = ?1
-                WHERE e.kind IN (SELECT value FROM json_each(?2))
-                AND (d.event_id IS NULL OR d.status = 'pending'
-                     OR (d.status = 'leased' AND d.leased_until < {EPOCH}))
-                AND COALESCE(d.attempts, 0) < ?3 ORDER BY e.id LIMIT 1"
-                ),
-                params![consumer, kinds, max_attempts],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                },
+                "SELECT payload FROM events WHERE id = ?1",
+                [event.0],
+                |row| row.get(0),
             )
-            .optional()?;
-        let delivery = if let Some((id, kind, payload, attempts)) = row {
-            let payload = serde_json::from_str(&payload)?;
-            let attempts = attempts + 1;
-            let token = Lease::grant(&tx, consumer, id, worker, attempts, seconds)?;
-            Some(Delivery {
-                event: Event { id, kind, payload },
-                attempts,
-                token,
-            })
-        } else {
-            None
-        };
-        tx.commit()?;
-        Ok(delivery)
+            .optional()?
+            .flatten();
+        Ok(payload
+            .map(|payload| serde_json::from_str(&payload))
+            .transpose()?)
+    }
+
+    /// Set how urgent `event` is: among the events a consumer can react to,
+    /// the highest priority is delivered first, and the oldest among equals.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failure.
+    pub fn prioritize(conn: &Connection, event: EventId, priority: i64) -> rusqlite::Result<()> {
+        conn.execute(
+            "UPDATE events SET priority = ?2 WHERE id = ?1",
+            params![event.0, priority],
+        )
+        .map(drop)
+    }
+
+    /// The newest event recorded, if any.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failure.
+    pub fn last(conn: &Connection) -> rusqlite::Result<Option<EventId>> {
+        conn.query_row("SELECT MAX(id) FROM events", [], |row| {
+            row.get::<_, Option<i64>>(0).map(|id| id.map(EventId))
+        })
     }
 }
 
-/// An event or its delivery could not be stored.
+/// An event could not be stored or read.
 #[derive(Debug, thiserror::Error)]
 pub enum EventError {
     /// Database I/O or schema error.
@@ -277,26 +261,44 @@ pub enum EventError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delivery::Inbox;
 
     #[test]
     fn typed_events_retry_and_reject_a_replaced_lease() {
-        let mut db = Connection::open_in_memory().expect("db");
-        EventLog::initialize(&db).expect("queue");
-        let event = EventLog::publish(&db, "paper.found", &vec!["arXiv"]).expect("event");
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("explorer.db");
+        let db = crate::store::open(&path).expect("db");
+        crate::store::initialize(&db).expect("tables");
+        let event =
+            EventLog::publish_with(&db, "paper.found", Some(4), &vec!["arXiv"]).expect("event");
+        assert_eq!(EventLog::last(&db).expect("last"), Some(event));
+        assert_eq!(
+            EventLog::payload::<Vec<String>>(&db, event).expect("payload"),
+            Some(vec!["arXiv".to_owned()])
+        );
+        let bare = EventLog::publish(&db, "proof.checked", None).expect("event");
+        assert_eq!(
+            EventLog::payload::<Vec<String>>(&db, bare).expect("payload"),
+            None
+        );
+
+        let mut inbox = Inbox::open(&path, "verify").expect("inbox");
         assert!(
-            EventLog::lease::<Vec<String>>(&mut db, "verify", &["proof.checked"], 1, 3, 60)
+            inbox
+                .lease(&["survey.done"], 1, false, 3)
                 .expect("filtered subscription")
                 .is_none()
         );
-        let first: Delivery<Vec<String>> =
-            EventLog::lease(&mut db, "verify", &["paper.found"], 1, 3, 60)
-                .expect("lease")
-                .expect("delivery");
-        assert_eq!(first.event.payload, ["arXiv"]);
+        let first = inbox
+            .lease(&["paper.found"], 1, false, 3)
+            .expect("lease")
+            .expect("delivery");
+        assert_eq!(first.event.id, event);
+        assert_eq!(first.event.subject, Some(4));
         let old = Lease {
             consumer: "verify",
-            event,
-            token: &first.token,
+            event: event.0,
+            token: first.token.as_str(),
         };
         assert_eq!(
             old.settle(
@@ -306,27 +308,30 @@ mod tests {
                     max_attempts: 3
                 }
             )
-            .unwrap(),
+            .expect("settle"),
             Settlement::Retrying
         );
-        let second: Delivery<Vec<String>> =
-            EventLog::lease(&mut db, "verify", &["paper.found"], 2, 3, 60)
-                .expect("lease")
-                .expect("delivery");
+        let second = inbox
+            .lease(&["paper.found"], 2, false, 3)
+            .expect("lease")
+            .expect("delivery");
         assert_eq!(second.attempts, 2);
-        assert!(!old.renew(&db, 60).unwrap());
+        assert!(!old.renew(&db, 60).expect("renew"));
         let active = Lease {
             consumer: "verify",
-            event,
-            token: &second.token,
+            event: event.0,
+            token: second.token.as_str(),
         };
         assert_eq!(
-            active.settle(&db, Disposition::Acknowledge(None)).unwrap(),
+            active
+                .settle(&db, Disposition::Acknowledge(None))
+                .expect("settle"),
             Settlement::Settled
         );
         assert!(
-            EventLog::lease::<Vec<String>>(&mut db, "verify", &["paper.found"], 3, 3, 60)
-                .unwrap()
+            inbox
+                .lease(&["paper.found"], 3, false, 3)
+                .expect("lease")
                 .is_none()
         );
     }

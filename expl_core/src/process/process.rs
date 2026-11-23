@@ -3,6 +3,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
+use expl_runtime::capacity::Capacity;
 use expl_runtime::worker::{Active, with_heartbeat};
 use opentelemetry::KeyValue;
 use thiserror::Error;
@@ -10,7 +11,6 @@ use thiserror::Error;
 use crate::event::{Consumer, Delivery, EventKind, Inbox, InboxError, Lease};
 use crate::graph::{Graph, GraphError, NodeId};
 use crate::handler::{Abandonment, Context, Handler, HandlerError, Reaction, Report};
-use crate::process::capacity::Capacity;
 use crate::process::telemetry::{Phase, WorkerTelemetry};
 use crate::process::{HEARTBEAT_SECONDS, Interrupt, ProcessId, ProcessRecord, Processes};
 use crate::store::StoreError;
@@ -236,7 +236,12 @@ impl<'a> Process<'a> {
         {
             return Ok("consumer is not reachable through its delivery group".to_owned());
         }
-        let capacity = Capacity::new(&project.state_dir(), self.consumer, route.as_ref())?;
+        let capacity = Capacity::new(
+            &project.state_dir(),
+            self.consumer.name(),
+            consumer.concurrency,
+            route.as_ref(),
+        )?;
         let shared_capacity = route
             .as_ref()
             .is_some_and(|route| route.groups(self.consumer.name()).next().is_some());

@@ -7,16 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph::NodeId;
 
-/// Position of an event in the project's event log; strictly increasing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct EventId(pub i64);
-
-impl fmt::Display for EventId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "e{}", self.0)
-    }
-}
+pub use expl_runtime::event::EventId;
 
 /// What happened. Named as past-tense facts about the graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
