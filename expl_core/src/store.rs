@@ -229,6 +229,8 @@ ALTER TABLE processes ADD COLUMN run_once INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE processes ADD COLUMN exit_when_idle INTEGER NOT NULL DEFAULT 0;
 ",
     EVENT_LOG_MIGRATION,
+    // The clock of the runtime's periodic tasks (following the trunk).
+    expl_runtime::store::TASKS,
 ];
 
 const EVENT_LOG_MIGRATION: &str = r"

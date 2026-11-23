@@ -84,8 +84,9 @@ fn journal(conn: &Connection, mode: &'static str) -> Result<(), StoreError> {
 }
 
 /// Create the framework's tables in a fresh explorer's database: the event
-/// log, each consumer's deliveries, and the recipients recorded for routed
-/// groups. Existing tables are left as they are.
+/// log, each consumer's deliveries, the recipients recorded for routed
+/// groups, the process table and the periodic tasks' clock. Existing tables
+/// are left as they are.
 ///
 /// The columns `agent` and `role` hold consumer and group names; they keep
 /// the names existing databases were created with.
@@ -131,9 +132,38 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             agent      TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT ({NOW}),
             PRIMARY KEY (role, event_id)
-         );"
+         );
+
+         CREATE TABLE IF NOT EXISTS processes (
+            id             INTEGER PRIMARY KEY,
+            name           TEXT NOT NULL UNIQUE,
+            agent          TEXT NOT NULL,
+            pid            INTEGER,
+            status         TEXT NOT NULL CHECK (status IN ('created', 'running', 'exited')),
+            detached       INTEGER NOT NULL,
+            log_path       TEXT NOT NULL,
+            stop_requested INTEGER NOT NULL DEFAULT 0,
+            activity       TEXT,
+            exit_reason    TEXT,
+            heartbeat_at   INTEGER,
+            created_at     TEXT NOT NULL DEFAULT ({NOW}),
+            finished_at    TEXT,
+            start_by       INTEGER,
+            resume         INTEGER NOT NULL DEFAULT 0,
+            run_once       INTEGER NOT NULL DEFAULT 0,
+            exit_when_idle INTEGER NOT NULL DEFAULT 0
+         );
+
+         {TASKS}"
     ))
 }
+
+/// The table behind periodic tasks: when each last ran, so that the workers
+/// of an explorer run a task once per period between them.
+pub const TASKS: &str = "CREATE TABLE IF NOT EXISTS tasks (
+    name   TEXT PRIMARY KEY,
+    ran_at INTEGER NOT NULL
+);";
 
 #[cfg(test)]
 mod tests {

@@ -33,6 +33,9 @@ use expl_core::testing::scaled;
 const AGENT: &str = r#"#!/bin/sh
 case "$EXPL_EVENT_ID" in ""|*[!0-9]*) exit 3 ;; esac
 [ -n "$EXPL_CONSUMER" ] || exit 3
+# What the worker told the reaction's command about its delivery is not the
+# agent's to inherit.
+[ -z "$EXPL_LEASE$EXPL_OUTCOME$EXPL_REACTION" ] || exit 3
 if [ "$EXPL_HANDLER" = exploration ] && [ "$EXPL_EVENT" = node.revisited ] && [ -f "@DIR@/fast-revisits" ]; then
   prompt="@DIR@/prompts/exploration-revisit.txt"
   if [ ! -f "$prompt" ]; then cat > "$prompt"; fi
@@ -1816,10 +1819,10 @@ fn weighted_agents_of_one_role_split_its_events() {
     ok(repo, &["run", "explorer", "--exit-when-idle"]);
     ok(repo, &["run", "contrarian", "--exit-when-idle"]);
 
-    // Each goal.added was explored by exactly one of the two agents (not
-    // by both), and both agents are done with every one of them.
-    for agent in ["explorer", "contrarian"] {
-        let deliveries = json_lines(&ok(
+    // Each goal.added went to exactly one of the two agents, which is done
+    // with it; the other was never handed it.
+    let deliveries = |agent: &str| -> Vec<String> {
+        json_lines(&ok(
             repo,
             &[
                 "event",
@@ -1831,12 +1834,17 @@ fn weighted_agents_of_one_role_split_its_events() {
                 "--format",
                 "json",
             ],
-        ));
-        assert_eq!(deliveries.len(), 6);
-        assert!(
-            deliveries.iter().all(|e| e["delivery"] == "done"),
-            "{deliveries:?}"
-        );
+        ))
+        .iter()
+        .map(|event| event["delivery"].as_str().unwrap_or_default().to_owned())
+        .collect()
+    };
+    let (explorer, contrarian) = (deliveries("explorer"), deliveries("contrarian"));
+    assert_eq!((explorer.len(), contrarian.len()), (6, 6));
+    for (one, other) in explorer.iter().zip(&contrarian) {
+        let mut pair = [one.as_str(), other.as_str()];
+        pair.sort_unstable();
+        assert_eq!(pair, ["done", "undelivered"], "{explorer:?} {contrarian:?}");
     }
     // Forward explorations are journaled on the node they start from.
     let runs = |agent: &str| {
@@ -1897,21 +1905,35 @@ fn weighted_assignments_hold_across_declarations_and_restarts() {
             ok(repo, &["goal", "add", &format!("{prefix} {i}")]);
         }
     };
-    let settled = |agent: &str, goals: usize| {
-        let deliveries = json_lines(&ok(
-            repo,
-            &[
-                "event",
-                "ls",
-                "--consumer",
-                agent,
-                "--kind",
-                "goal.added",
-                "--format",
-                "json",
-            ],
-        ));
-        deliveries.len() == goals && deliveries.iter().all(|e| e["delivery"] == "done")
+    // Every goal went to exactly one of the two agents, which is done with
+    // it; the other was never handed it.
+    let settled = |goals: usize| {
+        let deliveries = |agent: &str| -> Vec<String> {
+            json_lines(&ok(
+                repo,
+                &[
+                    "event",
+                    "ls",
+                    "--consumer",
+                    agent,
+                    "--kind",
+                    "goal.added",
+                    "--format",
+                    "json",
+                ],
+            ))
+            .iter()
+            .map(|event| event["delivery"].as_str().unwrap_or_default().to_owned())
+            .collect()
+        };
+        let (explorer, contrarian) = (deliveries("explorer"), deliveries("contrarian"));
+        explorer.len() == goals
+            && contrarian.len() == goals
+            && explorer.iter().zip(&contrarian).all(|(one, other)| {
+                let mut pair = [one.as_str(), other.as_str()];
+                pair.sort_unstable();
+                pair == ["done", "undelivered"]
+            })
     };
 
     // Overlapping processes, each of which loaded weights that route
@@ -1924,9 +1946,7 @@ fn weighted_assignments_hold_across_declarations_and_restarts() {
     let contrarian = ok(repo, &["run", "contrarian", "-d"]);
     wait_until(repo, "the contrarian to start", || running(&contrarian));
     add_goals("Overlap");
-    wait_until(repo, "both agents to settle every goal", || {
-        settled("explorer", 4) && settled("contrarian", 4)
-    });
+    wait_until(repo, "every goal to be settled by one agent", || settled(4));
     ok(repo, &["down", "--time", &down_time()]);
 
     // After a restart, each agent loads weights that route nearly every
@@ -1942,7 +1962,7 @@ fn weighted_assignments_hold_across_declarations_and_restarts() {
     ok(repo, &["run", "explorer", "--exit-when-idle"]);
     favor("explorer");
     ok(repo, &["run", "contrarian", "--exit-when-idle"]);
-    assert!(settled("explorer", 12) && settled("contrarian", 12));
+    assert!(settled(12));
 
     // Every goal was explored exactly once, by the agent it is assigned to.
     let db = rusqlite::Connection::open(repo.join(".expl/expl.db")).expect("db");

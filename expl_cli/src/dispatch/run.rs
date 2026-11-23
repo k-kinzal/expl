@@ -15,7 +15,8 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use expl_core::{Interrupt, Process, ProcessId, ProcessOptions, ProcessRecord, Project};
+use expl_core::{Interrupt, ProcessId, ProcessOptions, ProcessRecord, Project};
+use expl_runtime::worker::Worker;
 
 use crate::cli::RunArgs;
 use crate::dispatch::{load, processes};
@@ -69,7 +70,22 @@ pub(crate) fn run(start: &Path, args: &RunArgs) -> Result<(), CliError> {
         Interrupt::on_signals().map_err(|e| CliError::io("install signal handlers", e))?;
     let observer = ActivityLog::new(&record.name, tee);
     let _telemetry = Telemetry::start(project, context.declaration().telemetry.as_ref(), true);
-    Process::new(&context, &consumer, record.id, interrupt).run(options, &observer)?;
+    // The worker is the runtime's. What it executes for each event is this
+    // binary again, making one reaction (`expl react`).
+    let exe = std::env::current_exe().map_err(|e| CliError::io("locate the expl binary", e))?;
+    let registration = context.declaration().registration_for(&exe, project.root());
+    Worker {
+        directory: project.root(),
+        database: &project.database_path(),
+        state: &project.state_dir(),
+        logs: &project.processes_dir(),
+        registration: &registration,
+        consumer: consumer.name(),
+        id: record.id,
+        interrupt,
+        authority: context.authority(),
+    }
+    .run(options, &observer)?;
     Ok(())
 }
 

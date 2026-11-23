@@ -2,10 +2,12 @@
 
 use expl_core::agent::AgentError;
 use expl_core::git::GitError;
+use expl_core::react::ReactError;
 use expl_core::{
-    DeclarationError, DoctorError, GraphError, HandlerError, ProcessError, ProjectError,
-    StoreError, WorkspaceError,
+    DeclarationError, DoctorError, GraphError, HandlerError, ProjectError, StoreError,
+    WorkspaceError,
 };
+use expl_runtime::worker::WorkerError;
 use thiserror::Error;
 
 /// Exit codes shared with iter.
@@ -48,9 +50,12 @@ pub(crate) enum CliError {
     /// A role.
     #[error(transparent)]
     Handler(#[from] HandlerError),
-    /// A process.
+    /// A worker.
     #[error(transparent)]
-    Process(#[from] ProcessError),
+    Process(#[from] WorkerError),
+    /// One reaction, run for a worker.
+    #[error(transparent)]
+    React(#[from] ReactError),
     /// Agent.
     #[error(transparent)]
     Agent(#[from] AgentError),
@@ -93,7 +98,7 @@ impl CliError {
                 | GraphError::NotInStatus { .. }
                 | GraphError::Cycle { .. },
             )
-            | Self::Process(ProcessError::NotAdoptable(_))
+            | Self::Process(WorkerError::NotAdoptable(_))
             | Self::Inconsistent(_) => exit::USER,
             Self::Declaration(_) | Self::Handler(HandlerError::Declaration(_)) => exit::CONFIG,
             Self::Project(ProjectError::Io { .. })
@@ -104,6 +109,7 @@ impl CliError {
             | Self::Workspace(_)
             | Self::Handler(_)
             | Self::Process(_)
+            | Self::React(_)
             | Self::Agent(_)
             | Self::Overview(_)
             | Self::Doctor(_)

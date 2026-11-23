@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use expl_core::{ProcessRecord, ProcessState, Processes, Project};
+use expl_core::{Graph, ProcessRecord, ProcessState, Processes, Project};
 
 use crate::cli::{ListingFormat, ProcessCommand, PsArgs};
 use crate::dispatch::{logs, processes};
@@ -53,6 +53,8 @@ pub(crate) fn process(start: &Path, command: ProcessCommand) -> Result<(), CliEr
                 if record.is_live() {
                     kill(&table, &record)?;
                 }
+                // The agent runs journaled under the record are kept.
+                Graph::open(&project.database_path())?.forget_process(record.id.0)?;
                 table.remove(record.id)?;
                 std::fs::remove_file(&record.log_path).ok();
                 println(&record.name)?;

@@ -75,6 +75,17 @@ pub(crate) enum Command {
     RuntimeOverview,
     #[command(hide = true)]
     RuntimeJob { name: String, peer: String },
+    /// React, as a consumer, to the event a worker leased (described in
+    /// the environment). What a worker executes for one event.
+    #[command(hide = true)]
+    React { consumer: String },
+    /// Look once whether the trunk moved, and let the origin follow it.
+    /// The periodic task of every worker.
+    #[command(hide = true)]
+    Follow,
+    /// Revisit a random starting point. What an idle exploration runs.
+    #[command(hide = true)]
+    Revisit { consumer: String },
     /// Initialise expl in the current git repository.
     #[command(
         long_about = "Create .expl/ (database, worktrees, logs), write expl.toml if absent, \

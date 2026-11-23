@@ -12,6 +12,7 @@ mod node;
 mod origin;
 mod path;
 mod process;
+mod react;
 pub(crate) mod run;
 mod up;
 
@@ -41,6 +42,9 @@ pub(crate) fn dispatch(cli: Cli) -> Result<(), CliError> {
             let view = expl_core::overview::Overview::load(&project).map_err(CliError::Overview)?;
             crate::output::json_pretty(&view)
         }
+        Command::React { consumer } => react::react(&start, &consumer),
+        Command::Follow => react::follow(&start),
+        Command::Revisit { consumer } => react::revisit(&start, &consumer),
         Command::Init(args) => init::init(&start, &args),
         Command::Doctor(args) => doctor::doctor(&start, &args),
         Command::Goal(command) => goal::goal(&start, command),
@@ -83,8 +87,5 @@ pub(crate) fn load(start: &Path) -> Result<Context, CliError> {
 
 /// The process table of `project`.
 pub(crate) fn processes(project: &Project) -> Result<Processes, CliError> {
-    Ok(Processes::open(
-        &project.database_path(),
-        &project.processes_dir(),
-    )?)
+    Ok(expl_core::process::processes(project)?)
 }

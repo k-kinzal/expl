@@ -38,6 +38,31 @@ pub(crate) fn wait(
     interrupted: impl Fn() -> bool,
     deadline: Option<Instant>,
 ) -> std::io::Result<End> {
+    wait_stopping(child, interrupted, deadline, Stop::Group(TERMINATION_GRACE))
+}
+
+/// How a child that must stop is told to.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Stop {
+    /// TERM its whole process group at once, and KILL the group if the
+    /// leader is still there after the grace: for a CLI, whose tree has
+    /// nothing to finish.
+    Group(Duration),
+    /// TERM the leader alone, and KILL the group if the leader is still
+    /// there after the grace: for a command that stops its own processes
+    /// when told to (a reaction with a git command or an agent under way).
+    /// Signalling its children behind its back would make their deaths look
+    /// like failures of the work.
+    Leader(Duration),
+}
+
+/// [`wait`], telling the child to stop as `stop` says.
+pub(crate) fn wait_stopping(
+    child: &mut Child,
+    interrupted: impl Fn() -> bool,
+    deadline: Option<Instant>,
+    stop: Stop,
+) -> std::io::Result<End> {
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(End::Exited(status));
@@ -50,8 +75,17 @@ pub(crate) fn wait(
             thread::sleep(Duration::from_millis(100));
             continue;
         };
-        signal_group(child.id(), "-TERM");
-        let grace = Instant::now() + TERMINATION_GRACE;
+        let grace = match stop {
+            Stop::Group(grace) => {
+                signal_group(child.id(), "-TERM");
+                grace
+            }
+            Stop::Leader(grace) => {
+                signal_leader(child.id(), "-TERM");
+                grace
+            }
+        };
+        let grace = Instant::now() + grace;
         while Instant::now() < grace {
             if child.try_wait()?.is_some() {
                 return Ok(end);
@@ -62,6 +96,18 @@ pub(crate) fn wait(
         child.wait()?;
         return Ok(end);
     }
+}
+
+/// Send `signal` to the process `pid` alone.
+fn signal_leader(pid: u32, signal: &str) {
+    // Best effort: the process may already be gone.
+    Command::new("kill")
+        .arg(signal)
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok();
 }
 
 /// Send `signal` to the process group led by `pid`; `true` when the group

@@ -163,6 +163,17 @@ impl Agent {
         }
     }
 
+    /// Start the next invocation's route at the CLI whose turn `turn` is.
+    /// An agent built anew for every reaction (in a process of its own) has
+    /// no memory of the last route; its worker's count of reactions carries
+    /// the turn across them.
+    #[must_use]
+    pub fn starting_at(self, turn: u64) -> Self {
+        // Only its remainder by the number of CLIs matters.
+        self.turn.store(turn as usize, Ordering::Relaxed);
+        self
+    }
+
     /// Route command attempts through cluster members.
     #[must_use]
     pub fn with_cluster(mut self, cluster: Cluster) -> Self {
@@ -284,6 +295,20 @@ impl Agent {
             facts: invocation.facts,
         };
         let mut command = cli.driver.command(&request)?;
+        // The agent may itself run inside a reaction's command. What that
+        // command was told about its delivery (the lease token above all)
+        // is not the CLI's to inherit; a driver that passes facts on
+        // names them itself.
+        let named: Vec<std::ffi::OsString> = command
+            .process
+            .get_envs()
+            .map(|(name, _)| name.to_owned())
+            .collect();
+        for variable in crate::reaction::VARIABLES {
+            if !named.iter().any(|name| name == variable) {
+                command.process.env_remove(variable);
+            }
+        }
         let env: &BTreeMap<String, String> = &self.env;
         command
             .process

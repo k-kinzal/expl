@@ -40,6 +40,15 @@ impl Consumer {
         self
     }
 
+    /// Start the consumer's next invocation at the CLI whose turn `turn`
+    /// is: a reaction is a process of its own, and its worker carries the
+    /// turn from one to the next.
+    #[must_use]
+    pub fn starting_at(mut self, turn: u64) -> Self {
+        self.agent = self.agent.starting_at(turn);
+        self
+    }
+
     /// The name used to track subscriptions, deliveries and processes.
     #[must_use]
     pub fn name(&self) -> &str {

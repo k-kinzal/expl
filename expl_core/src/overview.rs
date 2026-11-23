@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::{
     AgentRunRecord, Declaration, Edge, Evaluation, Graph, GraphError, Node, NodeFilter, NodeId,
-    PlannedPath, ProcessRecord, ProcessState, Processes, Project, StoreError,
+    PlannedPath, ProcessRecord, ProcessState, Project, StoreError,
 };
 
 /// How many of the newest agent runs are kept (for per-node history).
@@ -69,7 +69,7 @@ impl Overview {
     /// [`OverviewError`] when the database cannot be read.
     pub fn load(project: &Project) -> Result<Self, OverviewError> {
         let graph = Graph::open(&project.database_path())?;
-        let processes = Processes::open(&project.database_path(), &project.processes_dir())?;
+        let processes = crate::process::processes(project)?;
 
         let nodes = graph.nodes(&NodeFilter::default())?;
         let edges = graph.edges()?;

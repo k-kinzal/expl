@@ -4,45 +4,18 @@
 use std::collections::HashMap;
 
 use opentelemetry::propagation::TextMapPropagator;
-use opentelemetry::trace::{Link, SpanContext, SpanKind, TraceContextExt, Tracer};
-use opentelemetry::{Array, Context, KeyValue, Value, global};
+use opentelemetry::trace::TraceContextExt;
+use opentelemetry::{Array, Context, KeyValue, Value};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 
 use crate::graph::{Node, NodeId};
 
-pub(crate) use expl_runtime::telemetry::{SCOPE, error, span};
-
-// A delivery starts its own trace so a continuous exploration cannot grow a
-// trace indefinitely. A link retains the cause across the durable inbox.
-pub(crate) fn consumer_span(attributes: Vec<KeyValue>, cause: Option<SpanContext>) -> Context {
-    let tracer = global::tracer(SCOPE);
-    let root = Context::new();
-    let mut builder = tracer
-        .span_builder("expl.delivery")
-        .with_kind(SpanKind::Consumer)
-        .with_attributes(attributes);
-    if let Some(cause) = cause {
-        builder = builder.with_links(vec![Link::new(cause, Vec::new(), 0)]);
-    }
-    root.with_span(builder.start_with_context(&tracer, &root))
-}
+pub(crate) use expl_runtime::telemetry::{error, span};
 
 pub(crate) fn inject() -> HashMap<String, String> {
     let mut headers = HashMap::new();
     TraceContextPropagator::new().inject_context(&Context::current(), &mut headers);
     headers
-}
-
-pub(crate) fn extract(parent: String, state: Option<String>) -> Option<SpanContext> {
-    let mut headers = HashMap::from([("traceparent".to_owned(), parent)]);
-    if let Some(state) = state {
-        headers.insert("tracestate".to_owned(), state);
-    }
-    let context = TraceContextPropagator::new().extract_with_context(&Context::new(), &headers);
-    let span = context.span();
-    span.span_context()
-        .is_valid()
-        .then(|| span.span_context().clone())
 }
 
 pub(crate) fn node_ids(nodes: impl IntoIterator<Item = NodeId>) -> Value {

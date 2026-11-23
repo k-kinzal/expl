@@ -8,7 +8,7 @@ use std::io::Write;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use expl_core::{ProcessActivity, ProcessObserver};
+use expl_runtime::worker::{Activity, Observer};
 use opentelemetry::Context;
 use opentelemetry::trace::TraceContextExt;
 
@@ -48,46 +48,19 @@ impl ActivityLog {
     }
 }
 
-impl ProcessObserver for ActivityLog {
-    fn observe(&self, activity: &ProcessActivity<'_>) {
+impl Observer for ActivityLog {
+    fn observe(&self, activity: &Activity<'_>) {
         match activity {
-            ProcessActivity::Followed(advance) => {
-                let adopted = if advance.adopted.is_empty() {
-                    "nothing adopted".to_owned()
-                } else {
-                    format!(
-                        "adopted {}",
-                        advance
-                            .adopted
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    )
-                };
-                self.line(&format!(
-                    "trunk {} moved to {}: origin {} supersedes {}, {adopted}{}",
-                    advance.branch,
-                    advance.commit.chars().take(7).collect::<String>(),
-                    advance.origin,
-                    advance.previous,
-                    if advance.descends {
-                        ""
-                    } else {
-                        " (the trunk was rewritten)"
-                    }
-                ));
-            }
-            ProcessActivity::Unfollowed(reason) => {
-                self.line(&format!("cannot follow the trunk: {reason}"));
-            }
-            ProcessActivity::Started(record) => self.line(&format!(
+            // What a task printed is the line: the trunk moved, or cannot
+            // be followed.
+            Activity::Task { line, .. } => self.line(line),
+            Activity::Started(record) => self.line(&format!(
                 "started process {} for consumer `{}` (pid {})",
                 record.id,
                 record.consumer,
                 std::process::id()
             )),
-            ProcessActivity::Reacting(delivery) => {
+            Activity::Reacting(delivery) => {
                 let attempt = if delivery.attempts > 1 {
                     format!(" (attempt {})", delivery.attempts)
                 } else {
@@ -95,14 +68,18 @@ impl ProcessObserver for ActivityLog {
                 };
                 self.line(&format!("reacting to {}{attempt}", delivery.event));
             }
-            ProcessActivity::Reacted { delivery, report } => {
-                self.line(&format!("{}: {}", delivery.event.id, report.summary()));
+            Activity::Reacted { delivery, note, .. } => {
+                self.line(&format!(
+                    "{}: {}",
+                    delivery.event.id,
+                    note.unwrap_or("reacted")
+                ));
             }
-            ProcessActivity::LeaseLost(delivery) => self.line(&format!(
+            Activity::LeaseLost(delivery) => self.line(&format!(
                 "{}: lost the lease; the reaction was abandoned to the process that took it over",
                 delivery.event.id
             )),
-            ProcessActivity::Failed {
+            Activity::Failed {
                 delivery,
                 error,
                 retry,
@@ -115,13 +92,14 @@ impl ProcessObserver for ActivityLog {
                     "giving up"
                 }
             )),
-            ProcessActivity::Abandoned { delivery, failed } => self.line(&format!(
+            Activity::Abandoned { delivery, note } => self.line(&format!(
                 "{}: its holder died on attempt {}; giving up{}",
                 delivery.event.id,
                 delivery.attempts,
-                failed.map_or_else(String::new, |node| format!(" ({node} failed)"))
+                note.filter(|note| !note.is_empty())
+                    .map_or_else(String::new, |note| format!(" ({note})"))
             )),
-            ProcessActivity::Exiting(reason) => self.line(&format!("exiting: {reason}")),
+            Activity::Exiting(reason) => self.line(&format!("exiting: {reason}")),
         }
     }
 }

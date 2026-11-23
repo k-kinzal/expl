@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Cluster, POLL, Peer, atomic_json, file_command, occupied, read_optional, try_lock};
 use crate::Interrupt;
-use crate::agent::supervisor::{End, Reaped, reap_group, wait};
+use crate::agent::supervisor::{End, Reaped, Stop, TERMINATION_GRACE, reap_group, wait_stopping};
 
 /// Command information portable between members with the same mounted paths.
 #[derive(Debug, Serialize, Deserialize)]
@@ -23,6 +23,11 @@ pub struct CommandSpec {
     args: Vec<OsString>,
     env: Vec<(OsString, Option<OsString>)>,
     directory: PathBuf,
+    /// Set for a command that stops its own processes when told to: it
+    /// alone is sent SIGTERM and given this long before its group is
+    /// killed. Unset, the whole group is sent SIGTERM at once.
+    #[serde(default)]
+    stops_itself_within: Option<Duration>,
 }
 
 impl CommandSpec {
@@ -38,7 +43,19 @@ impl CommandSpec {
                 .map(|(key, value)| (key.to_owned(), value.map(ToOwned::to_owned)))
                 .collect(),
             directory: command.get_current_dir().unwrap_or(directory).to_owned(),
+            stops_itself_within: None,
         }
+    }
+
+    /// The command stops its own processes when told to (a reaction with an
+    /// agent under way): when it must stop, it alone is sent SIGTERM, and
+    /// its group is killed only if it is still there after `grace`.
+    /// Signalling its children behind its back would make their deaths look
+    /// like failures of its work.
+    #[must_use]
+    pub fn stopping_itself_within(mut self, grace: Duration) -> Self {
+        self.stops_itself_within = Some(grace);
+        self
     }
 
     fn command(self) -> Command {
@@ -393,12 +410,16 @@ impl Cluster {
         prepare: impl FnOnce(bool, Command) -> io::Result<Command>,
     ) -> io::Result<Outcome> {
         let control = matches!(request.target, Target::Control(_));
+        let stop = request
+            .command
+            .stops_itself_within
+            .map_or(Stop::Group(TERMINATION_GRACE), Stop::Leader);
         let mut command = prepare(control, request.command.command())?;
         file_command(&mut command, path)?;
         let mut child = command.spawn()?;
         let pid = child.id();
         let deadline = request.timeout.map(|timeout| Instant::now() + timeout);
-        let end = wait(
+        let end = wait_stopping(
             &mut child,
             || {
                 path.join("cancel").exists()
@@ -406,6 +427,7 @@ impl Cluster {
                     || !self.is_live(peer).unwrap_or(false)
             },
             deadline,
+            stop,
         );
         if reap_group(pid) == Reaped::Lingering {
             return Ok(Outcome::Lingering { group: pid });

@@ -210,6 +210,11 @@ fn serve(start: &Path, directory: Option<&Path>, member: &str) -> Result<(), Cli
             |_| {
                 let mut table = dispatch::processes(&project).map_err(io::Error::other)?;
                 *recovering.borrow_mut() = table.recover().map_err(io::Error::other)?;
+                // The workers of the last term are gone, and with them the
+                // agent runs they journaled as running.
+                expl_core::Graph::open(&project.database_path())
+                    .and_then(|mut graph| graph.interrupt_agent_runs("leader changed"))
+                    .map_err(io::Error::other)?;
                 Ok(())
             },
             |authority| {

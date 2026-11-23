@@ -16,8 +16,9 @@
 //! of several commits, of a step together with the not-yet-adopted steps
 //! it built on, or of a joined step and its merges).
 //!
-//! Every running [process](crate::process::Process) follows the trunk, so
-//! it is enough to merge: the origin moves within seconds.
+//! Following the trunk is a periodic task every worker of the project runs
+//! (`expl follow`, once per period between them), so it is enough to merge:
+//! the origin moves within seconds while any worker runs.
 
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;

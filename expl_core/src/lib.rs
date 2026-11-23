@@ -9,7 +9,8 @@
 //! - [`event`] — subscriptions and leased deliveries.
 //! - [`handler`] — graph operations that run in response to an event.
 //! - [`agent`] — the runtime drivers that get a structured response from a command.
-//! - [`process`] — workers and the process table behind `expl ps`.
+//! - [`process`] — the runtime's workers and the process table behind `expl ps`.
+//! - [`react`] — the command a worker executes for one event: one reaction.
 //! - [`workspace`] — node worktrees and scratch worktrees.
 //! - [`trunk`] — following the default branch: the origin moves with it.
 //! - [`doctor`] — checking the graph against git, and the safe repairs.
@@ -32,6 +33,7 @@ pub mod handler;
 pub mod overview;
 pub mod process;
 pub mod project;
+pub mod react;
 pub mod store;
 mod telemetry;
 pub mod trunk;
@@ -53,8 +55,7 @@ pub use graph::{
 };
 pub use handler::{Context, Direction, Handler, HandlerError, Reaction, Report};
 pub use process::{
-    Interrupt, Process, ProcessActivity, ProcessError, ProcessId, ProcessObserver, ProcessOptions,
-    ProcessRecord, ProcessState, Processes,
+    Interrupt, MAX_ATTEMPTS, ProcessId, ProcessOptions, ProcessRecord, ProcessState, Processes,
 };
 pub use project::{Project, ProjectError};
 pub use prompt::Prompt;

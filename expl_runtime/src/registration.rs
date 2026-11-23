@@ -106,6 +106,10 @@ pub struct ConsumerRegistration {
     /// Extra environment variables for the command.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// What the explorer wants said about this consumer on its workers'
+    /// spans and metrics, beside its name.
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
 }
 
 /// Where a consumer's command runs.

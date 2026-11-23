@@ -1867,6 +1867,38 @@ impl Graph {
         Ok(())
     }
 
+    /// Journal every agent run still marked running as interrupted, for
+    /// `reason`: the workers that held them are gone (the leader changed),
+    /// so none of them will be finished.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError`] on SQLite failure.
+    pub fn interrupt_agent_runs(&mut self, reason: &str) -> Result<(), GraphError> {
+        self.conn.execute(
+            &format!(
+                "UPDATE agent_runs SET status = 'interrupted', error = ?1, finished_at = {NOW} \
+                 WHERE status = 'running'"
+            ),
+            [reason],
+        )?;
+        Ok(())
+    }
+
+    /// Detach the agent runs journaled under the process record `process`,
+    /// so the record can be removed and the runs kept.
+    ///
+    /// # Errors
+    ///
+    /// [`GraphError`] on SQLite failure.
+    pub fn forget_process(&mut self, process: i64) -> Result<(), GraphError> {
+        self.conn.execute(
+            "UPDATE agent_runs SET process_id = NULL WHERE process_id = ?1",
+            [process],
+        )?;
+        Ok(())
+    }
+
     /// When the newest run of `agent` that succeeded started (UTC, RFC
     /// 3339, comparable with event times), if it ever succeeded.
     ///

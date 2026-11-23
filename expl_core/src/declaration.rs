@@ -8,14 +8,20 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::agent::DriverKind;
-use crate::event::{EventId, EventKind};
+use crate::event::EventKind;
 use crate::handler::Handler;
 use crate::project::Project;
 
 pub use expl_runtime::command::{CliDeclaration, Timeout, TimeoutError};
+#[cfg(test)]
 pub(crate) use expl_runtime::registration::Route;
-use expl_runtime::registration::{ConsumerRegistration, Registration};
+use expl_runtime::registration::{
+    ConsumerRegistration, IdleCommand, Registration, TaskRegistration,
+};
 pub use expl_runtime::registration::{RouterDeclaration, RoutingPolicy};
+
+/// How often the trunk is looked at, in seconds.
+const FOLLOW_SECONDS: u64 = 2;
 
 /// Reading or validating `expl.toml` failed.
 #[derive(Debug, Error)]
@@ -136,13 +142,14 @@ impl DeclarationFile {
                     agent.group = Some(group.to_owned());
                 }
             }
+            self.route_by_weight();
             self.consumer = self.agent;
         }
         let registration = Registration {
             consumer: self
                 .consumer
                 .iter()
-                .map(|(name, consumer)| (name.clone(), consumer.registration()))
+                .map(|(name, consumer)| (name.clone(), consumer.subscription()))
                 .collect(),
             router: self.router.clone(),
             routing: self.routing.clone(),
@@ -159,6 +166,46 @@ impl DeclarationFile {
         };
         declaration.validate()?;
         Ok(declaration)
+    }
+
+    /// Agents that share their role's events by an inline `weight` become a
+    /// weighted router over those agents, under the role's name as their
+    /// delivery group: the same split, and the recipients recorded for the
+    /// role so far still hold. A role that is routed explicitly keeps that
+    /// routing, and agents without a weight keep reacting to every event.
+    fn route_by_weight(&mut self) {
+        for handler in Handler::ALL {
+            let role = handler.as_str();
+            if self.routing.contains_key(role) {
+                continue;
+            }
+            let weights: BTreeMap<String, u32> = self
+                .agent
+                .iter()
+                .filter(|(_, agent)| agent.handler == handler)
+                .filter_map(|(name, agent)| agent.weight.map(|weight| (name.clone(), weight)))
+                .collect();
+            if weights.is_empty() {
+                continue;
+            }
+            for name in weights.keys() {
+                if let Some(agent) = self.agent.get_mut(name) {
+                    agent.group = Some(role.to_owned());
+                }
+            }
+            let router = format!("{role}:weight");
+            self.router.insert(
+                router.clone(),
+                RouterDeclaration {
+                    targets: weights.keys().cloned().collect(),
+                    policy: RoutingPolicy::Weighted,
+                    // The split is all the router is for: no limit of its own.
+                    concurrency: NonZeroUsize::MAX,
+                    weights,
+                },
+            );
+            self.routing.insert(role.to_owned(), router);
+        }
     }
 }
 
@@ -262,7 +309,7 @@ pub enum Scope {
 impl ConsumerDeclaration {
     /// What the runtime needs to deliver this consumer's events: its
     /// subscription, group and limits.
-    fn registration(&self) -> ConsumerRegistration {
+    fn subscription(&self) -> ConsumerRegistration {
         ConsumerRegistration {
             on: self
                 .on
@@ -274,6 +321,10 @@ impl ConsumerDeclaration {
             concurrency: self.concurrency,
             exclusive: self.handler.is_exclusive(),
             coalesce: self.handler.coalesces(),
+            attributes: BTreeMap::from([(
+                "expl.handler".to_owned(),
+                self.handler.as_str().to_owned(),
+            )]),
             ..ConsumerRegistration::default()
         }
     }
@@ -527,53 +578,56 @@ concurrency = 1
         &self.registration
     }
 
+    /// Everything this explorer registers with the framework for the
+    /// project at `root`, operated through `program` (the `expl` binary):
+    /// each consumer with the command that makes one reaction of its
+    /// handler, the command an idle exploration revisits a starting point
+    /// with, and the task that follows the trunk. The commands run on the
+    /// leader, beside the graph.
+    #[must_use]
+    pub fn registration_for(&self, program: &Path, root: &Path) -> Registration {
+        let command = |arguments: &[&str]| -> Vec<String> {
+            [
+                program.to_string_lossy().into_owned(),
+                "-C".to_owned(),
+                root.to_string_lossy().into_owned(),
+            ]
+            .into_iter()
+            .chain(arguments.iter().map(|&argument| argument.to_owned()))
+            .collect()
+        };
+        let mut registration = self.registration.clone();
+        for (name, consumer) in &mut registration.consumer {
+            consumer.run = command(&["react", name]);
+            let declared = &self.consumer[name];
+            if let Some(cooldown) = declared.revisit_cooldown
+                && declared.on.contains(&EventKind::NodeRevisited)
+            {
+                consumer.idle = Some(IdleCommand {
+                    after: cooldown,
+                    run: command(&["revisit", name]),
+                });
+            }
+        }
+        registration.task.insert(
+            "follow".to_owned(),
+            TaskRegistration {
+                every: FOLLOW_SECONDS,
+                run: command(&["follow"]),
+            },
+        );
+        registration
+    }
+
     /// Whether this consumer is reachable through its delivery group's router.
     #[must_use]
     pub fn is_assigned(&self, name: &str) -> bool {
         self.registration.is_assigned(name)
     }
 
+    #[cfg(test)]
     pub(crate) fn route_for(&self, name: &str) -> Option<Route<'_>> {
         self.registration.route_for(name)
-    }
-
-    /// When the agent named `agent` shares its role's events by weight,
-    /// the agent `event` is routed to (possibly `agent` itself); `None`
-    /// when `agent` declares no weight, i.e. it reacts to every event. The
-    /// choice depends only on the event and the declaration; processes that
-    /// loaded different weights may propose differently, so it is only a
-    /// proposal for [`Inbox::assign`](crate::event::Inbox::assign), whose
-    /// recorded assignment every process obeys.
-    #[must_use]
-    pub(crate) fn legacy_route(&self, agent: &str, event: EventId) -> Option<&str> {
-        let role = self.consumer.get(agent)?.handler;
-        self.consumer.get(agent)?.weight?;
-        let shares: Vec<(&str, u64)> = self
-            .consumer
-            .iter()
-            .filter(|(_, a)| a.handler == role)
-            .filter_map(|(name, a)| a.weight.map(|w| (name.as_str(), u64::from(w))))
-            .collect();
-        let total: u64 = shares.iter().map(|(_, w)| w).sum();
-        let mut point = spread(event.0 as u64) % total;
-        for (name, weight) in shares {
-            if point < weight {
-                return Some(name);
-            }
-            point -= weight;
-        }
-        None
-    }
-
-    /// Whether `other` shares `agent`'s role by weight in this declaration:
-    /// an assignment to an agent that does not (one since removed, or no
-    /// longer weighted) would never be handled.
-    #[must_use]
-    pub(crate) fn legacy_shares_with(&self, agent: &str, other: &str) -> bool {
-        match (self.consumer.get(agent), self.consumer.get(other)) {
-            (Some(agent), Some(other)) => agent.handler == other.handler && other.weight.is_some(),
-            _ => false,
-        }
     }
 
     /// Whether an assigned consumer handles this event with the given operation.
@@ -596,20 +650,12 @@ concurrency = 1
     }
 }
 
-/// `SplitMix64`: consecutive event ids land far apart, so routing by weight
-/// does not alternate in lockstep with the event log.
-fn spread(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::event::EventId;
 
     #[test]
     fn template_is_a_valid_declaration() {
@@ -694,20 +740,31 @@ execution = "check"
             legacy.replace("breadth = 3\n", "breadth = 3\nweight = 3\n")
         );
         let declaration = Declaration::parse(&text).expect("parses");
+        // The weighted agents are routed as one group, named for their role.
+        let explorer = declaration.route_for("explorer").expect("route");
+        let contrarian = declaration.route_for("contrarian").expect("route");
+        assert_eq!(explorer.group(), "exploration");
         let mut counts = BTreeMap::new();
         for id in 1..=4000 {
-            let explorer = declaration.legacy_route("explorer", EventId(id));
-            let contrarian = declaration.legacy_route("contrarian", EventId(id));
-            assert_eq!(explorer, contrarian, "every agent agrees on e{id}");
-            *counts.entry(explorer.expect("routed")).or_insert(0) += 1;
+            let chosen = explorer.select("goal.added", EventId(id));
+            assert_eq!(
+                chosen,
+                contrarian.select("goal.added", EventId(id)),
+                "every agent agrees on e{id}"
+            );
+            *counts.entry(chosen.to_owned()).or_insert(0) += 1;
         }
         assert!((2800..3200).contains(&counts["explorer"]), "{counts:?}");
         assert!((800..1200).contains(&counts["contrarian"]), "{counts:?}");
+        // The split is all the router does: it limits nothing.
+        assert!(
+            explorer
+                .groups("explorer")
+                .all(|(_, limit)| limit == NonZeroUsize::MAX)
+        );
         // Unweighted agents react to everything of their role.
-        assert_eq!(declaration.legacy_route("planner", EventId(1)), None);
-        assert!(declaration.legacy_shares_with("explorer", "contrarian"));
-        assert!(!declaration.legacy_shares_with("explorer", "removed"));
-        assert!(!declaration.legacy_shares_with("explorer", "planner"));
+        assert!(declaration.route_for("planner").is_none());
+        assert!(declaration.is_assigned("planner"));
 
         let zero = legacy.replace("breadth = 3\n", "breadth = 3\nweight = 0\n");
         let error = Declaration::parse(&zero).expect_err("zero weight");

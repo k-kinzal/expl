@@ -3,7 +3,9 @@
 //! An explorer owns its event vocabulary and state transitions, and
 //! [registers](registration) what reacts to which events. This crate owns
 //! the rest: the [event log](event) and its [delivery](delivery) with
-//! routing and [concurrency limits](capacity), worker lifecycles, command
+//! routing and [concurrency limits](capacity), the [workers](worker) that
+//! execute a consumer's command for each event under the
+//! [reaction contract](reaction), their [process table](process), command
 //! drivers, and execution on one machine or across members sharing a
 //! cluster directory.
 
@@ -17,7 +19,9 @@ pub mod delivery;
 pub mod event;
 pub mod git;
 mod interrupt;
+pub mod process;
 pub mod prompt;
+pub mod reaction;
 pub mod registration;
 pub mod store;
 pub mod telemetry;

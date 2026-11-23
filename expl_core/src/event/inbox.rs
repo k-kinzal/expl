@@ -7,7 +7,9 @@ use std::path::Path;
 
 use expl_runtime::delivery as runtime;
 
-use crate::declaration::{Declaration, Route};
+use crate::declaration::Declaration;
+#[cfg(test)]
+use crate::declaration::Route;
 use crate::event::{Event, EventId, EventKind};
 use crate::graph::NodeId;
 use crate::process::ProcessId;
@@ -43,17 +45,25 @@ impl Delivery {
 
     /// The runtime's delivery, when its event is one the graph records.
     fn typed(delivery: runtime::Delivery) -> Result<Self, rusqlite::Error> {
-        let kind = delivery.event.kind.parse().map_err(|reason: String| {
+        Self::try_from(delivery).map_err(|reason| {
             rusqlite::Error::FromSqlConversionFailure(
                 1,
                 rusqlite::types::Type::Text,
                 Box::new(std::io::Error::other(reason)),
             )
-        })?;
+        })
+    }
+}
+
+impl TryFrom<runtime::Delivery> for Delivery {
+    /// Why the event is not one the graph records.
+    type Error = String;
+
+    fn try_from(delivery: runtime::Delivery) -> Result<Self, Self::Error> {
         Ok(Self {
             event: Event {
                 id: delivery.event.id,
-                kind,
+                kind: delivery.event.kind.parse()?,
                 node: delivery.event.subject.map(NodeId),
                 created_at: delivery.event.created_at,
             },
@@ -63,6 +73,7 @@ impl Delivery {
     }
 }
 
+#[cfg(test)]
 pub(crate) enum Lease<T> {
     Idle,
     AtCapacity,
@@ -97,11 +108,12 @@ impl Inbox {
         self.inbox.consumer()
     }
 
-    /// Trace context of the producer of this durable event, if it had one.
-    /// A telemetry lookup must never affect delivery of the event itself.
+    /// The span that produced this durable event, if it was traced, as the
+    /// runtime's worker links a delivery to it.
+    #[cfg(test)]
     pub(crate) fn cause(&self, id: EventId) -> Option<opentelemetry::trace::SpanContext> {
         let (parent, state) = self.inbox.trace_context(id)?;
-        crate::telemetry::extract(parent, state)
+        expl_runtime::telemetry::remote_span(&parent, state.as_deref())
     }
 
     /// Lease the next deliverable event of `kinds` to `process`: the
@@ -138,6 +150,7 @@ impl Inbox {
     /// Find or record an event's recipient before taking a delivery. Try
     /// to acquire capacity only for work that belongs to this consumer, and
     /// leave the event unleased when no slot is available.
+    #[cfg(test)]
     pub(crate) fn lease_with<T, E: From<rusqlite::Error>>(
         &mut self,
         kinds: &[EventKind],
@@ -302,6 +315,7 @@ impl Inbox {
     /// # Errors
     ///
     /// SQLite failure.
+    #[cfg(test)]
     pub(crate) fn assign(
         &self,
         group: &str,
@@ -317,6 +331,7 @@ impl Inbox {
     /// # Errors
     ///
     /// SQLite failure.
+    #[cfg(test)]
     pub(crate) fn reassign(
         &self,
         group: &str,
@@ -332,6 +347,7 @@ impl Inbox {
     /// # Errors
     ///
     /// SQLite failure.
+    #[cfg(test)]
     pub(crate) fn assignment(
         &self,
         group: &str,

@@ -1,12 +1,12 @@
-//! [`Processes`] — the process table in the project database.
+//! [`Processes`] — the process table in an explorer's database.
 
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::process::ProcessOptions;
-use crate::process::{ProcessId, ProcessRecord, ProcessState, ProcessStatus};
-use crate::store::{self, EPOCH, NOW, StoreError};
+use crate::event::{EPOCH, NOW};
+use crate::process::{ProcessId, ProcessOptions, ProcessRecord, ProcessState, ProcessStatus};
+use crate::store::{self, StoreError};
 
 /// How often a running process beats.
 pub const HEARTBEAT_SECONDS: u64 = 2;
@@ -81,10 +81,17 @@ impl Processes {
     ///
     /// [`StoreError`] when the database cannot be opened.
     pub fn open(path: &Path, logs: &Path) -> Result<Self, StoreError> {
-        Ok(Self {
-            conn: store::open(path)?,
+        Ok(Self::over(store::open(path)?, logs))
+    }
+
+    /// The process table over a connection the application opened (and
+    /// migrated); logs go to `logs`.
+    #[must_use]
+    pub fn over(conn: Connection, logs: &Path) -> Self {
+        Self {
+            conn,
             logs: logs.to_path_buf(),
-        })
+        }
     }
 
     /// Register a worker for `consumer`, named `name` or `<consumer>-<id>`, to
@@ -171,8 +178,12 @@ impl Processes {
         Ok(())
     }
 
-    /// Recover the queue and the desired detached workers for a new term.
+    /// Recover the queue and the desired detached workers for a new term:
+    /// every lease is expired so its event is delivered again, and the
+    /// workers that were requested are returned to be started.
     /// The elected daemon calls this under the exclusive handover barrier.
+    /// What the application journals about work in flight is its own to
+    /// settle.
     ///
     /// # Errors
     ///
@@ -201,10 +212,6 @@ impl Processes {
             "UPDATE deliveries SET leased_until = 0 WHERE status = 'leased'",
             [],
         )?;
-        tx.execute(&format!(
-            "UPDATE agent_runs SET status = 'interrupted', error = 'leader changed', finished_at = {NOW}
-             WHERE status = 'running'"
-        ), [])?;
         let workers = {
             let mut query = tx.prepare(&format!(
                 "SELECT {COLUMNS}, run_once, exit_when_idle FROM processes
@@ -403,16 +410,13 @@ impl Processes {
         Ok(())
     }
 
-    /// Forget a record.
+    /// Forget a record. Rows of the application that refer to it must be
+    /// detached first.
     ///
     /// # Errors
     ///
     /// SQLite failure.
     pub fn remove(&self, id: ProcessId) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "UPDATE agent_runs SET process_id = NULL WHERE process_id = ?1",
-            [id.0],
-        )?;
         self.conn
             .execute("DELETE FROM processes WHERE id = ?1", [id.0])?;
         Ok(())
@@ -425,7 +429,9 @@ mod tests {
 
     fn table() -> (tempfile::TempDir, Processes) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let table = Processes::open(&dir.path().join("expl.db"), dir.path()).expect("open");
+        let conn = store::open(&dir.path().join("explorer.db")).expect("open");
+        store::initialize(&conn).expect("tables");
+        let table = Processes::over(conn, dir.path());
         (dir, table)
     }
 
