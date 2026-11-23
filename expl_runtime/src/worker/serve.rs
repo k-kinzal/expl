@@ -25,8 +25,8 @@ use crate::reaction::{self, Mode, Outcome, Reaction};
 use crate::registration::{ConsumerRegistration, Placement, Registration, TaskRegistration};
 use crate::store::{self, StoreError};
 use crate::telemetry;
+use crate::worker::heartbeat::{Active, with_heartbeat};
 use crate::worker::telemetry::{Phase, WorkerTelemetry};
-use crate::worker::{Active, with_heartbeat};
 
 /// How long an idle worker waits before looking at its inbox again.
 const POLL: Duration = Duration::from_millis(500);

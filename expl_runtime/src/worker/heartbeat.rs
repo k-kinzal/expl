@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 use crate::Interrupt;
 
-/// A worker's one in-flight delivery. The lease may be any application type.
+/// A worker's one in-flight delivery.
 #[derive(Debug)]
-pub struct Active<L>(Mutex<Option<(L, Interrupt)>>);
+pub(crate) struct Active<L>(Mutex<Option<(L, Interrupt)>>);
 
 impl<L> Default for Active<L> {
     fn default() -> Self {
@@ -19,7 +19,7 @@ impl<L> Default for Active<L> {
 
 impl<L> Active<L> {
     /// Run one reaction, exposing its lease to the heartbeat until it returns.
-    pub fn react<T>(&self, lease: L, interrupt: &Interrupt, run: impl FnOnce() -> T) -> T {
+    pub(crate) fn react<T>(&self, lease: L, interrupt: &Interrupt, run: impl FnOnce() -> T) -> T {
         *self
             .0
             .lock()
@@ -30,7 +30,7 @@ impl<L> Active<L> {
 
     /// Renew the current lease. Return false from `renew` to cancel the
     /// reaction because a different worker now holds the delivery.
-    pub fn renew(&self, renew: impl FnOnce(&L) -> bool) {
+    pub(crate) fn renew(&self, renew: impl FnOnce(&L) -> bool) {
         let held = self
             .0
             .lock()
@@ -55,9 +55,9 @@ impl<L> Drop for Clear<'_, L> {
     }
 }
 
-/// Run a worker alongside its heartbeat. The application supplies its own
-/// durable queue, event selection and settlement logic.
-pub fn with_heartbeat<L: Send, T>(
+/// Run the worker's delivery loop alongside its heartbeat: `beat` runs every
+/// `interval` on a thread of its own until `serve` returns.
+pub(crate) fn with_heartbeat<L: Send, T>(
     interval: Duration,
     mut beat: impl FnMut(&Active<L>) + Send,
     serve: impl FnOnce(&Active<L>) -> T,
