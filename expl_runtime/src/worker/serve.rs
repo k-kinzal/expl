@@ -751,13 +751,15 @@ impl Worker<'_> {
         }
     }
 
-    /// `argv` as a command in the explorer's directory.
+    /// `argv` as a command in the explorer's directory, told where the
+    /// explorer's database is.
     fn command(&self, argv: &[String], env: &BTreeMap<String, String>) -> Command {
         let mut command = Command::new(argv.first().map_or("", String::as_str));
         command
             .args(argv.iter().skip(1))
             .current_dir(self.directory)
-            .envs(env);
+            .envs(env)
+            .env(daemon::DATABASE, self.database);
         command
     }
 
@@ -1526,6 +1528,21 @@ mod tests {
             .expect("age");
         assert_eq!(due(&mut first) + due(&mut second), 1);
         assert_eq!((due(&mut first), due(&mut second)), (0, 0));
+    }
+
+    #[test]
+    fn every_command_is_told_where_the_explorers_database_is() {
+        let mut explorer = Explorer::new(r#"echo "$EXPL_RUNTIME_DATABASE" >> @DIR@/calls"#);
+        let run = explorer.shell(r#"echo "$EXPL_RUNTIME_DATABASE" >> @DIR@/ticks"#);
+        explorer
+            .registration
+            .task
+            .insert("tick".to_owned(), TaskRegistration { every: 3600, run });
+        explorer.publish(None);
+        explorer.until_idle();
+        let database = explorer.database.display().to_string();
+        assert_eq!(explorer.lines("calls"), [database.as_str()]);
+        assert_eq!(explorer.lines("ticks"), [database.as_str()]);
     }
 
     #[test]

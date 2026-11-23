@@ -21,6 +21,10 @@
 //! | `EXPL_REACTION` | `react`, or `abandon` to clean up after a holder that died on the last attempt |
 //! | `EXPL_OUTCOME` | the file to write the outcome to |
 //! | `TRACEPARENT`, `TRACESTATE` | the delivery's span, when it is traced |
+//!
+//! The command runs in the explorer's directory and finds the explorer's
+//! database in [`DATABASE`](crate::daemon::DATABASE), as do the explorer's
+//! tasks and idle commands.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};

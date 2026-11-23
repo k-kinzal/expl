@@ -48,6 +48,9 @@ pub const ORIGIN: &str = "EXPL_RUNTIME_ORIGIN";
 /// The pool of the explorer a worker serves, for the commands it executes:
 /// the agents they invoke count against that pool's limit.
 pub const POOL: &str = "EXPL_RUNTIME_POOL";
+/// The database of the explorer a worker serves, for the commands it
+/// executes: where the explorer's state and its events are.
+pub const DATABASE: &str = "EXPL_RUNTIME_DATABASE";
 
 /// A daemon operation failed.
 #[derive(Debug, Error)]
@@ -457,6 +460,12 @@ pub fn enter() -> io::Result<Option<(Authority, File)>> {
 #[must_use]
 pub fn bound_directory() -> Option<PathBuf> {
     std::env::var_os(PROJECT).map(PathBuf::from)
+}
+
+/// The database of the explorer this command was executed for by a worker.
+#[must_use]
+pub fn bound_database() -> Option<PathBuf> {
+    std::env::var_os(DATABASE).map(PathBuf::from)
 }
 
 /// The directory a forwarded operation was typed in.
