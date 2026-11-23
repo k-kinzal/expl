@@ -30,6 +30,7 @@ use crate::agent::{
 };
 use crate::cluster::{Cluster, CommandSpec, Outcome};
 use crate::command::{CliDeclaration, TimeoutError};
+use crate::control::{self, AcquireError};
 use crate::prompt::Prompt;
 use crate::telemetry;
 
@@ -79,6 +80,8 @@ pub struct Agent {
     /// Where the next invocation's route starts.
     turn: AtomicUsize,
     cluster: Option<Cluster>,
+    /// The pool whose limit its invocations count against under a daemon.
+    pool: Option<String>,
 }
 
 /// One driver, with its own environment and attempt timeout.
@@ -160,6 +163,7 @@ impl Agent {
             // Replicas start their routes at different CLIs.
             turn: AtomicUsize::new(std::process::id() as usize),
             cluster: None,
+            pool: None,
         }
     }
 
@@ -174,10 +178,20 @@ impl Agent {
         self
     }
 
-    /// Route command attempts through cluster members.
+    /// Route command attempts through cluster members, under the daemon's
+    /// [agent control](crate::control): each attempt waits for a slot of
+    /// the daemon's limit (and of its pool's, see [`Self::in_pool`]).
     #[must_use]
     pub fn with_cluster(mut self, cluster: Cluster) -> Self {
         self.cluster = Some(cluster);
+        self
+    }
+
+    /// Count the agent's invocations against `pool`'s limit under a
+    /// daemon: the pool its explorer registered.
+    #[must_use]
+    pub fn in_pool(mut self, pool: &str) -> Self {
+        self.pool = Some(pool.to_owned());
         self
     }
 
@@ -332,6 +346,23 @@ impl Agent {
         writeln!(log, "=== command: {:?}", command.process)?;
         writeln!(log, "=== prompt ===\n{}\n=== output ===", invocation.prompt)?;
         if let Some(cluster) = &self.cluster {
+            // The daemon decides how many agents run at once. Waiting for
+            // a slot is not part of the attempt: its timeout starts after.
+            let slots =
+                control::acquire(cluster, self.pool.as_deref(), invocation.interrupt, || {
+                    writeln!(log, "=== waiting for an agent slot ===").ok();
+                });
+            let _slots = match slots {
+                Ok(slots) => slots,
+                Err(AcquireError::Interrupted) => {
+                    writeln!(log, "=== interrupted ===")?;
+                    return Err(AgentError::Interrupted);
+                }
+                Err(AcquireError::Io(error)) => return Err(AgentError::Io(error)),
+                Err(AcquireError::Control(error)) => {
+                    return Err(AgentError::Launch(format!("agent control: {error}")));
+                }
+            };
             let spec = CommandSpec::capture(&command.process, invocation.directory);
             let mut stdout = RemoteLog::new(log.try_clone()?, "");
             let mut stderr = RemoteLog::new(log.try_clone()?, "[stderr] ");

@@ -13,6 +13,7 @@ use crate::handler::Handler;
 use crate::project::Project;
 
 pub use expl_runtime::command::{CliDeclaration, Timeout, TimeoutError};
+use expl_runtime::control::{ControlError, NamedAgent};
 #[cfg(test)]
 pub(crate) use expl_runtime::registration::Route;
 use expl_runtime::registration::{
@@ -50,6 +51,23 @@ pub enum DeclarationError {
     /// No consumer has this name.
     #[error("no consumer named `{0}` in expl.toml")]
     UnknownConsumer(String),
+    /// A consumer names daemon agents, and the project runs under none.
+    #[error(
+        "consumer `{0}` names daemon agents (`agents`), which only a daemon defines: run the \
+         project under one (`expl daemon`), or declare `driver` and `command`"
+    )]
+    NoDaemon(String),
+    /// A consumer names an agent its daemon does not define.
+    #[error("consumer `{consumer}`: the daemon defines no agent named `{agent}` (daemon.toml)")]
+    UnknownAgent {
+        /// The consumer.
+        consumer: String,
+        /// The name it uses.
+        agent: String,
+    },
+    /// The daemon's agent control could not be read.
+    #[error(transparent)]
+    Control(Box<ControlError>),
     /// A consumer's `timeout` (or one of its alternatives') is zero or not a
     /// duration.
     #[error("consumer `{consumer}`: invalid `timeout`: {source}")]
@@ -62,6 +80,12 @@ pub enum DeclarationError {
     },
 }
 
+impl From<ControlError> for DeclarationError {
+    fn from(error: ControlError) -> Self {
+        Self::Control(Box::new(error))
+    }
+}
+
 /// The whole `expl.toml`, with legacy declarations normalized to consumers.
 #[derive(Debug, Clone, Serialize)]
 pub struct Declaration {
@@ -72,6 +96,10 @@ pub struct Declaration {
     /// OpenTelemetry export for this project.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<TelemetryDeclaration>,
+    /// The pool whose shared agent limit this project counts against under
+    /// a daemon (default: one of its own, named after the project).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
     /// Named event consumers.
     pub consumer: BTreeMap<String, ConsumerDeclaration>,
     /// Named routers, whose targets are consumers or other routers.
@@ -93,6 +121,8 @@ struct DeclarationFile {
     workspace: WorkspaceDeclaration,
     #[serde(default)]
     telemetry: Option<TelemetryDeclaration>,
+    #[serde(default)]
+    pool: Option<String>,
     #[serde(default)]
     consumer: BTreeMap<String, ConsumerDeclaration>,
     #[serde(default)]
@@ -153,12 +183,14 @@ impl DeclarationFile {
                 .collect(),
             router: self.router.clone(),
             routing: self.routing.clone(),
+            pool: self.pool.clone(),
             ..Registration::default()
         };
         let declaration = Declaration {
             trunk: self.trunk,
             workspace: self.workspace,
             telemetry: self.telemetry,
+            pool: self.pool,
             consumer: self.consumer,
             router: self.router,
             routing: self.routing,
@@ -244,10 +276,19 @@ pub struct ConsumerDeclaration {
     /// Optional shared delivery group, declared under `[routing]`.
     #[serde(default)]
     pub group: Option<String>,
-    /// Which driver translates for its CLI.
-    pub driver: DriverKind,
+    /// Which driver translates for its CLI. Declared together with
+    /// `command`, unless the consumer names daemon `agents` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<DriverKind>,
     /// Program and leading arguments, e.g. `["claude"]`.
+    #[serde(default)]
     pub command: Vec<String>,
+    /// Agents of the daemon the project runs under, by the names its
+    /// operator gave them (`agents = ["claude", "cursor"]`), instead of a
+    /// `driver` and `command` of the consumer's own. Their CLIs take turns
+    /// in this order, before any `alternative`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<String>,
     /// Extra arguments appended after the driver's own flags.
     #[serde(default)]
     pub args: Vec<String>,
@@ -335,22 +376,47 @@ impl ConsumerDeclaration {
         self.weight
     }
 
-    /// Every CLI of the agent, primary first, each with the `timeout` that
-    /// bounds it (its own, else the agent's).
+    /// Every CLI the consumer declares itself, primary first, each with
+    /// the `timeout` that bounds it (its own, else the consumer's). A
+    /// consumer that names daemon `agents` declares only its alternatives;
+    /// [`Self::clis_among`] puts the named agents before them.
     #[must_use]
     pub fn clis(&self) -> Vec<CliDeclaration> {
-        let primary = CliDeclaration {
-            driver: self.driver,
+        let primary = self.driver.map(|driver| CliDeclaration {
+            driver,
             command: self.command.clone(),
             args: self.args.clone(),
             env: BTreeMap::new(),
             timeout: self.timeout.clone(),
-        };
+        });
         let alternatives = self.alternative.iter().map(|cli| CliDeclaration {
             timeout: cli.timeout.clone().or_else(|| self.timeout.clone()),
             ..cli.clone()
         });
-        std::iter::once(primary).chain(alternatives).collect()
+        primary.into_iter().chain(alternatives).collect()
+    }
+
+    /// Every CLI of the consumer under a daemon whose operator defined
+    /// `named`: the CLIs of each agent it names, in order, then its own.
+    /// The consumer's `timeout` bounds a named CLI that has none.
+    ///
+    /// # Errors
+    ///
+    /// The first name the daemon does not define.
+    pub fn clis_among(
+        &self,
+        named: &BTreeMap<String, NamedAgent>,
+    ) -> Result<Vec<CliDeclaration>, String> {
+        let mut clis = Vec::new();
+        for name in &self.agents {
+            let agent = named.get(name).ok_or_else(|| name.clone())?;
+            clis.extend(agent.clis().into_iter().map(|cli| CliDeclaration {
+                timeout: cli.timeout.clone().or_else(|| self.timeout.clone()),
+                ..cli
+            }));
+        }
+        clis.extend(self.clis());
+        Ok(clis)
     }
 }
 
@@ -377,6 +443,11 @@ impl Declaration {
 # A consumer may use further CLIs with [[consumer.<name>.alternative]] (driver,
 # command, args, env). Its invocations are then routed across all of them in
 # turn, falling over to the next CLI when one fails.
+#
+# Under a daemon, a consumer may name agents its operator defined in the
+# daemon's `daemon.toml` (`agents = ["<name>", ...]`) instead of a `driver`
+# and `command` of its own, and a top-level `pool = "<name>"` says whose
+# agent limit the project counts against.
 #
 # An optional `timeout` (seconds, or a duration such as "30m") bounds each
 # CLI attempt: past it, the CLI is stopped and the attempt fails like any
@@ -495,6 +566,13 @@ concurrency = 1
                 "`workspace.remote` must name a configured Git remote".to_owned(),
             ));
         }
+        if self
+            .pool
+            .as_ref()
+            .is_some_and(|pool| pool.trim().is_empty())
+        {
+            return Err(DeclarationError::Invalid("`pool` is empty".to_owned()));
+        }
         if self.workspace.frozen.iter().any(|p| p.trim().is_empty()) {
             return Err(DeclarationError::Invalid(
                 "`workspace.frozen` holds an empty pathspec".to_owned(),
@@ -519,6 +597,28 @@ concurrency = 1
                 && !self.routing.contains_key(group)
             {
                 return invalid(name, &format!("unknown delivery group `{group}`"));
+            }
+            let inline = consumer.driver.is_some() || !consumer.command.is_empty();
+            if inline && !consumer.agents.is_empty() {
+                return invalid(
+                    name,
+                    "declare `driver` and `command`, or name daemon agents with `agents`, not both",
+                );
+            }
+            if !inline && consumer.agents.is_empty() {
+                return invalid(name, "needs `driver` and `command`, or `agents`");
+            }
+            if inline && consumer.driver.is_none() {
+                return invalid(name, "`command` needs a `driver`");
+            }
+            if !inline && !consumer.args.is_empty() {
+                return invalid(
+                    name,
+                    "`args` belong to a `command`; a named agent brings its own",
+                );
+            }
+            if consumer.agents.iter().any(|agent| agent.trim().is_empty()) {
+                return invalid(name, "`agents` holds an empty name");
             }
             if consumer
                 .clis()
@@ -772,6 +872,95 @@ execution = "check"
             error.to_string().contains("`weight` must be >= 1"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_consumer_declares_its_own_cli_or_names_daemon_agents() {
+        let named = Declaration::TEMPLATE
+            .replace(
+                "handler = \"planning\"\ndriver = \"claude_code\"\ncommand = [\"claude\"]\n\
+                 args = [\"--permission-mode\", \"bypassPermissions\"]",
+                "handler = \"planning\"\nagents = [\"claude\", \"cursor\"]\ntimeout = \"20m\"",
+            )
+            .replace("trunk = \"main\"", "trunk = \"main\"\npool = \"general\"");
+        let text = format!(
+            "{named}\n[[consumer.planner.alternative]]\ndriver = \"codex\"\ncommand = [\"codex\"]\n"
+        );
+        let declaration = Declaration::parse(&text).expect("parses");
+        assert_eq!(declaration.pool.as_deref(), Some("general"));
+        assert_eq!(declaration.registration().pool.as_deref(), Some("general"));
+        let planner = &declaration.consumer["planner"];
+        assert_eq!(planner.agents, ["claude", "cursor"]);
+        assert_eq!(planner.driver, None);
+        // By itself it declares only its alternative.
+        assert_eq!(planner.clis().len(), 1);
+
+        let control = expl_runtime::control::Control::parse(
+            "[agent.claude]\ndriver = \"claude_code\"\ncommand = [\"claude\"]\n\
+             args = [\"--model\", \"claude-opus-5-5\"]\n\n\
+             [agent.cursor]\ndriver = \"cursor_agent\"\ncommand = [\"cursor-agent\"]\ntimeout = 60\n",
+        )
+        .expect("control");
+        let clis = planner.clis_among(&control.agent).expect("named");
+        let drivers: Vec<_> = clis.iter().map(|cli| cli.driver).collect();
+        assert_eq!(
+            drivers,
+            [
+                DriverKind::ClaudeCode,
+                DriverKind::CursorAgent,
+                DriverKind::Codex
+            ]
+        );
+        assert_eq!(clis[0].args, ["--model", "claude-opus-5-5"]);
+        // The consumer's timeout bounds a named CLI that has none.
+        let timeouts: Vec<_> = clis
+            .iter()
+            .map(|cli| cli.timeout.as_ref().map(|t| t.duration().expect("valid")))
+            .collect();
+        assert_eq!(
+            timeouts,
+            [
+                Some(Duration::from_secs(1200)),
+                Some(Duration::from_secs(60)),
+                Some(Duration::from_secs(1200))
+            ]
+        );
+        control.agent.get("claude").expect("defined");
+        let mut fewer = control.agent.clone();
+        fewer.remove("cursor");
+        assert_eq!(planner.clis_among(&fewer).expect_err("undefined"), "cursor");
+
+        for (from, to, problem) in [
+            (
+                "agents = [\"claude\", \"cursor\"]",
+                "agents = [\"claude\"]\ndriver = \"generic\"\ncommand = [\"x\"]",
+                "not both",
+            ),
+            (
+                "agents = [\"claude\", \"cursor\"]",
+                "",
+                "needs `driver` and `command`, or `agents`",
+            ),
+            (
+                "agents = [\"claude\", \"cursor\"]",
+                "command = [\"x\"]",
+                "`command` needs a `driver`",
+            ),
+            (
+                "agents = [\"claude\", \"cursor\"]",
+                "agents = [\"claude\"]\nargs = [\"--fast\"]",
+                "`args` belong to a `command`",
+            ),
+            (
+                "agents = [\"claude\", \"cursor\"]",
+                "agents = [\"\"]",
+                "empty name",
+            ),
+            ("pool = \"general\"", "pool = \" \"", "`pool` is empty"),
+        ] {
+            let error = Declaration::parse(&text.replacen(from, to, 1)).expect_err(problem);
+            assert!(error.to_string().contains(problem), "{error}");
+        }
     }
 
     #[test]

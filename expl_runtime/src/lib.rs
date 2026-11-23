@@ -15,6 +15,7 @@ pub mod agent;
 pub mod capacity;
 pub mod cluster;
 pub mod command;
+pub mod control;
 pub mod daemon;
 pub mod delivery;
 pub mod event;

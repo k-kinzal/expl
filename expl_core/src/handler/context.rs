@@ -1,6 +1,7 @@
 //! [`Context`] — the collaborators every reaction shares.
 
 use expl_runtime::cluster::Authority;
+use expl_runtime::control::Control;
 
 use crate::declaration::{Declaration, DeclarationError};
 use crate::event::Consumer;
@@ -69,11 +70,42 @@ impl Context {
     /// [`DeclarationError::UnknownConsumer`], or
     /// [`DeclarationError::Timeout`] for an unusable `timeout`.
     pub fn consumer(&self, name: &str) -> Result<Consumer, DeclarationError> {
-        let consumer = Consumer::new(name, self.declaration.consumer(name)?)?;
-        Ok(match &self.authority {
-            Some(authority) => consumer.with_cluster(authority.cluster().clone()),
-            None => consumer,
-        })
+        let declared = self.declaration.consumer(name)?;
+        let Some(authority) = &self.authority else {
+            if !declared.agents.is_empty() {
+                return Err(DeclarationError::NoDaemon(name.to_owned()));
+            }
+            return Consumer::new(name, declared);
+        };
+        let cluster = authority.cluster();
+        let consumer = if declared.agents.is_empty() {
+            Consumer::new(name, declared)?
+        } else {
+            // The daemon's operator defines the agents a consumer names;
+            // read as they stand now, so a changed model applies to the
+            // next reaction.
+            let named = Control::load(cluster)?.agent;
+            let clis =
+                declared
+                    .clis_among(&named)
+                    .map_err(|agent| DeclarationError::UnknownAgent {
+                        consumer: name.to_owned(),
+                        agent,
+                    })?;
+            Consumer::over(name, declared, clis)?
+        };
+        Ok(consumer.with_cluster(cluster.clone(), &self.pool()))
+    }
+
+    /// The pool this project's agents count against under a daemon: the
+    /// one it declares, else one of its own, named as the project is
+    /// registered.
+    #[must_use]
+    pub fn pool(&self) -> String {
+        self.declaration
+            .pool
+            .clone()
+            .unwrap_or_else(|| self.project.explorer_name())
     }
 
     /// A fresh connection to the project's graph.

@@ -82,7 +82,8 @@ impl Capacity {
     }
 }
 
-fn try_slot(directory: &Path, limit: usize) -> io::Result<Option<Slot>> {
+/// Take the first free slot among the first `limit` of `directory`.
+pub(crate) fn try_slot(directory: &Path, limit: usize) -> io::Result<Option<Slot>> {
     for slot in 0..limit {
         let file = OpenOptions::new()
             .create(true)
@@ -98,7 +99,8 @@ fn try_slot(directory: &Path, limit: usize) -> io::Result<Option<Slot>> {
     Ok(None)
 }
 
-fn directory(root: &Path, kind: &str, name: &str) -> PathBuf {
+/// The slot directory of the limit called `name`, among those of `kind`.
+pub(crate) fn directory(root: &Path, kind: &str, name: &str) -> PathBuf {
     let mut path = root.join(kind);
     // Encode names so slashes, case-insensitive filesystems and long
     // names do not make unrelated groups share a slot directory.

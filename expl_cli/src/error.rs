@@ -7,6 +7,7 @@ use expl_core::{
     DeclarationError, DoctorError, GraphError, HandlerError, ProjectError, StoreError,
     WorkspaceError,
 };
+use expl_runtime::control::ControlError;
 use expl_runtime::daemon::DaemonError;
 use expl_runtime::worker::WorkerError;
 use thiserror::Error;
@@ -57,6 +58,9 @@ pub(crate) enum CliError {
     /// The daemon and the explorers it hosts.
     #[error(transparent)]
     Daemon(#[from] DaemonError),
+    /// The daemon's agent control (`daemon.toml`).
+    #[error(transparent)]
+    Control(#[from] ControlError),
     /// One reaction, run for a worker.
     #[error(transparent)]
     React(#[from] ReactError),
@@ -113,7 +117,9 @@ impl CliError {
                 | DaemonError::Registration { .. },
             )
             | Self::Inconsistent(_) => exit::USER,
-            Self::Declaration(_) | Self::Handler(HandlerError::Declaration(_)) => exit::CONFIG,
+            Self::Declaration(_)
+            | Self::Handler(HandlerError::Declaration(_))
+            | Self::Control(_) => exit::CONFIG,
             Self::Project(ProjectError::Io { .. })
             | Self::Store(_)
             | Self::Database(_)

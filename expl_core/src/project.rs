@@ -117,6 +117,33 @@ impl Project {
         &self.root
     }
 
+    /// The name the project is registered under with a daemon, as one of
+    /// its explorers: the root directory's name, in the characters a
+    /// registry allows.
+    #[must_use]
+    pub fn explorer_name(&self) -> String {
+        let name: String = self
+            .root
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .take(100)
+            .collect();
+        if name.is_empty() {
+            "project".to_owned()
+        } else {
+            name
+        }
+    }
+
     /// `expl.toml`.
     #[must_use]
     pub fn declaration_path(&self) -> PathBuf {

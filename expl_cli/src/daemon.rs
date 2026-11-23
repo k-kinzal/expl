@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use expl_core::{Declaration, Interrupt, ProcessId, ProcessOptions, Project};
 use expl_runtime::cluster::{Authority, Cluster, Peer};
+use expl_runtime::control::Control;
 use expl_runtime::daemon::{self, Explorer, Registry};
 
 use crate::cli::{self, Cli, RuntimeWorkerArgs};
@@ -61,7 +62,7 @@ pub(crate) fn dispatch(mut cli: Cli) -> Result<u8, CliError> {
         let cluster = join_project(&project, cli.cluster.as_deref())?;
         status(&format!(
             "{} joined the daemon at {}",
-            explorer_name(&project),
+            project.explorer_name(),
             cluster.root().display()
         ));
         return Ok(0);
@@ -123,11 +124,20 @@ fn cluster_status(cluster: &Cluster, member: &str, via: Option<&Peer>) -> Result
         .into_iter()
         .map(|explorer| explorer.name)
         .collect();
+    // The limits the operator set, and how much of each is taken now.
+    let control = Control::load(cluster)?;
+    let agents = serde_json::json!({
+        "concurrency": control.agents.concurrency,
+        "in_use": control.usage(cluster).map_err(cluster_error)?.map(|usage| usage.in_use),
+        "named": control.agent.keys().collect::<Vec<_>>(),
+    });
     json_pretty(&serde_json::json!({
         "member": member,
         "role": role,
         "leader": leader.as_ref().map(Peer::name),
         "explorers": explorers,
+        "agents": agents,
+        "pools": control.pool_usage(cluster).map_err(cluster_error)?,
     }))
 }
 
@@ -193,31 +203,6 @@ fn configured(project: &Project) -> Result<Option<PathBuf>, CliError> {
     }
 }
 
-/// The name a project is registered under: its directory's name, in the
-/// characters a registry allows.
-fn explorer_name(project: &Project) -> String {
-    let name: String = project
-        .root()
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .take(100)
-        .collect();
-    if name.is_empty() {
-        "project".to_owned()
-    } else {
-        name
-    }
-}
-
 /// What a project registers with a daemon: its `expl.toml`, with each
 /// consumer's reaction as a command of this binary.
 fn record(project: &Project, declaration: &Declaration) -> Result<Explorer, CliError> {
@@ -230,7 +215,7 @@ fn record(project: &Project, declaration: &Declaration) -> Result<Explorer, CliE
     let mut recover = program.clone();
     recover.push("runtime-recover".to_owned());
     Ok(Explorer {
-        name: explorer_name(project),
+        name: project.explorer_name(),
         directory: project.root().to_path_buf(),
         database: project.database_path(),
         state: project.state_dir(),

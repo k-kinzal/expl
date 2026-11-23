@@ -21,13 +21,26 @@ impl Consumer {
         name: &str,
         declaration: &ConsumerDeclaration,
     ) -> Result<Self, DeclarationError> {
-        let agent =
-            Agent::new(name, declaration.env.clone(), declaration.clis()).map_err(|source| {
-                DeclarationError::Timeout {
-                    consumer: name.to_owned(),
-                    source,
-                }
-            })?;
+        Self::over(name, declaration, declaration.clis())
+    }
+
+    /// Bind a declared event consumer to `clis`: its own, or those of the
+    /// daemon agents it names followed by its own.
+    ///
+    /// # Errors
+    ///
+    /// [`DeclarationError::Timeout`] if a command has an invalid timeout.
+    pub(crate) fn over(
+        name: &str,
+        declaration: &ConsumerDeclaration,
+        clis: Vec<expl_runtime::command::CliDeclaration>,
+    ) -> Result<Self, DeclarationError> {
+        let agent = Agent::new(name, declaration.env.clone(), clis).map_err(|source| {
+            DeclarationError::Timeout {
+                consumer: name.to_owned(),
+                source,
+            }
+        })?;
         Ok(Self {
             name: name.to_owned(),
             declaration: declaration.clone(),
@@ -35,8 +48,14 @@ impl Consumer {
         })
     }
 
-    pub(crate) fn with_cluster(mut self, cluster: expl_runtime::cluster::Cluster) -> Self {
-        self.agent = self.agent.with_cluster(cluster);
+    /// Run the consumer's commands through `cluster`'s members, counted
+    /// against `pool` under the daemon's agent control.
+    pub(crate) fn with_cluster(
+        mut self,
+        cluster: expl_runtime::cluster::Cluster,
+        pool: &str,
+    ) -> Self {
+        self.agent = self.agent.with_cluster(cluster).in_pool(pool);
         self
     }
 

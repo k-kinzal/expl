@@ -35,7 +35,14 @@ pub(crate) fn ls(start: &Path, listing: &ListingArgs) -> Result<(), CliError> {
         let running = live.iter().filter(|r| &r.consumer == name).count();
         let kinds: Vec<&str> = consumer.on.iter().map(|k| k.as_str()).collect();
         let drivers: Vec<_> = consumer.clis().iter().map(|cli| cli.driver).collect();
-        let labels: Vec<&str> = drivers.iter().map(|d| d.label()).collect();
+        // Daemon agents are shown by the names the consumer uses, then its
+        // own CLIs by their drivers.
+        let labels: Vec<String> = consumer
+            .agents
+            .iter()
+            .map(|agent| format!("@{agent}"))
+            .chain(drivers.iter().map(|d| d.label().to_owned()))
+            .collect();
         if listing.format == ListingFormat::Json {
             json_line(&json!({
                 "name": name,
@@ -45,6 +52,7 @@ pub(crate) fn ls(start: &Path, listing: &ListingArgs) -> Result<(), CliError> {
                 "role": consumer.handler,
                 "driver": consumer.driver,
                 "drivers": drivers,
+                "agents": consumer.agents,
                 "replicas": consumer.replicas,
                 "concurrency": consumer.concurrency,
                 "running": running,

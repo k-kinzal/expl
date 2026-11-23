@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::Interrupt;
+use crate::agent::Agent;
 use crate::cluster::{self, Authority, Cluster, CommandSpec, Outcome, Peer};
 use crate::command::run_supervised;
 use crate::process::{ProcessId, ProcessOptions, ProcessRecord, Processes};
@@ -44,6 +45,9 @@ pub const PROJECT: &str = "EXPL_RUNTIME_PROJECT";
 /// The directory a forwarded operation was typed in, so the leader can
 /// resolve the relative paths among its arguments.
 pub const ORIGIN: &str = "EXPL_RUNTIME_ORIGIN";
+/// The pool of the explorer a worker serves, for the commands it executes:
+/// the agents they invoke count against that pool's limit.
+pub const POOL: &str = "EXPL_RUNTIME_POOL";
 
 /// A daemon operation failed.
 #[derive(Debug, Error)]
@@ -461,6 +465,26 @@ pub fn origin() -> Option<PathBuf> {
     std::env::var_os(ORIGIN).map(PathBuf::from)
 }
 
+/// Put `agent` under the control of the daemon this process was started
+/// by: its invocations run on the daemon's members, within the limits of
+/// the daemon and of the explorer's pool. Outside a daemon the agent is
+/// returned as it is. What a registered command calls before it invokes an
+/// agent of its own.
+///
+/// # Errors
+///
+/// The daemon's directory cannot be opened.
+pub fn govern(agent: Agent) -> io::Result<Agent> {
+    let Some(directory) = std::env::var_os(CLUSTER) else {
+        return Ok(agent);
+    };
+    let agent = agent.with_cluster(Cluster::open(Path::new(&directory))?);
+    Ok(match std::env::var(POOL) {
+        Ok(pool) => agent.in_pool(&pool),
+        Err(_) => agent,
+    })
+}
+
 /// Send an operation of the daemon binary through `via` to the leader,
 /// which runs it for the explorer living in `directory`, and copy what it
 /// prints. Returns the exit code to end with.
@@ -700,6 +724,7 @@ pub fn spawn_worker(
         command.arg("--exit-when-idle");
     }
     bind(&mut command, &explorer.directory, authority)?;
+    command.env(POOL, explorer.pool());
     // The child outlives this call; it is not waited for.
     command.spawn()
 }

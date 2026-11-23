@@ -2688,6 +2688,134 @@ fn clustered_workers_use_members_and_survive_a_leader_crash() {
 }
 
 #[test]
+fn a_daemon_limits_agents_across_its_explorers_and_defines_the_ones_they_name() {
+    let first = sandbox();
+    let second = sandbox();
+    let cluster = first.dir.path().join("cluster");
+    let marks = first.dir.path().join("marks");
+    let other = second.dir.path().join("other");
+    // Each verification notes when its agent starts and ends. In between
+    // it holds on until the other project's agent is seen waiting for its
+    // turn (or gives up waiting, when nothing makes agents take turns).
+    for sandbox in [&first, &second] {
+        let agent = sandbox.dir.path().join("agent.sh");
+        let commands = std::fs::read_to_string(&agent).expect("agent").replace(
+            "verification)\n",
+            &format!(
+                "verification)\n  echo start >> \"{marks}\"; n=0\n  \
+                 while ! grep -qs 'waiting for an agent slot' \"{a}\"/* \"{b}\"/* \
+                 && [ $n -lt 300 ]; do sleep 0.1; n=$((n+1)); done\n  \
+                 echo end >> \"{marks}\"\n",
+                marks = marks.display(),
+                a = first.repo.join(".expl/logs").display(),
+                b = other.join(".expl/logs").display(),
+            ),
+        );
+        std::fs::write(agent, commands).expect("instrument fake agent");
+    }
+    // The operator allows one agent at a time across the daemon, and
+    // defines an agent explorers may name.
+    std::fs::create_dir_all(&cluster).expect("daemon directory");
+    std::fs::write(
+        cluster.join("daemon.toml"),
+        format!(
+            "[agents]\nconcurrency = 1\n\n[agent.scripted]\ndriver = \"generic\"\n\
+             command = [\"{}\"]\n",
+            second.dir.path().join("agent.sh").display()
+        ),
+    )
+    .expect("daemon.toml");
+    // The second project's verifier names that agent instead of a CLI.
+    let declaration = second.repo.join("expl.toml");
+    let contents = std::fs::read_to_string(&declaration).expect("declaration");
+    let (before, verifier) = contents
+        .split_once("[consumer.verifier]")
+        .expect("verifier");
+    let (verifier, after) = verifier.split_once("[consumer.").expect("next consumer");
+    let verifier: String = verifier
+        .lines()
+        .filter(|line| !line.starts_with("command = ") && !line.starts_with("args = "))
+        .map(|line| {
+            if line.starts_with("driver = ") {
+                "agents = [\"scripted\"]"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(
+        &declaration,
+        format!("{before}[consumer.verifier]{verifier}\n\n[consumer.{after}"),
+    )
+    .expect("declaration");
+    // Only a daemon defines agents: without one the consumer cannot run.
+    let unmanaged = expl(&second.repo, &["run", "verifier", "--exit-when-idle"]);
+    assert_eq!(unmanaged.status.code(), Some(64), "{unmanaged:?}");
+    assert!(
+        String::from_utf8_lossy(&unmanaged.stderr).contains("which only a daemon defines"),
+        "{unmanaged:?}"
+    );
+
+    let path = cluster.to_str().expect("cluster directory");
+    let _daemon = daemon(&first.repo, "local", Some(&cluster));
+    wait_until(&first.repo, "the daemon", || {
+        member_role(&first.repo, "local", "leader")
+    });
+    // A name belongs to the explorer that registered it: both projects
+    // live in a directory called `repo`.
+    let refused = expl(&second.repo, &["--cluster", path, "join"]);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("already registered"),
+        "{refused:?}"
+    );
+    std::fs::rename(&second.repo, &other).expect("rename the second project");
+    ok(&other, &["--cluster", path, "join"]);
+    assert_eq!(
+        json(&ok(&other, &["cluster", "status"]))["explorers"],
+        serde_json::json!(["other", "repo"])
+    );
+    assert!(ok(&other, &["consumer", "ls"]).contains("@scripted"));
+
+    let mut steps = Vec::new();
+    for repo in [&first.repo, &other] {
+        ok(repo, &["goal", "add", "greet"]);
+        steps.push(ok(repo, &["node", "add", "write it", "--priority", "1"]));
+        ok(repo, &["up", "verifier"]);
+    }
+    for (repo, step) in [&first.repo, &other].into_iter().zip(&steps) {
+        wait_until(repo, "the verification to complete", || {
+            node(repo, step)["node"]["status"] == "completed"
+        });
+    }
+    // One agent ran at a time, although the two belong to different
+    // explorers with workers of their own.
+    assert_eq!(
+        std::fs::read_to_string(&marks).expect("marks"),
+        "start\nend\nstart\nend\n"
+    );
+    let waited = [&first.repo, &other].into_iter().any(|repo| {
+        std::fs::read_dir(repo.join(".expl/logs"))
+            .expect("logs")
+            .flatten()
+            .any(|log| {
+                std::fs::read_to_string(log.path())
+                    .unwrap_or_default()
+                    .contains("=== waiting for an agent slot ===")
+            })
+    });
+    assert!(waited, "no agent had to wait for the other explorer's");
+    let status = json(&ok(&other, &["cluster", "status"]));
+    assert_eq!(status["agents"]["concurrency"], 1, "{status}");
+    assert_eq!(status["agents"]["in_use"], 0, "{status}");
+    assert_eq!(status["agents"]["named"], serde_json::json!(["scripted"]));
+    for repo in [&first.repo, &other] {
+        ok(repo, &["down", "--time", &down_time()]);
+    }
+}
+
+#[test]
 fn a_single_daemon_serves_the_same_cli_and_uses_a_git_remote() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
