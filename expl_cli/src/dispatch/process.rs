@@ -17,7 +17,9 @@ pub(crate) fn process(start: &Path, command: ProcessCommand) -> Result<(), CliEr
     let table = processes(&project)?;
     match command {
         ProcessCommand::Ls(args) => ls(&table, &args),
-        ProcessCommand::Inspect(args) => json_pretty(&resolve(&table, &args.process)?),
+        ProcessCommand::Inspect(args) => {
+            json_pretty(&ProcessOutput::from(&resolve(&table, &args.process)?))
+        }
         ProcessCommand::Logs(args) => {
             let record = resolve(&table, &args.process)?;
             logs::print_log(&table, &record, args.follow)
@@ -60,6 +62,23 @@ pub(crate) fn process(start: &Path, command: ProcessCommand) -> Result<(), CliEr
     }
 }
 
+/// Include the old JSON field for callers that still read it.
+#[derive(serde::Serialize)]
+struct ProcessOutput<'a> {
+    #[serde(flatten)]
+    record: &'a ProcessRecord,
+    agent: &'a str,
+}
+
+impl<'a> From<&'a ProcessRecord> for ProcessOutput<'a> {
+    fn from(record: &'a ProcessRecord) -> Self {
+        Self {
+            record,
+            agent: &record.consumer,
+        }
+    }
+}
+
 fn ls(table: &Processes, args: &PsArgs) -> Result<(), CliError> {
     let records = table.list(args.all)?;
     if args.listing.quiet {
@@ -70,16 +89,18 @@ fn ls(table: &Processes, args: &PsArgs) -> Result<(), CliError> {
     }
     if args.listing.format == ListingFormat::Json {
         for record in &records {
-            json_line(record)?;
+            json_line(&ProcessOutput::from(record))?;
         }
         return Ok(());
     }
-    let mut out = Table::new(&["ID", "NAME", "AGENT", "STATE", "PID", "CREATED", "STATUS"]);
+    let mut out = Table::new(&[
+        "ID", "NAME", "CONSUMER", "STATE", "PID", "CREATED", "STATUS",
+    ]);
     for record in &records {
         out.row(vec![
             record.id.to_string(),
             record.name.clone(),
-            record.agent.clone(),
+            record.consumer.clone(),
             record.state.to_string(),
             record.pid.map_or_else(|| "-".to_owned(), |p| p.to_string()),
             record.created_at.clone(),

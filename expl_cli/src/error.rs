@@ -3,8 +3,8 @@
 use expl_core::agent::AgentError;
 use expl_core::git::GitError;
 use expl_core::{
-    DeclarationError, DoctorError, GraphError, ProcessError, ProjectError, RoleError, StoreError,
-    WorkspaceError,
+    DeclarationError, DoctorError, GraphError, HandlerError, ProcessError, ProjectError,
+    StoreError, WorkspaceError,
 };
 use thiserror::Error;
 
@@ -47,7 +47,7 @@ pub(crate) enum CliError {
     Workspace(#[from] WorkspaceError),
     /// A role.
     #[error(transparent)]
-    Role(#[from] RoleError),
+    Handler(#[from] HandlerError),
     /// A process.
     #[error(transparent)]
     Process(#[from] ProcessError),
@@ -84,7 +84,7 @@ impl CliError {
         match self {
             Self::Usage(_)
             | Self::Project(ProjectError::NotARepository(..) | ProjectError::NotInitialized(_))
-            | Self::Declaration(DeclarationError::UnknownAgent(_))
+            | Self::Declaration(DeclarationError::UnknownConsumer(_))
             | Self::Graph(
                 GraphError::NodeNotFound(_)
                 | GraphError::NotInStatus { .. }
@@ -92,14 +92,14 @@ impl CliError {
             )
             | Self::Process(ProcessError::NotAdoptable(_))
             | Self::Inconsistent(_) => exit::USER,
-            Self::Declaration(_) | Self::Role(RoleError::Declaration(_)) => exit::CONFIG,
+            Self::Declaration(_) | Self::Handler(HandlerError::Declaration(_)) => exit::CONFIG,
             Self::Project(ProjectError::Io { .. })
             | Self::Store(_)
             | Self::Database(_)
             | Self::Graph(_)
             | Self::Git(_)
             | Self::Workspace(_)
-            | Self::Role(_)
+            | Self::Handler(_)
             | Self::Process(_)
             | Self::Agent(_)
             | Self::Doctor(_)

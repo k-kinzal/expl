@@ -44,8 +44,8 @@ use crate::graph::{
     Answer, ChangeResult, Conclusion, Decision, Graph, GraphError, Node, NodeId, NodeKind,
     NodeStatus,
 };
+use crate::handler::{Abandonment, HandlerError, Reaction, Report};
 use crate::prompt::Prompt;
-use crate::role::{Abandonment, Reaction, Report, RoleError};
 use crate::trunk::Trunk;
 use crate::workspace::{AgentClone, Workspace, WorkspaceError};
 
@@ -105,7 +105,7 @@ fn schema() -> serde_json::Value {
     })
 }
 
-pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, RoleError> {
+pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, HandlerError> {
     let id = reaction.subject()?;
     let node = graph.node(id)?;
     if node.kind != NodeKind::Step {
@@ -133,7 +133,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
     // settlement and kept what it holds: there is nothing left to do, so
     // the event is acknowledged, not retried.
     match realise(reaction, graph, &node) {
-        Err(RoleError::Graph(error)) if error.is_settled(id) => Ok(Reaction::ignore(format!(
+        Err(HandlerError::Graph(error)) if error.is_settled(id) => Ok(Reaction::ignore(format!(
             "{id} was settled elsewhere: {error}"
         ))),
         result => result,
@@ -142,7 +142,11 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
 
 /// Realise the step `node` this reaction has just claimed: investigate it,
 /// or carry its change out on a branch of its own.
-fn realise(reaction: &Reaction<'_>, graph: &mut Graph, node: &Node) -> Result<Report, RoleError> {
+fn realise(
+    reaction: &Reaction<'_>,
+    graph: &mut Graph,
+    node: &Node,
+) -> Result<Report, HandlerError> {
     let id = node.id;
     let token = reaction.token();
     // Read after the claim: a claimed step can no longer be joined, so these
@@ -205,7 +209,7 @@ fn realise(reaction: &Reaction<'_>, graph: &mut Graph, node: &Node) -> Result<Re
     };
     let result = graph
         .set_branch(id, token, &branch)
-        .map_err(RoleError::from)
+        .map_err(HandlerError::from)
         .and_then(|()| carry_out(reaction, graph, node, &attempt, &branch, &mut workspace));
     // This attempt releases its own worktree, and only that; both are best
     // effort, and `expl doctor --fix` removes a leftover once the step
@@ -229,7 +233,7 @@ fn carry_out(
     attempt: &Attempt<'_>,
     branch: &str,
     workspace: &mut Workspace,
-) -> Result<Report, RoleError> {
+) -> Result<Report, HandlerError> {
     let id = node.id;
     let token = reaction.token();
     let schema = schema();
@@ -288,7 +292,7 @@ fn carry_out(
     // beyond this attempt's own worktree.
     if reaction.lease_lost() {
         workspace.take_in(&clone, frozen).ok();
-        return Err(RoleError::Agent(AgentError::Interrupted));
+        return Err(HandlerError::Agent(AgentError::Interrupted));
     }
     if let Err(error) = workspace.take_in(&clone, frozen) {
         return fail(
@@ -334,7 +338,7 @@ fn carry_out(
         );
     }
     if reaction.lease_lost() {
-        return Err(RoleError::Agent(AgentError::Interrupted));
+        return Err(HandlerError::Agent(AgentError::Interrupted));
     }
     graph.publish(
         id,
@@ -405,7 +409,7 @@ fn investigate(
     node: &Node,
     predecessors: &[Node],
     continued: &[Conclusion],
-) -> Result<Report, RoleError> {
+) -> Result<Report, HandlerError> {
     let id = node.id;
     let token = reaction.token();
     let mut commits: Vec<String> = Vec::new();
@@ -442,21 +446,21 @@ fn investigate(
     let prompt = investigation_prompt(reaction, node, &path, continued, &schema);
     // An investigation changes nothing: a run that changed its working
     // directory (or moved HEAD) is no finding about the code it was given.
-    let result: Result<Finding, RoleError> =
+    let result: Result<Finding, HandlerError> =
         reaction.invoke_read_only(graph, Some(id), &scratch, &prompt, &schema);
     drop(scratch);
     // Whatever the agent answered, a lease another process took over means
     // the step is no longer ours to record.
     if reaction.lease_lost() {
-        return Err(RoleError::Agent(AgentError::Interrupted));
+        return Err(HandlerError::Agent(AgentError::Interrupted));
     }
     let finding = match result {
         Ok(finding) => finding,
-        Err(error @ RoleError::Agent(AgentError::Interrupted)) => {
+        Err(error @ HandlerError::Agent(AgentError::Interrupted)) => {
             graph.unclaim(id, token)?;
             return Err(error);
         }
-        Err(error @ RoleError::Agent(_)) => {
+        Err(error @ HandlerError::Agent(_)) => {
             return fail(
                 graph,
                 token,
@@ -466,7 +470,7 @@ fn investigate(
                 format!("investigation agent failed: {error}"),
             );
         }
-        Err(error @ RoleError::ScratchModified { .. }) => {
+        Err(error @ HandlerError::ScratchModified { .. }) => {
             return fail(
                 graph,
                 token,
@@ -525,7 +529,7 @@ fn investigation_prompt(
         title = node.title,
         objective = node.objective,
         continued = continuation_section(continued, false),
-        instructions = super::instructions_section(reaction.agent()),
+        instructions = super::instructions_section(reaction.consumer()),
         response = super::response_section(schema),
     ))
 }
@@ -540,12 +544,12 @@ fn invoke(
     clone: &AgentClone,
     prompt: &Prompt,
     schema: &serde_json::Value,
-) -> Result<(bool, String), RoleError> {
-    let result: Result<Response, RoleError> =
+) -> Result<(bool, String), HandlerError> {
+    let result: Result<Response, HandlerError> =
         reaction.invoke(graph, Some(id), clone, prompt, schema);
     match result {
         Ok(response) => Ok((response.succeeded, response.summary)),
-        Err(error @ RoleError::Agent(AgentError::Interrupted)) => {
+        Err(error @ HandlerError::Agent(AgentError::Interrupted)) => {
             // Stopping, not failing: give the step back so the redelivered
             // event can claim it again — unless the lease was lost, when the
             // step may already belong to the process that took it over.
@@ -554,7 +558,7 @@ fn invoke(
             }
             Err(error)
         }
-        Err(error @ RoleError::Agent(_)) => {
+        Err(error @ HandlerError::Agent(_)) => {
             Ok((false, format!("verification agent failed: {error}")))
         }
         Err(error) => {
@@ -592,7 +596,7 @@ fn fail(
     branch: &str,
     head_commit: Option<String>,
     summary: String,
-) -> Result<Report, RoleError> {
+) -> Result<Report, HandlerError> {
     if node.investigation || branch.is_empty() {
         graph.fail(node.id, token, &summary)?;
     } else {
@@ -636,7 +640,7 @@ fn resolution_prompt(
          {response}",
         title = node.title,
         conflicts = workspace.conflicts().join(", "),
-        instructions = super::instructions_section(reaction.agent()),
+        instructions = super::instructions_section(reaction.consumer()),
         response = super::response_section(schema),
     ))
 }
@@ -647,7 +651,7 @@ fn resolution_prompt(
 /// while it is being carried on: since the last one, nothing concluded it
 /// done or abandoned (a continue not put back — another evaluation agent's,
 /// say — does not end it). Empty for a step not being continued.
-fn continuations(graph: &Graph, id: NodeId) -> Result<Vec<Conclusion>, RoleError> {
+fn continuations(graph: &Graph, id: NodeId) -> Result<Vec<Conclusion>, HandlerError> {
     let concluded = graph.conclusions_of(id)?;
     let reopened = |c: &Conclusion| c.decision == Decision::Continue && c.reopened;
     let Some(last) = concluded.iter().rposition(reopened) else {
@@ -720,7 +724,7 @@ fn prompt(
         title = node.title,
         objective = node.objective.trim(),
         continued = continuation_section(attempt.continued, attempt.carried_on),
-        instructions = super::instructions_section(reaction.agent()),
+        instructions = super::instructions_section(reaction.consumer()),
         response = super::response_section(schema),
     ))
 }
@@ -737,9 +741,9 @@ mod tests {
     use crate::declaration::Declaration;
     use crate::event::{Delivery, EventId, EventKind, Inbox};
     use crate::git::Git;
+    use crate::handler::{Context, Handler};
     use crate::process::{Interrupt, MAX_ATTEMPTS, ProcessId, Processes};
     use crate::project::Project;
-    use crate::role::{Context, Role};
     use crate::store::{self, EPOCH};
     use crate::workspace::Workspaces;
 
@@ -796,14 +800,16 @@ mod tests {
         graph.plan_step(step, 1).expect("plan"); // node.ready
         let declaration = Declaration::parse(
             r#"
-            [agent.verifier]
-            role = "verification"
+            [consumer.verifier]
+            on = ["node.ready"]
+            handler = "verification"
             driver = "generic"
             command = ["sh", "-c", '''if grep '^## Question$' >/dev/null; then printf '%s\n' "$1"; else echo old > old.txt; printf '%s\n' "$2"; fi''', "agent", '{"investigated":true,"answer":"yes","evidence":"old holder"}', '{"succeeded":true,"summary":"old holder"}']
             replicas = 1
 
-            [agent.replacement]
-            role = "verification"
+            [consumer.replacement]
+            on = ["node.ready"]
+            handler = "verification"
             driver = "generic"
             command = ["false"]
             replicas = 1
@@ -822,7 +828,7 @@ mod tests {
             .id;
         let delivery = Inbox::open(&db, "verifier")
             .expect("inbox")
-            .lease(Role::Verification.reactions(), holder, false, MAX_ATTEMPTS)
+            .lease(Handler::Verification.events(), holder, false, MAX_ATTEMPTS)
             .expect("lease")
             .expect("node.ready");
         Held {
@@ -880,14 +886,14 @@ mod tests {
             }
             let delivery = Inbox::open(&db, "replacement")
                 .expect("inbox")
-                .lease(Role::Verification.reactions(), taker, false, MAX_ATTEMPTS)
+                .lease(Handler::Verification.events(), taker, false, MAX_ATTEMPTS)
                 .expect("lease")
                 .expect("replacement agent's delivery");
             assert_eq!(delivery.attempts, 1);
             assert_eq!(delivery.event.id, first.event.id);
             let mut graph = Graph::open(&db).expect("graph");
             let started = graph.last_event().expect("last");
-            let agent = context.agent("replacement").expect("agent");
+            let agent = context.consumer("replacement").expect("agent");
             let interrupt = Interrupt::default().for_reaction();
             let reaction = Reaction::new(&context, &agent, taker, &delivery, &interrupt);
             assert!(matches!(
@@ -950,7 +956,7 @@ mod tests {
     fn assert_takeover_at(at: Window) {
         let mut held = held_step(at == Window::Finding);
         let (_hook, takeover) = take_over_at(&held, at);
-        let agent = held.context.agent("verifier").expect("agent");
+        let agent = held.context.consumer("verifier").expect("agent");
         let reaction = Reaction::new(
             &held.context,
             &agent,
@@ -960,7 +966,7 @@ mod tests {
         );
         assert!(matches!(
             react(&reaction, &mut held.graph),
-            Err(RoleError::Graph(GraphError::LeaseLost(id))) if id == held.step
+            Err(HandlerError::Graph(GraphError::LeaseLost(id))) if id == held.step
         ));
         let takeover = takeover.borrow();
         let takeover = takeover.as_ref().expect("the step was taken over");
@@ -974,7 +980,7 @@ mod tests {
             Err(GraphError::LeaseLost(id)) if id == held.step
         ));
         assert_eq!(
-            Role::Verification
+            Handler::Verification
                 .abandon(&held.delivery, &mut held.graph, "late abandonment")
                 .expect("abandon"),
             Abandonment::Nothing
@@ -1011,7 +1017,7 @@ mod tests {
         let reached = Rc::new(RefCell::new(Vec::new()));
         let seen = Rc::clone(&reached);
         let _hook = Hooked::install(move |window| seen.borrow_mut().push(window));
-        let agent = held.context.agent("verifier").expect("agent");
+        let agent = held.context.consumer("verifier").expect("agent");
         let reaction = Reaction::new(
             &held.context,
             &agent,
@@ -1082,7 +1088,7 @@ mod tests {
             .expect("expire");
         let delivery = Inbox::open(&held.db, "verifier")
             .expect("inbox")
-            .lease(Role::Verification.reactions(), retry, false, MAX_ATTEMPTS)
+            .lease(Handler::Verification.events(), retry, false, MAX_ATTEMPTS)
             .expect("lease")
             .expect("redelivery");
         assert_eq!(delivery.attempts, 2);
@@ -1098,7 +1104,7 @@ mod tests {
                 assert!(stale.wait().expect("stale process exit").success());
             }
         });
-        let agent = held.context.agent("verifier").expect("agent");
+        let agent = held.context.consumer("verifier").expect("agent");
         let reaction = Reaction::new(&held.context, &agent, retry, &delivery, &held.interrupt);
         let report = react(&reaction, &mut held.graph).expect("reclaim and verify");
         let Report::Verification(report) = report else {
@@ -1140,7 +1146,7 @@ mod tests {
             .expect("trunk ref");
         assert!(git.resolve_commit(trunk).is_err());
 
-        let agent = held.context.agent("verifier").expect("agent");
+        let agent = held.context.consumer("verifier").expect("agent");
         let reaction = Reaction::new(
             &held.context,
             &agent,
@@ -1185,7 +1191,7 @@ mod tests {
     fn a_stale_verifier_resumed_before_allocation_leaves_the_replacement_worktree_intact() {
         let mut held = held_step(false);
         let (_hook, takeover) = take_over_at(&held, Window::Allocate);
-        let agent = held.context.agent("verifier").expect("agent");
+        let agent = held.context.consumer("verifier").expect("agent");
         let reaction = Reaction::new(
             &held.context,
             &agent,
@@ -1195,7 +1201,7 @@ mod tests {
         );
         assert!(matches!(
             react(&reaction, &mut held.graph),
-            Err(RoleError::Graph(GraphError::LeaseLost(id))) if id == held.step
+            Err(HandlerError::Graph(GraphError::LeaseLost(id))) if id == held.step
         ));
         let takeover = takeover.borrow();
         let replacement = takeover
@@ -1264,7 +1270,7 @@ mod tests {
             // lease expires, and settles it first.
             let delivery = Inbox::open(&db, "replacement")
                 .expect("inbox")
-                .lease(Role::Verification.reactions(), taker, false, MAX_ATTEMPTS)
+                .lease(Handler::Verification.events(), taker, false, MAX_ATTEMPTS)
                 .expect("lease")
                 .expect("replacement agent's delivery");
             store::open(&db)
@@ -1282,7 +1288,7 @@ mod tests {
                 .record_finding(step, &delivery.token, "abc", Answer::No, "replacement")
                 .expect("the replacement's finding");
         });
-        let agent = held.context.agent("verifier").expect("agent");
+        let agent = held.context.consumer("verifier").expect("agent");
         let reaction = Reaction::new(
             &held.context,
             &agent,
@@ -1317,7 +1323,7 @@ mod tests {
     fn a_lease_lost_after_the_commit_publishes_nothing_of_the_attempt() {
         let mut held = held_step(false);
         let (_hook, takeover) = take_over_at(&held, Window::Publish);
-        let agent = held.context.agent("verifier").expect("agent");
+        let agent = held.context.consumer("verifier").expect("agent");
         let reaction = Reaction::new(
             &held.context,
             &agent,
@@ -1327,7 +1333,7 @@ mod tests {
         );
         assert!(matches!(
             react(&reaction, &mut held.graph),
-            Err(RoleError::Graph(GraphError::LeaseLost(id))) if id == held.step
+            Err(HandlerError::Graph(GraphError::LeaseLost(id))) if id == held.step
         ));
         let takeover = takeover.borrow();
         let replacement = takeover
@@ -1369,7 +1375,7 @@ mod tests {
     #[test]
     fn a_retry_that_fails_before_committing_shows_no_earlier_tip() {
         let mut held = held_step(false);
-        let agent = held.context.agent("verifier").expect("agent");
+        let agent = held.context.consumer("verifier").expect("agent");
         let workspaces = held.context.workspaces();
         let git = Git::new(held.context.project().root());
 
@@ -1427,7 +1433,7 @@ mod tests {
             .id;
         let delivery = Inbox::open(&held.db, "verifier")
             .expect("inbox")
-            .lease(Role::Verification.reactions(), retry, false, MAX_ATTEMPTS)
+            .lease(Handler::Verification.events(), retry, false, MAX_ATTEMPTS)
             .expect("lease")
             .expect("the reopened step's node.ready");
         assert_eq!(delivery.event.node, Some(held.step));
@@ -1506,7 +1512,7 @@ mod tests {
         let [claimed, unclaimed] = [running, planned].map(|id| {
             let delivery = inbox
                 .lease(
-                    Role::Verification.reactions(),
+                    Handler::Verification.events(),
                     ProcessId(1),
                     false,
                     MAX_ATTEMPTS,
@@ -1520,7 +1526,7 @@ mod tests {
 
         // Only verification leaves steps behind.
         assert_eq!(
-            Role::Planning
+            Handler::Planning
                 .abandon(&claimed, &mut graph, "gone")
                 .expect("abandon"),
             Abandonment::Nothing
@@ -1531,7 +1537,7 @@ mod tests {
         );
 
         assert_eq!(
-            Role::Verification
+            Handler::Verification
                 .abandon(&claimed, &mut graph, "its holder died")
                 .expect("abandon"),
             Abandonment::Failed(running)
@@ -1554,7 +1560,7 @@ mod tests {
             (&claimed, Abandonment::Settled(running)),
         ] {
             assert_eq!(
-                Role::Verification
+                Handler::Verification
                     .abandon(delivery, &mut graph, "again")
                     .expect("abandon"),
                 abandonment

@@ -1,4 +1,4 @@
-//! `expl event ls` — the event log, optionally as one agent sees it.
+//! `expl event ls` — the event log, optionally as one consumer sees it.
 
 use std::path::Path;
 
@@ -23,9 +23,9 @@ pub(crate) fn ls(start: &Path, args: &EventLsArgs) -> Result<(), CliError> {
         events.drain(..events.len().saturating_sub(args.limit));
     }
     let inbox = args
-        .agent
+        .consumer
         .as_deref()
-        .map(|agent| Inbox::open(&project.database_path(), agent))
+        .map(|consumer| Inbox::open(&project.database_path(), consumer))
         .transpose()?;
     let delivery = |id: EventId| -> Result<String, CliError> {
         Ok(match &inbox {

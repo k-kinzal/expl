@@ -5,9 +5,9 @@ description: Operate expl on this repository (expl developing itself) — start,
 
 # Operating expl (controller notes)
 
-You are the **controller**. expl's agents explore (propose hypotheses), plan, verify and evaluate on
-their own; you keep them running, read what they produce, adopt good hypotheses
-into `main`, and fix expl when it stops behaving. You do not implement features
+You are the **controller**. expl's consumers handle exploration, planning,
+verification and evaluation events. You keep them running, read what they produce,
+adopt good hypotheses into `main`, and fix expl when it stops behaving. You do not implement features
 yourself — expl does. You only fix what blocks expl from continuing to explore.
 
 ## Standing rules (from the owner)
@@ -33,7 +33,7 @@ yourself — expl does. You only fix what blocks expl from continuing to explore
 
 ## How this repository is wired
 
-| Agent | Role | CLI(s) | Replicas |
+| Consumer | Handler | CLI(s) | Replicas |
 | --- | --- | --- | --- |
 | explorer | exploration (mainstream, `weight = 4`) | claude_code ⇄ codex | 1 |
 | fringe | exploration (niche + counterexamples, `weight = 1`) | claude_code ⇄ codex | 1 |
@@ -52,17 +52,18 @@ yourself — expl does. You only fix what blocks expl from continuing to explore
   them ("the whole graph was surveyed at …").
 - **Failures grow hypotheses.** `node.failed` (and revisits of a failed step) make
   exploration propose new steps in its place: same base, same goals, told what went
-  wrong and where the attempt's branch is (`explored past the failure from #N`). Agents of one role that declare `weight`
-  split that role's events: each event goes to exactly one of them (4:1 here), the
-  other acknowledges it as `routed to …`. Agents without `weight` get every event.
-  To add another exploration perspective, declare another exploration agent with a
-  `weight` and its own `instructions`.
+  wrong and where the attempt's branch is (`explored past the failure from #N`).
+  Evaluation concludes about a failure first when it subscribes to `node.failed`.
+  The exploration group routes each subscribed event to one perspective.
+  To add a perspective, declare a consumer with its own `on` and `instructions`,
+  set `group = "exploration"`, and add it to the `explorers` router's targets
+  and weights.
 - **Explore wide, plan narrow.** Explorers list up to `breadth = 8` possibilities
   without filtering by likelihood; the planner ranks weak or counterproductive steps
   low and prunes only duplicates. There is no backlog limit, on the owner's
   instruction: a new hypothesis can change what is most promising, and crowding is
   planning's problem to solve, not a reason to stop exploring.
-- **One replica per agent, on purpose.** The owner prefers slow exploration over
+- **One replica per consumer, on purpose.** The owner prefers slow exploration over
   bursts of token use. Do not raise `replicas` without being asked.
 - **Random revisits** (`revisit_cooldown = 600` on the explorer): when the explorer
   has no event to react to, it waits until 10 minutes have passed since its last
@@ -82,7 +83,7 @@ yourself — expl does. You only fix what blocks expl from continuing to explore
   the planner lists in `rebases` the open steps that should start from the new
   origin (`rebased …` in its log line), keeps the rest on the code they were
   proposed for, or prunes them.
-- **Routing** (`[[agent.<name>.alternative]]`): each invocation starts at the next
+- **Routing** (`[[consumer.<name>.alternative]]`): each invocation starts at the next
   CLI in turn (per process, seeded by pid) and falls over to the other CLI when
   one fails (usage limit, outage, unusable reply). A run log shows which CLI ran
   in its first line: `=== agent `explorer` (codex) ===`, and
@@ -109,13 +110,13 @@ yourself — expl does. You only fix what blocks expl from continuing to explore
 ## Start / stop
 
 ```sh
-expl up                                   # idempotent: tops every agent up to `replicas`
+expl up                                   # idempotent: tops every consumer up to `replicas`
 nohup expl-ui -C "$PWD" > .expl/operator/expl-ui.log 2>&1 &   # the live graph window
 # UI controls: scroll zooms around the pointer, drag pans, +/- zoom, f fits, 0 resets.
 # Adopted work is drawn as a branch merging into the trunk spine; merge origins have
 # a halo and a "+N" in their label.
 expl down -t 30                           # stop all (in-flight runs are interrupted and redelivered)
-expl run verifier -d                      # one extra process of an agent
+expl run verifier -d                      # one extra worker
 ```
 
 `skills/expl-operate/scripts/rolling-restart.sh` restarts every process that runs
@@ -137,7 +138,7 @@ expl path ls                  # the latest plan
 expl hypothesis ls            # hypotheses evaluated as satisfying a goal (adoption list)
 expl origin ls                # lineage: each trunk position, what it adopted, trunk scores
 expl event ls --limit 30      # event log
-expl event ls --agent planner # how one agent's deliveries stand (failed / leased / acked)
+expl event ls --consumer planner # how one consumer's deliveries stand (failed / leased / acked)
 expl node inspect <id>        # edges, evaluations, agent runs of one node
 expl node logs <id>           # newest raw agent log about a node
 ```
@@ -181,6 +182,6 @@ neither. Tell the owner whenever you add or retire one.
 - `expl node prune <id>` — discard a step that is off-track (e.g. it is about docs).
 - `expl node retry <id>` — re-plan a failed step after you fixed its cause.
 - `expl node add "TITLE" --after <id> --priority N` — hand-propose a step (rarely).
-- Edit agent `instructions` in `expl.toml`, commit it to `main`, then restart the
-  affected agent's processes (`expl stop <name>` then `expl up`) — declarations are
+- Edit consumer `instructions` in `expl.toml`, commit it to `main`, then restart the
+  affected consumer's workers (`expl stop <name>` then `expl up`) — declarations are
   read when a process starts.

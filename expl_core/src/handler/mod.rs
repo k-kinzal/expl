@@ -1,41 +1,17 @@
-//! Roles: what an agent does when an event reaches it.
+//! Built-in graph operations for event consumers.
 //!
-//! The vision names four agents — exploration, planning, verification,
-//! evaluation. Here a [`Role`] is that responsibility as a reaction
-//! contract: the [`EventKind`]s it reacts to, what it reads, which worktree
-//! its agent works in, the JSON Schema of the agent's response, and how the
-//! response changes the graph (and so which events it causes):
+//! A [`Handler`] prepares the workspace and request for a delivered event,
+//! validates the response, and applies the result to the graph. This may
+//! produce more events. The consumer declares which events to deliver and
+//! which command supplies the response.
 //!
-//! | Role | Reacts to | Works in | Changes the graph by (events) |
-//! | --- | --- | --- | --- |
-//! | exploration | `goal.added`, `node.evaluated`, `node.failed`, `origin.advanced`, `node.revisited` | scratch at the starting node | proposing steps (`node.proposed`) |
-//! | planning | `node.proposed`, `node.evaluated`, `node.failed`, `goal.retired`, `origin.advanced` | scratch at the origin | recording a plan, joins, priorities, prunes (`plan.recorded`, `node.planned`, `node.ready`, `node.pruned`) |
-//! | verification | `node.ready` | the step's own worktree | committing the step (`node.started`, `node.completed` / `node.failed`, successors' `node.ready`) |
-//! | evaluation | `node.completed`, `origin.advanced` | scratch at the step (or origin) | recording verdicts (`node.evaluated`) |
+//! Exploration can start from a node, a goal, a failed or speculative step,
+//! or the graph as a whole. Planning reads the graph and coalesces deliveries
+//! already covered by a plan. Verification handles ready change steps or
+//! investigations. Evaluation reads the results against the active goals.
 //!
-//! `origin.advanced` means the trunk moved: a human merged into the
-//! default branch, and a process following it recorded the new origin. Exploration starts again from the new origin,
-//! evaluation judges where the trunk now stands against every goal, and
-//! planning decides which steps that have not started move onto it.
-//!
-//! Exploration has a [`Direction`]: forward from a realised node toward the
-//! goals, backward from a goal — **counter-exploration**, done when the
-//! goal asks for it — past a failed step (new hypotheses in its place),
-//! ahead of a step not carried out yet (assuming it succeeds), or,
-//! for an agent declared with `scope = "graph"`, across the whole graph.
-//!
-//! The scratch worktrees of exploration, planning, and evaluation are
-//! read-only: an agent that moves HEAD, changes files, or leaves untracked
-//! files there fails its run and the reaction with
-//! [`RoleError::ScratchModified`], and its response is not acted on.
-//!
-//! Roles never print and never decide *when* they run: a
-//! [`Process`](crate::process::Process) hands them one event at a time.
-//!
-//! An agent knows only its work: a role's prompt carries the task and the
-//! information it needs, never expl or other agents; only planning and a
-//! graph-wide exploration see the whole graph.
-//! Operator `instructions` are the only addition.
+//! A handler working in a read-only scratch clone rejects changes to HEAD or
+//! files with [`HandlerError::ScratchModified`].
 
 mod context;
 mod digest;
@@ -47,7 +23,7 @@ mod reaction;
 mod verification;
 
 pub use context::Context;
-pub use error::RoleError;
+pub use error::HandlerError;
 pub use evaluation::{EvaluationReport, Verdict};
 pub use exploration::{ExplorationReport, Rejection};
 pub use planning::PlanningReport;
@@ -59,14 +35,13 @@ use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::Agent;
-use crate::event::{Delivery, EventKind};
+use crate::event::{Consumer, Delivery, EventKind};
 use crate::graph::{Graph, GraphError, NodeId};
 
-/// One of the four responsibilities.
+/// Built-in operation to run for a delivered event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Role {
+pub enum Handler {
     /// Identifies nodes that could lead toward goals.
     Exploration,
     /// Defines paths of node combinations and sets priorities.
@@ -78,16 +53,16 @@ pub enum Role {
     Evaluation,
 }
 
-impl Role {
-    /// All roles.
-    pub const ALL: [Role; 4] = [
-        Role::Exploration,
-        Role::Planning,
-        Role::Verification,
-        Role::Evaluation,
+impl Handler {
+    /// All built-in handlers.
+    pub const ALL: [Handler; 4] = [
+        Handler::Exploration,
+        Handler::Planning,
+        Handler::Verification,
+        Handler::Evaluation,
     ];
 
-    /// Canonical name, as in `role = "..."`.
+    /// Canonical name, as in `handler = "..."`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -98,14 +73,14 @@ impl Role {
         }
     }
 
-    /// The events this role reacts to.
+    /// Supported events and the default subscriptions for legacy declarations.
     #[must_use]
-    pub fn reactions(self) -> &'static [EventKind] {
+    pub(crate) fn events(self) -> &'static [EventKind] {
         match self {
             // Exploration grows from a failure once evaluation concluded
             // about it (`node.evaluated`): it may be continued instead, and
             // otherwise comes with why it cannot work. `node.failed` itself
-            // is explored only where no evaluation agent is declared.
+            // is explored when no consumer handles failure evaluation.
             Self::Exploration => &[
                 EventKind::GoalAdded,
                 EventKind::NodeEvaluated,
@@ -129,7 +104,7 @@ impl Role {
         }
     }
 
-    /// Whether at most one process of an agent with this role reacts at a
+    /// Whether at most one worker of a consumer with this handler reacts at a
     /// time. Planning considers the whole graph, so two concurrent plans
     /// would only overwrite each other.
     #[must_use]
@@ -137,25 +112,7 @@ impl Role {
         matches!(self, Self::Planning)
     }
 
-    /// How long an idle process of `agent` waits after its last reaction
-    /// before revisiting a random [starting point](Graph::starting_points)
-    /// (`node.revisited`), if it revisits at all. Exploration does when
-    /// `revisit_cooldown` is declared: one exploration never exhausts a
-    /// node, so every starting point keeps growing new steps for as long as
-    /// the process runs. Exploration is never held back by how many steps
-    /// wait: crowding is planning's to sort out.
-    #[must_use]
-    pub fn revisit_cooldown(self, agent: &Agent) -> Option<std::time::Duration> {
-        match self {
-            Self::Exploration => agent
-                .declaration()
-                .revisit_cooldown
-                .map(std::time::Duration::from_secs),
-            Self::Planning | Self::Verification | Self::Evaluation => None,
-        }
-    }
-
-    /// Whether one reaction covers every event of this role recorded
+    /// Whether one reaction covers every event of this consumer recorded
     /// before it started — or, when its [`Report::covered`] says so, before
     /// the graph it was shown. Planning reads the whole graph, so the events
     /// that piled up while it was busy need no reaction of their own.
@@ -168,9 +125,9 @@ impl Role {
     ///
     /// # Errors
     ///
-    /// [`RoleError`] when the reaction failed; the event is delivered
+    /// [`HandlerError`] when the reaction failed; the event is delivered
     /// again.
-    pub fn react(self, reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, RoleError> {
+    pub fn react(self, reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, HandlerError> {
         match self {
             Self::Exploration => exploration::react(reaction, graph),
             Self::Planning => planning::react(reaction, graph),
@@ -183,7 +140,7 @@ impl Role {
     /// succeeding (its attempts were used up, or the process gave up on
     /// it), so no work is left hanging. Verification fails a step still
     /// held by the delivery (records `node.failed` with `why`), so planning can
-    /// replan or prune it; other roles leave nothing behind. A step
+    /// replan or prune it; other handlers leave nothing behind. A step
     /// settled elsewhere already is left as it is. Returns what became of
     /// the delivery's step.
     ///
@@ -203,11 +160,11 @@ impl Role {
     }
 }
 
-/// What [`Role::abandon`] did with the step of a delivery that ended for
+/// What [`Handler::abandon`] did with the step of a delivery that ended for
 /// good.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Abandonment {
-    /// Nothing was left behind: the role holds no steps, the event names
+    /// Nothing was left behind: the handler holds no steps, the event names
     /// none, or the delivery does not hold its step (another one does).
     Nothing,
     /// The step the delivery still held, now failed.
@@ -228,7 +185,7 @@ impl Abandonment {
     }
 }
 
-impl fmt::Display for Role {
+impl fmt::Display for Handler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -286,7 +243,7 @@ pub enum Report {
 
 impl Report {
     /// The newest event this reaction took into account, when it says so:
-    /// a coalescing role covers its events up to here and no further.
+    /// a coalescing handler covers its events up to here and no further.
     #[must_use]
     pub fn covered(&self) -> Option<crate::event::EventId> {
         match self {
@@ -380,8 +337,8 @@ impl Report {
 }
 
 /// Operator guidance from `instructions`, if any.
-fn instructions_section(agent: &Agent) -> String {
-    match &agent.declaration().instructions {
+fn instructions_section(consumer: &Consumer) -> String {
+    match &consumer.declaration().instructions {
         Some(text) if !text.trim().is_empty() => {
             format!("\n## Instructions\n\n{}\n", text.trim())
         }
@@ -389,7 +346,7 @@ fn instructions_section(agent: &Agent) -> String {
     }
 }
 
-/// Closing of every role prompt.
+/// Closing of every handler prompt.
 fn response_section(schema: &serde_json::Value) -> String {
     format!(
         "\n## Response\n\nFinish with a single JSON object (no prose around it) that matches \

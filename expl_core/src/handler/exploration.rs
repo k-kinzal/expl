@@ -54,8 +54,8 @@ use crate::event::EventKind;
 use crate::graph::{
     Evaluation, Graph, Lineage, NewStep, Node, NodeFilter, NodeId, NodeKind, NodeStatus, Snapshot,
 };
+use crate::handler::{Direction, Handler, HandlerError, Reaction, Report, digest};
 use crate::prompt::Prompt;
-use crate::role::{Direction, Reaction, Report, Role, RoleError, digest};
 
 /// What one exploration did.
 #[derive(Debug, Clone, Serialize)]
@@ -216,7 +216,7 @@ impl Aim {
 
     /// A goal just added, with the goals it serves for context; proposals
     /// head for it unless they say otherwise.
-    fn at(graph: &Graph, goal: &Node) -> Result<Self, RoleError> {
+    fn at(graph: &Graph, goal: &Node) -> Result<Self, HandlerError> {
         let ancestors = graph.goal_tree()?.ancestors(goal.id);
         let mut goals = vec![goal.clone()];
         goals.extend(
@@ -234,7 +234,7 @@ impl Aim {
 
     /// Every active goal; proposals that name none head for the top-level
     /// goals, tied to no subgoal.
-    fn everywhere(graph: &Graph) -> Result<Self, RoleError> {
+    fn everywhere(graph: &Graph) -> Result<Self, HandlerError> {
         let goals = graph.goals()?;
         let ids: Vec<NodeId> = goals.iter().map(|g| g.id).collect();
         let default = graph.goal_tree()?.roots(&ids);
@@ -251,7 +251,7 @@ impl Aim {
     /// is a stage reached, and the work converges past it on the goals it
     /// serves. From the origin, or a step that leads to no active goal:
     /// [`everywhere`](Self::everywhere).
-    fn from(graph: &Graph, start: &Node) -> Result<Self, RoleError> {
+    fn from(graph: &Graph, start: &Node) -> Result<Self, HandlerError> {
         if start.kind == NodeKind::Origin {
             return Self::everywhere(graph);
         }
@@ -300,7 +300,7 @@ impl Aim {
 
     /// The goals as a forward task lists them, and how a proposal says
     /// which it heads for.
-    fn describe(&self, graph: &Graph) -> Result<String, RoleError> {
+    fn describe(&self, graph: &Graph) -> Result<String, HandlerError> {
         let tree = graph.goal_tree()?;
         let mut out = digest::numbered_goals(&self.goals, &tree);
         if !self.reached.is_empty() {
@@ -342,7 +342,7 @@ fn reached_subgoals(
     start: &Node,
     goals: &[NodeId],
     tree: &crate::graph::GoalTree,
-) -> Result<Vec<NodeId>, RoleError> {
+) -> Result<Vec<NodeId>, HandlerError> {
     if start.kind != NodeKind::Step || start.status != NodeStatus::Completed {
         return Ok(Vec::new());
     }
@@ -358,21 +358,19 @@ fn reached_subgoals(
         .collect())
 }
 
-pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, RoleError> {
+pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, HandlerError> {
     let subject = graph.node(reaction.subject()?)?;
     if reaction.event().kind == EventKind::NodeFailed
         && reaction
             .context()
             .declaration()
-            .agent
-            .values()
-            .any(|a| a.role == Role::Evaluation)
+            .handles(Handler::Evaluation, EventKind::NodeFailed)
     {
         return Ok(Reaction::ignore(
             "evaluation concludes about a failure first: it is explored on node.evaluated",
         ));
     }
-    if reaction.agent().declaration().scope == Some(Scope::Graph) {
+    if reaction.consumer().declaration().scope == Some(Scope::Graph) {
         return survey_on(reaction, graph, &subject);
     }
     let explorations = match reaction.event().kind {
@@ -428,7 +426,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
             explorations
         }
         EventKind::NodeRevisited => {
-            let ahead = reaction.agent().declaration().speculate == Some(true);
+            let ahead = reaction.consumer().declaration().speculate == Some(true);
             if !graph
                 .starting_points(ahead)?
                 .iter()
@@ -537,7 +535,7 @@ const FAILURE_EXCERPT: usize = 2000;
 /// The steps that already exist around an exploration: `around` (the
 /// neighbours of where it starts), whatever became of them, and every step
 /// still open anywhere — newest first.
-fn known_steps(graph: &Graph, mut steps: Vec<Node>) -> Result<Vec<Node>, RoleError> {
+fn known_steps(graph: &Graph, mut steps: Vec<Node>) -> Result<Vec<Node>, HandlerError> {
     steps.extend(graph.nodes(&NodeFilter {
         kinds: vec![NodeKind::Step],
         statuses: vec![
@@ -616,7 +614,7 @@ fn record(
 }
 
 fn breadth(reaction: &Reaction<'_>) -> usize {
-    reaction.agent().declaration().breadth.unwrap_or(1)
+    reaction.consumer().declaration().breadth.unwrap_or(1)
 }
 
 /// Explore from `start` toward `goals`, forward or backward. Forward
@@ -628,7 +626,7 @@ fn explore(
     direction: Direction,
     start: &Node,
     aim: &Aim,
-) -> Result<ExplorationReport, RoleError> {
+) -> Result<ExplorationReport, HandlerError> {
     let origin = graph.origin()?;
     let backward = direction == Direction::Backward;
     let (ground, after): (&Node, Vec<NodeId>) = if backward {
@@ -692,7 +690,7 @@ fn explore(
                 objective: &proposal.objective,
                 kind: proposal.kind,
                 derived_from: None,
-                proposer: reaction.agent().name(),
+                proposer: reaction.consumer().name(),
             },
             &after,
             &before,
@@ -704,7 +702,7 @@ fn explore(
 /// What the step an exploration starts from did and how it was judged
 /// (its latest verdict per goal), so the next steps can aim at where it
 /// fell short; empty for the origin or a step never judged.
-fn judgement(graph: &Graph, start: &Node) -> Result<String, RoleError> {
+fn judgement(graph: &Graph, start: &Node) -> Result<String, HandlerError> {
     if start.kind != NodeKind::Step {
         return Ok(String::new());
     }
@@ -761,7 +759,7 @@ fn explore_failure(
     reaction: &Reaction<'_>,
     graph: &mut Graph,
     failed: &Node,
-) -> Result<ExplorationReport, RoleError> {
+) -> Result<ExplorationReport, HandlerError> {
     let origin = graph.origin()?;
     let lineage = graph.lineage()?;
     let predecessors = graph.predecessors(failed.id)?;
@@ -862,7 +860,7 @@ fn explore_failure(
                 objective: &proposal.objective,
                 kind: proposal.kind,
                 derived_from: Some(failed.id),
-                proposer: reaction.agent().name(),
+                proposer: reaction.consumer().name(),
             },
             &base,
             &aim.resolve(&proposal.before),
@@ -878,7 +876,7 @@ fn explore_ahead(
     reaction: &Reaction<'_>,
     graph: &mut Graph,
     start: &Node,
-) -> Result<Option<ExplorationReport>, RoleError> {
+) -> Result<Option<ExplorationReport>, HandlerError> {
     // The open steps it rests on, and the realised nodes they start from.
     let mut assumed: Vec<Node> = vec![start.clone()];
     let mut frontier: Vec<Node> = Vec::new();
@@ -957,7 +955,7 @@ fn explore_ahead(
                 objective: &proposal.objective,
                 kind: proposal.kind,
                 derived_from: None,
-                proposer: reaction.agent().name(),
+                proposer: reaction.consumer().name(),
             },
             &[start.id],
             &aim.resolve(&proposal.before),
@@ -973,7 +971,7 @@ fn survey_on(
     reaction: &Reaction<'_>,
     graph: &mut Graph,
     subject: &Node,
-) -> Result<Report, RoleError> {
+) -> Result<Report, HandlerError> {
     let event = reaction.event();
     let aim = if event.kind == EventKind::GoalAdded {
         if subject.status != NodeStatus::Active {
@@ -989,7 +987,7 @@ fn survey_on(
     if aim.is_empty() {
         return Ok(Reaction::ignore("no active goals"));
     }
-    if let Some(last) = graph.last_success(reaction.agent().name())?
+    if let Some(last) = graph.last_success(reaction.consumer().name())?
         && last > event.created_at
     {
         return Ok(Reaction::ignore(format!(
@@ -1012,7 +1010,7 @@ fn survey(
     graph: &mut Graph,
     aim: &Aim,
     failed: Option<&Node>,
-) -> Result<ExplorationReport, RoleError> {
+) -> Result<ExplorationReport, HandlerError> {
     let origin = graph.origin()?;
     let lineage = graph.lineage()?;
     let snapshot = graph.snapshot()?;
@@ -1075,7 +1073,7 @@ fn survey(
                 objective: &proposal.objective,
                 kind: proposal.kind,
                 derived_from: derived_from(&snapshot, proposal.derived_from),
-                proposer: reaction.agent().name(),
+                proposer: reaction.consumer().name(),
             },
             &after,
             &before,
@@ -1121,7 +1119,7 @@ fn prompt(
          {kinds}{map}{instructions}{response}",
         kinds = digest::STEP_KINDS,
         map = map.section(),
-        instructions = super::instructions_section(reaction.agent()),
+        instructions = super::instructions_section(reaction.consumer()),
         response = super::response_section(schema),
     ))
 }
@@ -1135,7 +1133,7 @@ struct Map {
 }
 
 impl Map {
-    fn of(graph: &Graph) -> Result<Self, RoleError> {
+    fn of(graph: &Graph) -> Result<Self, HandlerError> {
         let snapshot = graph.snapshot()?;
         let map = serde_json::json!({
             "origin": graph.origin()?.id,

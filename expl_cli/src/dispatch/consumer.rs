@@ -1,4 +1,4 @@
-//! `expl agent ls` — declared agents, their processes, and their backlog.
+//! `expl consumer ls` — event subscriptions, workers, and backlog.
 
 use std::path::Path;
 
@@ -17,33 +17,36 @@ pub(crate) fn ls(start: &Path, listing: &ListingArgs) -> Result<(), CliError> {
     let live = processes(context.project())?.list(false)?;
     let mut table = Table::new(&[
         "NAME",
-        "ROLE",
+        "HANDLER",
+        "GROUP",
         "DRIVER",
         "REPLICAS",
         "CONCURRENCY",
         "RUNNING",
         "BACKLOG",
-        "REACTS TO",
+        "ON",
     ]);
-    for (name, agent) in &declaration.agent {
+    for (name, consumer) in &declaration.consumer {
         if listing.quiet {
             println(name)?;
             continue;
         }
-        let reactions = agent.role.reactions();
-        let backlog = Inbox::open(&database, name)?.declared_backlog(declaration, agent.role)?;
-        let running = live.iter().filter(|r| &r.agent == name).count();
-        let kinds: Vec<&str> = reactions.iter().map(|k| k.as_str()).collect();
-        let drivers: Vec<_> = agent.clis().iter().map(|cli| cli.driver).collect();
+        let backlog = Inbox::open(&database, name)?.declared_backlog(declaration)?;
+        let running = live.iter().filter(|r| &r.consumer == name).count();
+        let kinds: Vec<&str> = consumer.on.iter().map(|k| k.as_str()).collect();
+        let drivers: Vec<_> = consumer.clis().iter().map(|cli| cli.driver).collect();
         let labels: Vec<&str> = drivers.iter().map(|d| d.label()).collect();
         if listing.format == ListingFormat::Json {
             json_line(&json!({
                 "name": name,
-                "role": agent.role,
-                "driver": agent.driver,
+                "handler": consumer.handler,
+                "group": consumer.group,
+                "on": kinds,
+                "role": consumer.handler,
+                "driver": consumer.driver,
                 "drivers": drivers,
-                "replicas": agent.replicas,
-                "concurrency": agent.concurrency,
+                "replicas": consumer.replicas,
+                "concurrency": consumer.concurrency,
                 "running": running,
                 "backlog": backlog,
                 "reacts_to": kinds,
@@ -52,10 +55,11 @@ pub(crate) fn ls(start: &Path, listing: &ListingArgs) -> Result<(), CliError> {
         }
         table.row(vec![
             name.clone(),
-            agent.role.to_string(),
+            consumer.handler.to_string(),
+            consumer.group.clone().unwrap_or_else(|| "-".to_owned()),
             labels.join("|"),
-            agent.replicas.to_string(),
-            agent
+            consumer.replicas.to_string(),
+            consumer
                 .concurrency
                 .map_or_else(|| "-".to_owned(), |limit| limit.to_string()),
             running.to_string(),

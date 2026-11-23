@@ -1,4 +1,4 @@
-//! [`Process`] — one running agent: lease an event, react, acknowledge.
+//! [`Process`] — one consumer worker: lease an event, react, acknowledge.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,12 +7,11 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use crate::agent::Agent;
-use crate::event::{Delivery, Inbox, InboxError, Lease};
+use crate::event::{Consumer, Delivery, EventKind, Inbox, InboxError, Lease};
 use crate::graph::{Graph, GraphError, NodeId};
+use crate::handler::{Abandonment, Context, Handler, HandlerError, Reaction, Report};
 use crate::process::capacity::Capacity;
 use crate::process::{HEARTBEAT_SECONDS, Interrupt, ProcessId, ProcessRecord, Processes};
-use crate::role::{Abandonment, Context, Reaction, Report, Role, RoleError};
 use crate::store::StoreError;
 use crate::trunk::{Advance, Trunk};
 
@@ -75,7 +74,7 @@ pub enum ProcessActivity<'a> {
     Reacted {
         /// The delivery.
         delivery: &'a Delivery,
-        /// What the role did.
+        /// What the handler did.
         report: &'a Report,
     },
     /// The process lost its lease on the event (it expired and another
@@ -87,7 +86,7 @@ pub enum ProcessActivity<'a> {
         /// The delivery.
         delivery: &'a Delivery,
         /// What went wrong.
-        error: &'a RoleError,
+        error: &'a HandlerError,
         /// Whether the event will be delivered again.
         retry: bool,
     },
@@ -124,23 +123,23 @@ fn holding<T>(result: Result<T, InboxError>) -> Result<Option<T>, ProcessError> 
 #[derive(Debug)]
 pub struct Process<'a> {
     context: &'a Context,
-    agent: &'a Agent,
+    consumer: &'a Consumer,
     id: ProcessId,
     interrupt: Interrupt,
 }
 
 impl<'a> Process<'a> {
-    /// The process registered as `id`, running `agent`.
+    /// The process registered as `id`, running `consumer`.
     #[must_use]
     pub fn new(
         context: &'a Context,
-        agent: &'a Agent,
+        consumer: &'a Consumer,
         id: ProcessId,
         interrupt: Interrupt,
     ) -> Self {
         Self {
             context,
-            agent,
+            consumer,
             id,
             interrupt,
         }
@@ -191,7 +190,7 @@ impl<'a> Process<'a> {
         let database = project.database_path();
         let (Ok(processes), Ok(inbox)) = (
             Processes::open(&database, &project.processes_dir()),
-            Inbox::open(&database, self.agent.name()),
+            Inbox::open(&database, self.consumer.name()),
         ) else {
             return;
         };
@@ -234,23 +233,24 @@ impl<'a> Process<'a> {
         let project = self.context.project();
         let database = project.database_path();
         let declaration = self.context.declaration();
-        let role = self.agent.role();
-        let route = declaration.explicit_route(role);
+        let consumer = self.consumer.declaration();
+        let handler = consumer.handler;
+        let route = declaration.route_for(self.consumer.name());
         if route
             .as_ref()
-            .is_some_and(|route| !route.members().contains(self.agent.name()))
+            .is_some_and(|route| !route.members().contains(self.consumer.name()))
         {
-            return Ok("agent is not assigned to its role".to_owned());
+            return Ok("consumer is not reachable through its delivery group".to_owned());
         }
-        let capacity = Capacity::new(&project.state_dir(), self.agent, route.as_ref())?;
+        let capacity = Capacity::new(&project.state_dir(), self.consumer, route.as_ref())?;
         let shared_capacity = route
             .as_ref()
-            .is_some_and(|route| route.groups(self.agent.name()).next().is_some());
-        let mut inbox = Inbox::open(&database, self.agent.name())?;
+            .is_some_and(|route| route.groups(self.consumer.name()).next().is_some());
+        let mut inbox = Inbox::open(&database, self.consumer.name())?;
         let mut graph = Graph::open(&database)?;
         let trunk = Trunk::new(project, declaration.trunk.as_deref());
-        let weighted =
-            route.is_none() && declaration.shares_with(self.agent.name(), self.agent.name());
+        let weighted = route.is_none()
+            && declaration.legacy_shares_with(self.consumer.name(), self.consumer.name());
         let mut activity = "";
         let mut followed: Option<Instant> = None;
         let mut unfollowed: Option<String> = None;
@@ -262,7 +262,7 @@ impl<'a> Process<'a> {
                 return Ok("stopped".to_owned());
             }
             // Every process follows the trunk, so a merge is noticed while
-            // any agent runs; the graph records each move only once.
+            // any worker runs; the graph records each move only once.
             if followed.is_none_or(|at| at.elapsed() >= FOLLOW) {
                 followed = Some(Instant::now());
                 match trunk.follow(&mut graph) {
@@ -280,12 +280,12 @@ impl<'a> Process<'a> {
                     }
                 }
             }
-            let owner = weighted.then(|| self.agent.name());
-            give_up_abandoned(role, owner, &inbox, &mut graph, observer)?;
+            let owner = weighted.then(|| self.consumer.name());
+            give_up_abandoned(handler, &consumer.on, owner, &inbox, &mut graph, observer)?;
             let (delivery, slots) = match inbox.lease_with(
-                role.reactions(),
+                &consumer.on,
                 self.id,
-                role.is_exclusive(),
+                handler.is_exclusive(),
                 MAX_ATTEMPTS,
                 route.as_ref(),
                 || capacity.try_acquire().map_err(ProcessError::from),
@@ -303,19 +303,13 @@ impl<'a> Process<'a> {
                     if options.exit_when_idle {
                         return Ok("idle".to_owned());
                     }
-                    // Nothing to react to: after its cooldown, an exploration
-                    // explores again from a starting point picked at random,
-                    // explored before or not.
-                    if role
-                        .revisit_cooldown(self.agent)
-                        .is_some_and(|cooldown| last_reaction.elapsed() >= cooldown)
-                        && revisit_at_random(
-                            &mut graph,
-                            self.agent.declaration().speculate == Some(true),
-                        )?
+                    // An idle consumer can also produce a revisit event.
+                    if consumer.on.contains(&EventKind::NodeRevisited)
+                        && consumer.revisit_cooldown.is_some_and(|seconds| {
+                            last_reaction.elapsed() >= Duration::from_secs(seconds)
+                        })
+                        && revisit_at_random(&mut graph, consumer.speculate == Some(true))?
                     {
-                        // The cooldown runs from the revisit, wherever routing
-                        // sends it, so a role revisits once per cooldown.
                         last_reaction = Instant::now();
                         continue;
                     }
@@ -327,28 +321,35 @@ impl<'a> Process<'a> {
                     continue;
                 }
             };
-            // Agents sharing a role by weight react only to the events
+            // Legacy weighted consumers react only to the events
             // assigned to them; the others are theirs to acknowledge. The
             // assignment is recorded before either, so processes that
             // loaded different weights still agree on the one recipient.
             let proposal = weighted
-                .then(|| declaration.route(self.agent.name(), delivery.event.id))
+                .then(|| declaration.legacy_route(self.consumer.name(), delivery.event.id))
                 .flatten();
             let owner = match proposal {
                 Some(proposed) => {
-                    let owner = inbox.assign(role, delivery.event.id, proposed)?;
+                    let owner = inbox.assign(handler.as_str(), delivery.event.id, proposed)?;
                     // Assigned to an agent no longer declared for the role
                     // (by a process that loaded an older declaration): it
                     // would never be handled, so move it.
-                    if owner != proposed && !declaration.shares_with(self.agent.name(), &owner) {
-                        Some(inbox.reassign(role, delivery.event.id, &owner, proposed)?)
+                    if owner != proposed
+                        && !declaration.legacy_shares_with(self.consumer.name(), &owner)
+                    {
+                        Some(inbox.reassign(
+                            handler.as_str(),
+                            delivery.event.id,
+                            &owner,
+                            proposed,
+                        )?)
                     } else {
                         Some(owner)
                     }
                 }
                 None => None,
             };
-            if let Some(owner) = owner.filter(|owner| owner != self.agent.name()) {
+            if let Some(owner) = owner.filter(|owner| owner != self.consumer.name()) {
                 let report = Report::Ignored {
                     reason: format!("routed to `{owner}`"),
                 };
@@ -372,20 +373,21 @@ impl<'a> Process<'a> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some((delivery.clone(), interrupt.clone()));
-            let reaction = Reaction::new(self.context, self.agent, self.id, &delivery, &interrupt);
-            let result = role.react(&reaction, &mut graph);
+            let reaction =
+                Reaction::new(self.context, self.consumer, self.id, &delivery, &interrupt);
+            let result = handler.react(&reaction, &mut graph);
             held.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
             let lost = || observer.observe(&ProcessActivity::LeaseLost(&delivery));
             match result {
                 _ if interrupt.lease_lost() => lost(),
-                Err(RoleError::Graph(GraphError::LeaseLost(_))) => lost(),
+                Err(HandlerError::Graph(GraphError::LeaseLost(_))) => lost(),
                 Ok(report) => {
                     let coalesced = match report.covered().or(covered) {
-                        Some(through) if role.coalesces() => {
+                        Some(through) if handler.coalesces() => {
                             let note = format!("covered by the reaction to {}", delivery.event.id);
-                            holding(inbox.ack_through(&delivery, role.reactions(), through, &note))?
+                            holding(inbox.ack_through(&delivery, &consumer.on, through, &note))?
                                 .is_some()
                         }
                         Some(_) | None => true,
@@ -416,8 +418,8 @@ impl<'a> Process<'a> {
                 // A busy database is transient (another process held the
                 // lock past the busy timeout): give the event back and carry
                 // on, rather than lose the process.
-                Err(RoleError::Graph(error)) if error.is_busy() => {
-                    let error = RoleError::Graph(error);
+                Err(HandlerError::Graph(error)) if error.is_busy() => {
+                    let error = HandlerError::Graph(error);
                     if holding(inbox.release(&delivery))?.is_some() {
                         observer.observe(&ProcessActivity::Failed {
                             delivery: &delivery,
@@ -431,7 +433,7 @@ impl<'a> Process<'a> {
                 }
                 // The step was settled elsewhere meanwhile: there is
                 // nothing left to do, and retrying would change nothing.
-                Err(RoleError::Graph(error))
+                Err(HandlerError::Graph(error))
                     if delivery.event.node.is_some_and(|id| error.is_settled(id)) =>
                 {
                     if !acknowledge_settled(&inbox, &delivery, observer)? {
@@ -447,7 +449,7 @@ impl<'a> Process<'a> {
                     // settled, so dying in between leaves it to be retried
                     // or abandoned rather than lost.
                     let abandoned = if delivery.attempts >= MAX_ATTEMPTS {
-                        role.abandon(&delivery, &mut graph, &why)?
+                        handler.abandon(&delivery, &mut graph, &why)?
                     } else {
                         Abandonment::Nothing
                     };
@@ -482,7 +484,7 @@ impl<'a> Process<'a> {
     }
 }
 
-/// Give up every delivery of `role` whose holder died on its last attempt,
+/// Give up every delivery of the subscribed kinds whose holder died on its last attempt,
 /// failing first what its reaction left `running`. A delivery whose step was
 /// settled elsewhere meanwhile is acknowledged as ignored instead: nothing
 /// of it was left hanging. An agent sharing its role by weight
@@ -490,23 +492,29 @@ impl<'a> Process<'a> {
 /// assigned to another agent is that agent's to carry out, whatever became
 /// of this agent's delivery of it.
 fn give_up_abandoned(
-    role: Role,
+    handler: Handler,
+    kinds: &[EventKind],
     weighted_as: Option<&str>,
     inbox: &Inbox,
     graph: &mut Graph,
     observer: &dyn ProcessObserver,
 ) -> Result<(), ProcessError> {
-    for delivery in inbox.abandoned(role.reactions(), MAX_ATTEMPTS)? {
+    for delivery in inbox.abandoned(kinds, MAX_ATTEMPTS)? {
         let why = format!(
             "abandoned: the process reacting to {} died on attempt {} of {MAX_ATTEMPTS}",
             delivery.event, delivery.attempts
         );
         let ours = match weighted_as {
             None => true,
-            Some(agent) => inbox.assignment(role, delivery.event.id)?.as_deref() == Some(agent),
+            Some(agent) => {
+                inbox
+                    .assignment(handler.as_str(), delivery.event.id)?
+                    .as_deref()
+                    == Some(agent)
+            }
         };
         let abandoned = if ours {
-            role.abandon(&delivery, graph, &why)?
+            handler.abandon(&delivery, graph, &why)?
         } else {
             Abandonment::Nothing
         };
@@ -611,12 +619,12 @@ mod tests {
             .propose_step("s", "s", &[origin], &[goal])
             .expect("step");
         graph.plan_step(step, 1).expect("plan"); // node.ready
-        let role = Role::Verification;
+        let role = Handler::Verification;
         let mut inbox = Inbox::open(&db, "verifier").expect("inbox");
         let mut ready = None;
         for attempt in 1..=MAX_ATTEMPTS {
             let delivery = inbox
-                .lease(role.reactions(), ProcessId(attempt), false, MAX_ATTEMPTS)
+                .lease(role.events(), ProcessId(attempt), false, MAX_ATTEMPTS)
                 .expect("lease")
                 .expect("node.ready");
             assert_eq!(
@@ -634,7 +642,8 @@ mod tests {
                 )
                 .expect("expire");
             let recorder = Recorder::default();
-            give_up_abandoned(role, None, &inbox, &mut graph, &recorder).expect("give up");
+            give_up_abandoned(role, role.events(), None, &inbox, &mut graph, &recorder)
+                .expect("give up");
             let abandoned = recorder.0.into_inner().expect("lock");
             if attempt < MAX_ATTEMPTS {
                 assert!(abandoned.is_empty(), "attempts are left");
@@ -655,7 +664,7 @@ mod tests {
         );
         assert!(
             inbox
-                .lease(role.reactions(), ProcessId(9), false, MAX_ATTEMPTS)
+                .lease(role.events(), ProcessId(9), false, MAX_ATTEMPTS)
                 .expect("lease")
                 .is_none(),
             "neither the given-up event nor anything else is delivered"
@@ -693,12 +702,12 @@ mod tests {
             .propose_investigation("q", "is it so?", &[origin], &[goal])
             .expect("investigation");
         graph.plan_step(question, 1).expect("plan"); // node.ready
-        let role = Role::Verification;
+        let role = Handler::Verification;
         let mut inbox = Inbox::open(&db, "verifier").expect("inbox");
         let mut last = None;
         for attempt in 1..=MAX_ATTEMPTS {
             let delivery = inbox
-                .lease(role.reactions(), ProcessId(attempt), false, MAX_ATTEMPTS)
+                .lease(role.events(), ProcessId(attempt), false, MAX_ATTEMPTS)
                 .expect("lease")
                 .expect("node.ready");
             if attempt == MAX_ATTEMPTS {
@@ -723,7 +732,7 @@ mod tests {
         let before = graph.last_event().expect("last");
 
         let acks = Acks::default();
-        give_up_abandoned(role, None, &inbox, &mut graph, &acks).expect("give up");
+        give_up_abandoned(role, role.events(), None, &inbox, &mut graph, &acks).expect("give up");
         let seen = acks.0.into_inner().expect("lock");
         assert_eq!(seen.len(), 1, "acknowledged once, nothing given up");
         assert_eq!(seen[0].0, last.event.id);
@@ -750,21 +759,21 @@ mod tests {
             .propose_step("s", "s", &[origin], &[goal])
             .expect("step");
         graph.plan_step(step, 1).expect("plan"); // node.ready
-        let role = Role::Verification;
+        let role = Handler::Verification;
         // The owner, `fast`, is carrying the step out.
         let mut fast = Inbox::open(&db, "fast").expect("inbox");
         let owner = fast
-            .lease(role.reactions(), ProcessId(9), false, MAX_ATTEMPTS)
+            .lease(role.events(), ProcessId(9), false, MAX_ATTEMPTS)
             .expect("lease")
             .expect("node.ready");
         assert!(graph.claim(step, &owner.token).expect("claim"));
         let mut slow = Inbox::open(&db, "slow").expect("inbox");
         for attempt in 1..=MAX_ATTEMPTS {
             let delivery = slow
-                .lease(role.reactions(), ProcessId(attempt), false, MAX_ATTEMPTS)
+                .lease(role.events(), ProcessId(attempt), false, MAX_ATTEMPTS)
                 .expect("lease")
                 .expect("node.ready");
-            slow.assign(role, delivery.event.id, "fast")
+            slow.assign(role.as_str(), delivery.event.id, "fast")
                 .expect("assign");
             // `slow`'s holders keep dying before acknowledging it as routed.
             store::open(&db)
@@ -778,7 +787,15 @@ mod tests {
                 .expect("expire");
         }
         let recorder = Recorder::default();
-        give_up_abandoned(role, Some("slow"), &slow, &mut graph, &recorder).expect("give up");
+        give_up_abandoned(
+            role,
+            role.events(),
+            Some("slow"),
+            &slow,
+            &mut graph,
+            &recorder,
+        )
+        .expect("give up");
         let abandoned = recorder.0.into_inner().expect("lock");
         assert_eq!(abandoned.len(), 1);
         assert_eq!(abandoned[0].1, None, "nothing of `fast`'s was failed");

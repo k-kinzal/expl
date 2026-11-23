@@ -10,9 +10,9 @@
 //! Trunk:      expl origin ls   (the trunk itself moves with git)
 //!             expl graph show · expl path ls · expl hypothesis ls
 //!             expl event ls
-//! Agents:     expl agent ls
-//! Processes:  expl run <AGENT> [-d]
-//!             expl up [AGENT...] · expl down
+//! Consumers:  expl consumer ls
+//! Processes:  expl run <CONSUMER> [-d]
+//!             expl up [CONSUMER...] · expl down
 //!             expl process ls|inspect|logs|stop|kill|rm
 //!             (aliases: expl ps | logs | stop | kill | rm)
 //! ```
@@ -27,21 +27,17 @@ use expl_core::{EventKind, NodeId, NodeKind, NodeStatus};
 #[command(
     name = "expl",
     version,
-    about = "Explore a problem space with agents that react to graph events",
-    long_about = "expl explores a problem space as a graph of git branches. Every change to the \
-                  graph is an event. Agents declared in expl.toml react to the events of their \
-                  role: exploration proposes hypotheses — steps toward goals (and backward from them) — \
-                  planning orders them into paths and sets priorities, verification tests ready \
-                  hypotheses (as commits on their own branches, or as findings), and evaluation \
-                  judges whether each was verified and how far it moves the goals. Agents run \
-                  as processes, managed like containers: run as many as you \
-                  like, and processes of one agent share its events, so independent work happens \
-                  in parallel. Exploration never ends by itself: choosing among the hypotheses \
-                  that satisfy a goal is yours.",
+    about = "Explore a problem space through graph events",
+    long_about = "expl explores a problem space as a graph of hypotheses. Every change to the \
+                  graph produces an event. Consumers in expl.toml subscribe to events and \
+                  define the work to run when they arrive. Exploration proposes hypotheses, \
+                  planning orders them, verification tests them with commits or findings, \
+                  and evaluation judges the results against goals. Workers of the same \
+                  consumer share deliveries, so independent work can run in parallel.",
     after_help = "EXAMPLES:\n  \
                   expl init\n  \
                   expl goal add \"Support Codex\" --objective \"...\"\n  \
-                  expl up                       # every agent, `replicas` processes each\n  \
+                  expl up                       # every consumer, `replicas` workers each\n  \
                   expl ps\n  \
                   expl run verifier -d          # one more verifier\n  \
                   expl logs verifier-5 -f\n  \
@@ -102,22 +98,21 @@ pub(crate) enum Command {
     /// Show the event log.
     #[command(subcommand)]
     Event(EventCommand),
-    /// Show declared agents.
-    #[command(subcommand)]
-    Agent(AgentCommand),
+    /// Show event consumers.
+    #[command(subcommand, alias = "agent")]
+    Consumer(ConsumerCommand),
     /// Manage processes.
     #[command(subcommand)]
     Process(ProcessCommand),
-    /// Start a process of an agent.
+    /// Start a worker for an event consumer.
     #[command(
-        long_about = "Start a process of the declared agent. It leases the events of its role \
-                      from the agent's inbox one at a time, reacts, and acknowledges them, until \
-                      stopped. Processes of the same agent share its events, so starting more \
-                      processes adds parallelism. With -d the process runs in the background and \
-                      its name is printed."
+        long_about = "Start a worker for a declared consumer. It leases subscribed events one \
+                      at a time, runs the handler, and acknowledges the delivery. Replicas \
+                      share the same inbox. With -d the process runs in the background and \
+                      prints its name."
     )]
     Run(RunArgs),
-    /// Start processes until each assigned agent has `replicas` running.
+    /// Start workers until each assigned consumer has `replicas` running.
     Up(UpArgs),
     /// Stop every running process.
     Down(StopArgs),
@@ -353,18 +348,18 @@ pub(crate) struct EventLsArgs {
     /// Only these kinds.
     #[arg(long, value_parser = parse_event_kind)]
     pub(crate) kind: Vec<EventKind>,
-    /// Show how this agent's deliveries of each event stand.
-    #[arg(long)]
-    pub(crate) agent: Option<String>,
+    /// Show delivery status for this consumer.
+    #[arg(long, alias = "agent")]
+    pub(crate) consumer: Option<String>,
     /// Output options.
     #[command(flatten)]
     pub(crate) listing: ListingArgs,
 }
 
-/// `expl agent ...`.
+/// `expl consumer ...`.
 #[derive(Debug, Subcommand)]
-pub(crate) enum AgentCommand {
-    /// List declared agents with their concurrency, running processes, and backlog.
+pub(crate) enum ConsumerCommand {
+    /// List event consumers with their subscriptions, running workers, and backlog.
     Ls(ListingArgs),
 }
 
@@ -388,12 +383,12 @@ pub(crate) enum ProcessCommand {
 /// `expl run`.
 #[derive(Debug, Args)]
 pub(crate) struct RunArgs {
-    /// Declared agent name.
-    pub(crate) agent: String,
+    /// Declared consumer name.
+    pub(crate) consumer: String,
     /// Run in the background and print the process name.
     #[arg(short, long)]
     pub(crate) detach: bool,
-    /// Process name (default: `<agent>-<id>`).
+    /// Process name (default: `<consumer>-<id>`).
     #[arg(long)]
     pub(crate) name: Option<String>,
     /// Exit after reacting to one event.
@@ -410,8 +405,8 @@ pub(crate) struct RunArgs {
 /// `expl up`.
 #[derive(Debug, Args)]
 pub(crate) struct UpArgs {
-    /// Only these agents (default: all declared).
-    pub(crate) agents: Vec<String>,
+    /// Only these consumers (default: all declared).
+    pub(crate) consumers: Vec<String>,
 }
 
 /// `expl ps` / `expl process ls`.

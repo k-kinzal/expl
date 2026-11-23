@@ -1,14 +1,8 @@
 # expl declaration for developing expl with expl. See `expl --help`.
 #
-# Each [agent.<name>] is started as processes (`expl run <name>`, or
-# `expl up` for `replicas` of every agent). An agent reacts to the graph
-# events of its role:
-#   exploration  — goal.added, node.evaluated, origin.advanced → proposes hypotheses (steps);
-#                  when idle, every `revisit_cooldown` seconds it explores again
-#                  from a random starting point (node.revisited)
-#   planning     — node.proposed/evaluated/failed, goal.retired, origin.advanced → paths and priorities
-#   verification — node.ready                                  → verifies the step: commits on its branch, or a finding
-#   evaluation   — node.completed, origin.advanced → whether it held, verdicts against goals
+# Each [consumer.<name>] subscribes to graph events and defines what to do
+# when they arrive. `expl run <name>` starts a worker and `expl up` starts
+# the declared replicas.
 #
 # `driver` selects how the CLI is spoken to:
 #   claude_code  — `claude --print --output-format json --json-schema ...`
@@ -16,14 +10,14 @@
 #   cursor_agent — `cursor-agent --print --output-format json ...`
 #   generic      — any command: prompt on stdin, JSON response on stdout
 #
-# Exploration, planning and evaluation are routed across Claude Code and
-# Codex (`[[agent.<name>.alternative]]`): each invocation goes to the next CLI in turn and falls over to the
-# other when one fails. Verification is routed the same way.
+# Claude Code and Codex take turns supplying handler responses
+# (`[[consumer.<name>.alternative]]`). A failed invocation falls over to
+# the other CLI.
 #
-# All agents share one cargo target directory so that every clone does
-# not rebuild the dependencies (gpui above all) from scratch.
+# Clones reuse Cargo build artifacts through CARGO_TARGET_DIR. Evaluation
+# uses a separate target directory.
 #
-# Every agent has one worker. The shared router allows one reaction at a time
+# Every consumer has one worker. The shared router allows one reaction at a time
 # across the whole cycle to keep token use low while we observe it.
 #
 # Agents run unattended inside private clones expl makes for them, so these
@@ -39,6 +33,7 @@ trunk = "main"
 [workspace]
 frozen = ["*.md"]
 
+# Keep the existing group names so the stored assignments still apply.
 [routing]
 exploration = "all"
 planning = "all"
@@ -58,8 +53,10 @@ policy = "weighted"
 weights = { explorer = 4, fringe = 1, surveyor = 1 }
 concurrency = 1
 
-[agent.explorer]
-role = "exploration"
+[consumer.explorer]
+on = ["goal.added", "node.evaluated", "node.failed", "origin.advanced", "node.revisited"]
+handler = "exploration"
+group = "exploration"
 driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
@@ -79,13 +76,15 @@ what would a change affect). Markdown files (*.md) are frozen: never propose a s
 purpose is to add, edit, or delete a .md file.
 """
 
-[[agent.explorer.alternative]]
+[[consumer.explorer.alternative]]
 driver = "codex"
 command = ["codex"]
 args = ["--dangerously-bypass-approvals-and-sandbox"]
 
-[agent.fringe]
-role = "exploration"
+[consumer.fringe]
+on = ["goal.added", "node.evaluated", "node.failed", "origin.advanced", "node.revisited"]
+handler = "exploration"
+group = "exploration"
 driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
@@ -108,13 +107,15 @@ files (*.md) are frozen:
 never propose a step whose purpose is to add, edit, or delete a .md file.
 """
 
-[[agent.fringe.alternative]]
+[[consumer.fringe.alternative]]
 driver = "codex"
 command = ["codex"]
 args = ["--dangerously-bypass-approvals-and-sandbox"]
 
-[agent.surveyor]
-role = "exploration"
+[consumer.surveyor]
+on = ["goal.added", "node.evaluated", "node.failed", "origin.advanced", "node.revisited"]
+handler = "exploration"
+group = "exploration"
 scope = "graph"
 driver = "claude_code"
 command = ["claude"]
@@ -133,13 +134,15 @@ question about the code. Markdown files (*.md) are frozen: never propose a step 
 is to add, edit, or delete a .md file.
 """
 
-[[agent.surveyor.alternative]]
+[[consumer.surveyor.alternative]]
 driver = "codex"
 command = ["codex"]
 args = ["--dangerously-bypass-approvals-and-sandbox"]
 
-[agent.planner]
-role = "planning"
+[consumer.planner]
+on = ["node.proposed", "node.evaluated", "node.failed", "goal.retired", "origin.advanced"]
+handler = "planning"
+group = "planning"
 driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
@@ -155,13 +158,15 @@ unless the judgements give a reason to try one. Prefer small, independently veri
 join paths only when their changes are complementary.
 """
 
-[[agent.planner.alternative]]
+[[consumer.planner.alternative]]
 driver = "codex"
 command = ["codex"]
 args = ["--dangerously-bypass-approvals-and-sandbox"]
 
-[agent.verifier]
-role = "verification"
+[consumer.verifier]
+on = ["node.ready"]
+handler = "verification"
+group = "verification"
 # Claude Code first, Codex when it fails. (Cursor Agent, used before, hit its
 # monthly Opus usage limit until 2026-12-17.)
 driver = "claude_code"
@@ -178,13 +183,15 @@ must pass; report succeeded=false if they do not. For an investigation (a questi
 change nothing, and back the answer with evidence from the code, builds, or tests you ran.
 """
 
-[[agent.verifier.alternative]]
+[[consumer.verifier.alternative]]
 driver = "codex"
 command = ["codex"]
 args = ["--dangerously-bypass-approvals-and-sandbox"]
 
-[agent.evaluator]
-role = "evaluation"
+[consumer.evaluator]
+on = ["node.completed", "node.failed", "origin.advanced"]
+handler = "evaluation"
+group = "evaluation"
 driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
@@ -200,7 +207,7 @@ evidence holds against the code in the working directory, and judge whether the 
 the goal. Judge naming and responsibilities against AGENTS.md as part of quality.
 """
 
-[[agent.evaluator.alternative]]
+[[consumer.evaluator.alternative]]
 driver = "codex"
 command = ["codex"]
 args = ["--dangerously-bypass-approvals-and-sandbox"]

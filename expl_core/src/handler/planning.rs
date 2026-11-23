@@ -3,7 +3,7 @@
 //! Reacts to `node.proposed`, `node.evaluated`, `node.failed`, and
 //! `goal.retired`, but always plans the whole graph: one reaction covers
 //! every such event recorded before the [`Snapshot`] its agent is shown
-//! (see [`Role::coalesces`](crate::role::Role::coalesces)). Steps proposed
+//! (see [`Handler::coalesces`](crate::handler::Handler::coalesces)). Steps proposed
 //! while the agent works are neither planned nor covered; they wait, with
 //! their events, for the next planning.
 //!
@@ -34,8 +34,8 @@ use crate::graph::{
     GoalTree, Graph, GraphError, Node, NodeFilter, NodeId, NodeKind, NodeStatus, PlanId,
     PlannedPath, Snapshot,
 };
+use crate::handler::{HandlerError, Reaction, Report, digest};
 use crate::prompt::Prompt;
-use crate::role::{Reaction, Report, RoleError, digest};
 
 /// What one planning did.
 #[derive(Debug, Clone, Serialize)]
@@ -164,7 +164,7 @@ fn schema() -> serde_json::Value {
     })
 }
 
-pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, RoleError> {
+pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, HandlerError> {
     let origin = graph.origin()?;
     let scratch = reaction.context().workspaces().scratch(&origin)?;
     let schema = schema();
@@ -358,7 +358,7 @@ fn prompt(reaction: &Reaction<'_>, shown: &Snapshot, schema: &serde_json::Value)
         routes = digest::routes(shown, &tree),
         graph = digest::graph(shown),
         kinds = digest::STEP_KINDS,
-        instructions = super::instructions_section(reaction.agent()),
+        instructions = super::instructions_section(reaction.consumer()),
         response = super::response_section(schema),
     ))
 }

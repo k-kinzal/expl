@@ -417,9 +417,9 @@ mod tests {
     use crate::event::{EventKind, Inbox};
     use crate::git::Git;
     use crate::graph::{Graph, NewEvaluation, NewOrigin};
+    use crate::handler::{Context, Handler, Reaction};
     use crate::process::{Interrupt, ProcessId, Processes};
     use crate::project::Project;
-    use crate::role::{Context, Reaction, Role};
 
     #[test]
     fn role_prompts_include_the_full_goal_objective() {
@@ -478,28 +478,28 @@ mod tests {
         let cases = [
             (
                 "explorer",
-                Role::Exploration,
+                Handler::Exploration,
                 "breadth = 1",
                 r#"{"nodes":[]}"#,
                 None,
             ),
             (
                 "surveyor",
-                Role::Exploration,
+                Handler::Exploration,
                 "breadth = 1\nscope = \"graph\"",
                 r#"{"nodes":[]}"#,
                 Some("## Map"),
             ),
             (
                 "planner",
-                Role::Planning,
+                Handler::Planning,
                 "",
                 r#"{"summary":"No steps"}"#,
                 Some("## Steps"),
             ),
             (
                 "evaluator",
-                Role::Evaluation,
+                Handler::Evaluation,
                 "",
                 evaluation_reply.as_str(),
                 None,
@@ -518,7 +518,7 @@ mod tests {
             ))
             .expect("declaration");
             let context = Context::new(project.clone(), declaration);
-            let agent = context.agent(name).expect("agent");
+            let agent = context.consumer(name).expect("agent");
             let process = processes.create(name, None, false).expect("process");
             let delivery = Inbox::open(&db, name)
                 .expect("inbox")

@@ -1,10 +1,10 @@
-//! [`Agent`] — a declared agent, and the invocation cycle it realises.
+//! [`Agent`] — invoke a command using the handler's prompt and response contract.
 //!
 //! An agent may be carried out by several CLIs (the primary one and its
 //! `alternative`s). Each invocation is **routed**: it starts at the next
 //! CLI in turn, so the work spreads across them, and falls over to the
 //! following CLI when one fails (a usage limit, an outage, an unusable
-//! reply, a reply that does not decode into the response the role expects,
+//! reply, a reply that does not decode into the response the handler expects,
 //! a declared `timeout` outrun). Every attempt goes to the same run log.
 
 use std::collections::BTreeMap;
@@ -24,10 +24,9 @@ use crate::agent::{
     AgentDriver, AgentError, AgentRequest, AgentRun, ClaudeCodeDriver, CodexDriver,
     CursorAgentDriver, DriverKind, GenericDriver,
 };
-use crate::declaration::{AgentDeclaration, CliDeclaration, DeclarationError, TimeoutError};
+use crate::declaration::{CliDeclaration, TimeoutError};
 use crate::process::Interrupt;
 use crate::prompt::Prompt;
-use crate::role::Role;
 
 /// How long an interrupted or timed-out invocation gets to exit after
 /// SIGTERM.
@@ -81,10 +80,10 @@ impl std::fmt::Debug for Invocation<'_> {
     }
 }
 
-/// A declared agent. See the [module docs](crate::agent).
+/// Command runner for a reaction. It has no subscription or graph state.
 pub struct Agent {
     name: String,
-    declaration: AgentDeclaration,
+    env: BTreeMap<String, String>,
     clis: Vec<Cli>,
     /// Where the next invocation's route starts.
     turn: AtomicUsize,
@@ -131,58 +130,33 @@ impl std::fmt::Debug for Agent {
         let drivers: Vec<DriverKind> = self.clis.iter().map(|c| c.driver.kind()).collect();
         f.debug_struct("Agent")
             .field("name", &self.name)
-            .field("role", &self.declaration.role)
             .field("drivers", &drivers)
             .finish_non_exhaustive()
     }
 }
 
 impl Agent {
-    /// Bring a declared agent to life: a mechanical field move into the
-    /// drivers named by `driver` (and each `alternative`'s).
+    /// Build the runner for a consumer's commands in rotation order.
     ///
     /// # Errors
     ///
-    /// [`DeclarationError::Timeout`] when a CLI's `timeout` is not a
-    /// positive duration (a declaration that passed validation never has one).
-    pub fn from_declaration(
+    /// [`TimeoutError`] when a CLI's timeout is invalid.
+    pub(crate) fn new(
         name: &str,
-        declaration: &AgentDeclaration,
-    ) -> Result<Self, DeclarationError> {
-        let clis = declaration
-            .clis()
+        env: BTreeMap<String, String>,
+        clis: Vec<CliDeclaration>,
+    ) -> Result<Self, TimeoutError> {
+        let clis = clis
             .into_iter()
             .map(Cli::from_declaration)
-            .collect::<Result<_, _>>()
-            .map_err(|source| DeclarationError::Timeout {
-                agent: name.to_owned(),
-                source,
-            })?;
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             name: name.to_owned(),
-            declaration: declaration.clone(),
+            env,
             clis,
-            // Processes of one agent start their routes at different CLIs.
+            // Replicas start their routes at different CLIs.
             turn: AtomicUsize::new(std::process::id() as usize),
         })
-    }
-
-    /// Declared name.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The role this agent plays.
-    #[must_use]
-    pub fn role(&self) -> Role {
-        self.declaration.role
-    }
-
-    /// The declaration it was built from.
-    #[must_use]
-    pub fn declaration(&self) -> &AgentDeclaration {
-        &self.declaration
     }
 
     /// Invoke the agent once and return its structured response decoded
@@ -266,7 +240,7 @@ impl Agent {
             facts: invocation.facts,
         };
         let mut command = cli.driver.command(&request)?;
-        let env: &BTreeMap<String, String> = &self.declaration.env;
+        let env: &BTreeMap<String, String> = &self.env;
         command
             .process
             .current_dir(invocation.directory)
@@ -577,7 +551,8 @@ mod tests {
 
     fn agent(text: &str) -> Agent {
         let declaration = Declaration::parse(text).expect("declaration");
-        Agent::from_declaration("a", declaration.agent("a").expect("agent")).expect("agent")
+        let consumer = declaration.consumer("a").expect("consumer");
+        Agent::new("a", consumer.env.clone(), consumer.clis()).expect("runner")
     }
 
     fn invoke(agent: &Agent, log: &Path) -> Result<AgentRun, AgentError> {

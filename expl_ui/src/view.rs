@@ -35,7 +35,7 @@
 //!   was judged against it.
 //! - **The trunk's history** is listed bottom right: each origin, newest
 //!   first, with what was adopted into it.
-//! - **Agents are dots** bottom left, one per process, grouped by agent:
+//! - **Agents are dots** bottom left, one per process, grouped by consumer:
 //!   pulsing while reacting, dim while idle, a ring for a missing replica,
 //!   red when dead.
 //! - Clicking a node or a listed goal or origin shows its words top left;
@@ -198,13 +198,13 @@ impl ExplView {
                 let changed = !self.loaded || self.error.is_some() || snapshot != self.snapshot;
                 if snapshot.nodes != self.snapshot.nodes
                     || snapshot.edges != self.snapshot.edges
-                    || snapshot.agents != self.snapshot.agents
+                    || snapshot.consumers != self.snapshot.consumers
                     || snapshot.paths != self.snapshot.paths
                 {
                     let explorers: Vec<(&str, u32)> = snapshot
-                        .agents
+                        .consumers
                         .iter()
-                        .filter(|a| a.role == "exploration")
+                        .filter(|a| a.handler == expl_core::Handler::Exploration)
                         .map(|a| (a.name.as_str(), a.weight))
                         .collect();
                     self.layout = Layout::of(
@@ -1107,18 +1107,18 @@ impl ExplView {
             })
     }
 
-    /// One dot per process, grouped by agent.
-    fn agents(&self) -> impl IntoElement {
+    /// One dot per process, grouped by consumer.
+    fn consumers(&self) -> impl IntoElement {
         let busy = self.snapshot.busy();
-        let mut agents: Vec<(&str, usize)> = self
+        let mut consumers: Vec<(&str, usize)> = self
             .snapshot
-            .agents
+            .consumers
             .iter()
             .map(|a| (a.name.as_str(), a.replicas))
             .collect();
         for process in &self.snapshot.processes {
-            if !agents.iter().any(|(name, _)| *name == process.agent) {
-                agents.push((process.agent.as_str(), 0));
+            if !consumers.iter().any(|(name, _)| *name == process.consumer) {
+                consumers.push((process.consumer.as_str(), 0));
             }
         }
         div()
@@ -1128,7 +1128,7 @@ impl ExplView {
             .flex()
             .items_center()
             .gap(px(14.0))
-            .children(agents.into_iter().map(|(name, replicas)| {
+            .children(consumers.into_iter().map(|(name, replicas)| {
                 let processes: Vec<&ProcessRecord> = self.snapshot.processes_of(name).collect();
                 let missing = replicas.saturating_sub(processes.len());
                 div()
@@ -1239,7 +1239,7 @@ impl Render for ExplView {
             .children(self.detail())
             .child(self.goals_panel(&lens, cx))
             .child(self.trunk_panel(&lens, cx))
-            .child(self.agents())
+            .child(self.consumers())
             .when_some(self.error.clone(), |el, error| {
                 el.child(
                     div()

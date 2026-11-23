@@ -59,7 +59,7 @@ fn record_from_row(row: &Row<'_>) -> rusqlite::Result<ProcessRecord> {
     Ok(ProcessRecord {
         id: ProcessId(row.get(0)?),
         name: row.get(1)?,
-        agent: row.get(2)?,
+        consumer: row.get(2)?,
         pid: row.get(3)?,
         state,
         detached: row.get(5)?,
@@ -86,7 +86,7 @@ impl Processes {
         })
     }
 
-    /// Register a process of `agent`, named `name` or `<agent>-<id>`, to
+    /// Register a worker for `consumer`, named `name` or `<consumer>-<id>`, to
     /// be adopted within [`STARTUP_SECONDS`].
     ///
     /// # Errors
@@ -94,7 +94,7 @@ impl Processes {
     /// SQLite failure, including a duplicate name.
     pub fn create(
         &mut self,
-        agent: &str,
+        consumer: &str,
         name: Option<&str>,
         detached: bool,
     ) -> Result<ProcessRecord, rusqlite::Error> {
@@ -108,15 +108,15 @@ impl Processes {
             ),
             params![
                 name.map_or_else(
-                    || format!("{agent}-pending-{}", std::process::id()),
+                    || format!("{consumer}-pending-{}", std::process::id()),
                     str::to_owned
                 ),
-                agent,
+                consumer,
                 detached
             ],
         )?;
         let id = tx.last_insert_rowid();
-        let name = name.map_or_else(|| format!("{agent}-{id}"), str::to_owned);
+        let name = name.map_or_else(|| format!("{consumer}-{id}"), str::to_owned);
         let log = self.logs.join(format!("{id}.log"));
         tx.execute(
             "UPDATE processes SET name = ?2, log_path = ?3 WHERE id = ?1",

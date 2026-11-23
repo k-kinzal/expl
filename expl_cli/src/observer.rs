@@ -72,9 +72,9 @@ impl ProcessObserver for ActivityLog {
                 self.line(&format!("cannot follow the trunk: {reason}"));
             }
             ProcessActivity::Started(record) => self.line(&format!(
-                "started process {} of agent `{}` (pid {})",
+                "started process {} for consumer `{}` (pid {})",
                 record.id,
-                record.agent,
+                record.consumer,
                 std::process::id()
             )),
             ProcessActivity::Reacting(delivery) => {

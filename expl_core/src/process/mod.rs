@@ -1,11 +1,8 @@
-//! Processes: running agents, managed the way Docker manages containers.
+//! Processes are workers for an event [`Consumer`](crate::event::Consumer).
 //!
-//! A [`Process`] is one running instance of a declared
-//! [`Agent`](crate::agent::Agent) — what a container is to an image. It
-//! leases events from its agent's [`Inbox`](crate::event::Inbox), reacts to
-//! each with the agent's role, and acknowledges it. Starting more processes
-//! of the same agent is how exploration widens: they compete for the same
-//! inbox, so independent events are handled in parallel.
+//! A [`Process`] leases an event from the consumer's [`Inbox`](crate::event::Inbox),
+//! runs its handler, and acknowledges the delivery. Replicas use the same
+//! inbox, so independent deliveries can run in parallel.
 //!
 //! Every process has a [`ProcessRecord`] in the project database — the
 //! operator's durable memory of what runs and what ran (`expl ps`), with

@@ -1,4 +1,4 @@
-//! `expl run <AGENT>` — start a process of an agent.
+//! `expl run <CONSUMER>` — start a worker for an event consumer.
 //!
 //! In the foreground the process's activity goes to stderr and its log
 //! file; Ctrl-C (or `expl stop`) stops it gracefully: the current agent
@@ -25,14 +25,14 @@ use crate::output::{println, status};
 
 pub(crate) fn run(start: &Path, args: &RunArgs) -> Result<(), CliError> {
     let context = load(start)?;
-    let agent = context.agent(&args.agent)?;
+    let consumer = context.consumer(&args.consumer)?;
     let project = context.project();
     let mut table = processes(project)?;
     std::fs::create_dir_all(project.processes_dir())
         .map_err(|e| CliError::io("create process log directory", e))?;
 
     if args.detach {
-        let record = table.create(agent.name(), args.name.as_deref(), true)?;
+        let record = table.create(consumer.name(), args.name.as_deref(), true)?;
         if let Err(error) = spawn_detached(project, &record, args) {
             table.exit(record.id, &format!("failed to start: {error}"))?;
             return Err(error);
@@ -43,16 +43,16 @@ pub(crate) fn run(start: &Path, args: &RunArgs) -> Result<(), CliError> {
 
     let (record, tee) = if let Some(id) = args.adopt {
         let record = table.get(ProcessId(id))?;
-        if record.agent != agent.name() {
+        if record.consumer != consumer.name() {
             return Err(CliError::Usage(format!(
-                "process {} belongs to agent `{}`",
-                record.id, record.agent
+                "process {} belongs to consumer `{}`",
+                record.id, record.consumer
             )));
         }
         // Detached: stderr already is the log file.
         (record, None)
     } else {
-        let record = table.create(agent.name(), args.name.as_deref(), false)?;
+        let record = table.create(consumer.name(), args.name.as_deref(), false)?;
         let log = open_log(&record)?;
         (record, Some(log))
     };
@@ -63,7 +63,7 @@ pub(crate) fn run(start: &Path, args: &RunArgs) -> Result<(), CliError> {
         once: args.once,
         exit_when_idle: args.exit_when_idle,
     };
-    Process::new(&context, &agent, record.id, interrupt).run(options, &observer)?;
+    Process::new(&context, &consumer, record.id, interrupt).run(options, &observer)?;
     Ok(())
 }
 
@@ -89,7 +89,7 @@ fn spawn_detached(
     command
         .arg("-C")
         .arg(project.root())
-        .args(["run", &args.agent, "--adopt", &record.id.0.to_string()])
+        .args(["run", &args.consumer, "--adopt", &record.id.0.to_string()])
         .current_dir(project.root())
         .stdin(Stdio::null())
         .stdout(log)

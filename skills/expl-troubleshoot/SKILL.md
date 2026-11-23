@@ -15,7 +15,7 @@ follows it like any adoption). Never change `*.md` files while fixing.
 ```sh
 skills/expl-operate/scripts/status.sh        # everything at once
 expl ps -a                                   # exited/dead processes and their reason
-expl event ls --agent <agent>                # per-delivery state: failed, attempts, note
+expl event ls --consumer <consumer>          # per-delivery state: failed, attempts, note
 expl logs <process> | tail -50               # process log: reacting / reacted / failed lines
 expl node logs <id>                          # raw agent output of the newest run about a node
 ls -t .expl/logs | head                      # newest agent runs
@@ -26,13 +26,13 @@ ls -t .expl/logs | head                      # newest agent runs
 | Symptom | Likely cause | Action |
 | --- | --- | --- |
 | `failed: … (will be delivered again)` then `(giving up)` in a process log | the agent CLI failed 3× on that event (`MAX_ATTEMPTS`) | read the run log; fix the cause (config, CLI auth, bug); for a failed step use `expl node retry <id>` |
-| run log ends with `claude reported error_*` / `usage limit` / codex exit 1 | CLI quota or outage | routing falls over to the other CLI automatically; if both fail, wait, or temporarily remove the broken CLI from `expl.toml` and restart that agent |
-| `codex's last message is not a JSON object` / `no structured output` | CLI answered prose | usually transient (retried); if systematic, check the role schema still matches what the CLI accepts |
+| run log ends with `claude reported error_*` / `usage limit` / codex exit 1 | CLI quota or outage | routing falls over to the other CLI automatically; if both fail, wait, or temporarily remove the broken CLI from `expl.toml` and restart that consumer’s workers |
+| `codex's last message is not a JSON object` / `no structured output` | CLI answered prose | usually transient (retried); if systematic, check the handler schema still matches what the CLI accepts |
 | cursor-agent `is_error` / auth error | Cursor login expired | ask the owner to run `! cursor-agent login`; then `expl node retry <id>` for failed steps |
 | step `failed` with "cargo … failed" in its summary | verifier could not make tests pass | normal outcome; planning re-plans or prunes it — leave it unless it repeats for the same reason |
 | process `dead` in `expl ps` | crashed or killed without exiting | `expl rm <name>` then `expl up`; its leases expire after 60 s and the events are redelivered |
 | a step stuck `running` with no live verifier | verifier died mid-run | the lease expires and the redelivered `node.ready` reclaims it; if not, `expl stop`/`up` the verifiers |
-| nothing `ready` although steps are `planned` | predecessors not completed, or planner never prioritised them | `expl path ls`, `expl event ls --agent planner` |
+| nothing `ready` although steps are `planned` | predecessors not completed, or planner never prioritised them | `expl path ls`, `expl event ls --consumer planner` |
 | merged into main but `expl origin ls` shows no new origin | no process is running, or trunk branch mismatch | `expl up`; `trunk = "main"` in `expl.toml`; the process log shows `cannot follow the trunk: …` |
 | `worktree add` / `branch -D` errors | leftover worktree or branch from a crash | `git worktree prune`; inspect `.expl/worktrees`; never delete `expl/node-*` branches of completed steps |
 | `expl` prints nothing and exits (even `--version`) | the binary was overwritten in place with `cp`; macOS kills it (invalid code signature) | reinstall with `skills/expl-operate/scripts/install.sh` (copy + rename) |
@@ -73,9 +73,8 @@ while processes run; if state must be repaired, `expl down` first and keep a cop
 - Joins whose merge conflicted always failed: the agent resolved the markers but git
   still listed the files as unmerged. Fixed by adopting #3 (`Workspace::resume`
   concludes the merge after checking the markers are gone).
-- A newly declared agent receives every past event of its role (its backlog starts
-  at the whole history). With `weight` it reacts only to its share; expect a few
-  catch-up explorations after adding one.
+- A newly declared consumer sees past events it subscribes to. For a consumer in
+  a delivery group, existing assignments keep their recipients while eligible.
 - Processes died with `database is locked`: deferred savepoints that read before
   writing failed at once with `SQLITE_BUSY_SNAPSHOT` when another process had
   committed. Writes now take the lock up front, and a reaction that still finds the

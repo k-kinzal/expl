@@ -1,4 +1,4 @@
-//! Explicit role assignments and nested agent routers.
+//! Delivery groups and nested routers for event consumers.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
@@ -6,16 +6,15 @@ use std::num::NonZeroUsize;
 use serde::{Deserialize, Serialize};
 
 use super::{Declaration, DeclarationError, spread};
-use crate::event::EventId;
-use crate::role::Role;
+use crate::event::{EventId, EventKind};
 
 /// One `[router.<name>]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouterDeclaration {
-    /// Agents or routers, in policy order.
+    /// Consumers or routers, in policy order.
     pub targets: Vec<String>,
-    /// How to choose among targets that serve the role being routed.
+    /// How to choose among targets that subscribe to the event being routed.
     pub policy: RoutingPolicy,
     /// Maximum concurrent reactions in this router's assigned group.
     pub concurrency: NonZeroUsize,
@@ -36,9 +35,9 @@ pub enum RoutingPolicy {
 
 type Members<'a> = BTreeMap<&'a str, BTreeSet<&'a str>>;
 
-/// The reachable targets for a role's explicit assignment.
+/// The reachable targets for one delivery group.
 pub(crate) struct Route<'a> {
-    pub(crate) role: Role,
+    pub(crate) group: &'a str,
     root: &'a str,
     declaration: &'a Declaration,
     members: Members<'a>,
@@ -49,23 +48,46 @@ impl Route<'_> {
         &self.members[self.root]
     }
 
-    pub(crate) fn groups(&self, agent: &str) -> impl Iterator<Item = (&str, NonZeroUsize)> {
+    pub(crate) fn groups(&self, consumer: &str) -> impl Iterator<Item = (&str, NonZeroUsize)> {
         self.members.iter().filter_map(move |(name, members)| {
             let router = self.declaration.router.get(*name)?;
             members
-                .contains(agent)
+                .contains(consumer)
                 .then_some((*name, router.concurrency))
         })
     }
 
-    pub(crate) fn select(&self, event: EventId) -> &str {
+    fn subscribes(&self, consumer: &str, kind: EventKind) -> bool {
+        self.declaration.consumer[consumer].on.contains(&kind)
+    }
+
+    /// Eligible owners per kind, so SQLite can detect stranded assignments
+    /// even when a former owner remains subscribed to other kinds.
+    pub(crate) fn eligible_owners(&self) -> String {
+        let owners: BTreeMap<_, Vec<_>> = EventKind::ALL
+            .iter()
+            .map(|&kind| {
+                let consumers = self
+                    .members()
+                    .iter()
+                    .copied()
+                    .filter(|consumer| self.subscribes(consumer, kind))
+                    .collect();
+                (kind.as_str(), consumers)
+            })
+            .collect();
+        serde_json::json!(owners).to_string()
+    }
+
+    pub(crate) fn select(&self, kind: EventKind, event: EventId) -> &str {
         let mut target = self.root;
         while let Some(router) = self.declaration.router.get(target) {
             let eligible = || {
-                router
-                    .targets
-                    .iter()
-                    .filter(|name| !self.members[name.as_str()].is_empty())
+                router.targets.iter().filter(|name| {
+                    self.members[name.as_str()]
+                        .iter()
+                        .any(|consumer| self.subscribes(consumer, kind))
+                })
             };
             let weight = |name: &String| u64::from(*router.weights.get(name).unwrap_or(&1));
             target = match router.policy {
@@ -98,8 +120,8 @@ impl Declaration {
     pub(super) fn validate_routing(&self) -> Result<(), DeclarationError> {
         for (name, router) in &self.router {
             let invalid = |why| DeclarationError::Invalid(format!("router `{name}`: {why}"));
-            if self.agent.contains_key(name) {
-                return Err(invalid("name is also an agent"));
+            if self.consumer.contains_key(name) {
+                return Err(invalid("name is also a consumer"));
             }
             let targets: BTreeSet<_> = router.targets.iter().collect();
             if targets.is_empty() || targets.len() != router.targets.len() {
@@ -122,11 +144,14 @@ impl Declaration {
         for name in self.router.keys() {
             self.collect_members(name, &mut members, &mut Vec::new())?;
         }
-        for (role, root) in &self.routing {
-            let agents = self.collect_members(root, &mut members, &mut Vec::new())?;
-            if !agents.iter().any(|agent| self.agent[*agent].role == *role) {
+        for (group, root) in &self.routing {
+            let consumers = self.collect_members(root, &mut members, &mut Vec::new())?;
+            if !consumers
+                .iter()
+                .any(|name| self.consumer[*name].group.as_ref() == Some(group))
+            {
                 return Err(DeclarationError::Invalid(format!(
-                    "routing for `{role}`: `{root}` has no agent for this role"
+                    "routing for `{group}`: `{root}` has no consumer in this group"
                 )));
             }
         }
@@ -149,7 +174,7 @@ impl Declaration {
                 path.join(" -> ")
             )));
         }
-        let agents = if self.agent.contains_key(target) {
+        let consumers = if self.consumer.contains_key(target) {
             BTreeSet::from([target])
         } else if let Some(router) = self.router.get(target) {
             path.push(target);
@@ -164,29 +189,30 @@ impl Declaration {
                 "unknown routing target `{target}`"
             )));
         };
-        members.insert(target, agents.clone());
-        Ok(agents)
+        members.insert(target, consumers.clone());
+        Ok(consumers)
     }
 
-    /// Whether a declared agent can receive events under this role assignment.
+    /// Whether this consumer is reachable through its delivery group's router.
     #[must_use]
-    pub fn is_assigned(&self, agent: &str) -> bool {
-        self.agent.get(agent).is_some_and(|declaration| {
-            self.explicit_route(declaration.role)
-                .is_none_or(|route| route.members().contains(agent))
+    pub fn is_assigned(&self, name: &str) -> bool {
+        self.consumer.get(name).is_some_and(|_| {
+            self.route_for(name)
+                .is_none_or(|route| route.members().contains(name))
         })
     }
 
-    pub(crate) fn explicit_route(&self, role: Role) -> Option<Route<'_>> {
-        let root = self.routing.get(&role)?;
+    pub(crate) fn route_for(&self, name: &str) -> Option<Route<'_>> {
+        let group = self.consumer.get(name)?.group.as_deref()?;
+        let root = self.routing.get(group)?;
         let mut members = BTreeMap::new();
         self.collect_members(root, &mut members, &mut Vec::new())
             .expect("validated routing targets");
-        for agents in members.values_mut() {
-            agents.retain(|agent| self.agent[*agent].role == role);
+        for consumers in members.values_mut() {
+            consumers.retain(|name| self.consumer[*name].group.as_deref() == Some(group));
         }
         Some(Route {
-            role,
+            group,
             root,
             declaration: self,
             members,
@@ -214,29 +240,48 @@ policy = "weighted"
 weights = { explorer = 4 }
 concurrency = 1
 
-[agent.fringe]
-role = "exploration"
+[consumer.fringe]
+on = ["goal.added"]
+handler = "exploration"
+group = "exploration"
 driver = "generic"
 command = ["fringe"]
 replicas = 1
 breadth = 2
 "#;
 
+    fn template_with_groups() -> String {
+        Declaration::TEMPLATE
+            .replace(
+                "handler = \"exploration\"",
+                "handler = \"exploration\"\ngroup = \"exploration\"",
+            )
+            .replace(
+                "handler = \"verification\"",
+                "handler = \"verification\"\ngroup = \"verification\"",
+            )
+    }
+
     #[test]
-    fn nested_routing_applies_policies_after_filtering_for_the_role() {
-        let declaration = Declaration::parse(&format!("{}{ROUTERS}", Declaration::TEMPLATE))
+    fn nested_routing_applies_policies_after_filtering_for_the_event_and_group() {
+        let declaration = Declaration::parse(&format!("{}{ROUTERS}", template_with_groups()))
             .expect("declaration");
-        let exploration = declaration
-            .explicit_route(Role::Exploration)
-            .expect("route");
-        let verification = declaration
-            .explicit_route(Role::Verification)
-            .expect("route");
+        let exploration = declaration.route_for("explorer").expect("route");
+        let verification = declaration.route_for("verifier").expect("route");
         let fringes = (1..=4000)
-            .filter(|id| exploration.select(EventId(*id)) == "fringe")
+            .filter(|id| exploration.select(EventKind::GoalAdded, EventId(*id)) == "fringe")
             .count();
         assert!((700..900).contains(&fringes), "{fringes}");
-        assert_eq!(verification.select(EventId(1)), "verifier");
+        assert_eq!(
+            verification.select(EventKind::NodeReady, EventId(1)),
+            "verifier"
+        );
+        for id in 1..=100 {
+            assert_eq!(
+                exploration.select(EventKind::NodeEvaluated, EventId(id)),
+                "explorer"
+            );
+        }
         assert_eq!(
             exploration
                 .groups("explorer")
@@ -249,7 +294,7 @@ breadth = 2
 
     #[test]
     fn routing_rejects_invalid_graphs_and_limits() {
-        let base = format!("{}{ROUTERS}", Declaration::TEMPLATE);
+        let base = format!("{}{ROUTERS}", template_with_groups());
         for (from, to, problem) in [
             (
                 "\"verifier\", \"explorers\"",
@@ -264,7 +309,7 @@ breadth = 2
             (
                 "exploration = \"all\"",
                 "exploration = \"verifier\"",
-                "no agent for this role",
+                "no consumer in this group",
             ),
             ("explorer = 4", "explorer = 0", "weights"),
             ("concurrency = 2", "concurrency = 0", "concurrency"),

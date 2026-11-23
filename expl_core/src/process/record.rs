@@ -85,10 +85,10 @@ impl fmt::Display for ProcessState {
 pub struct ProcessRecord {
     /// Identity.
     pub id: ProcessId,
-    /// Unique name (`<agent>-<id>` unless given).
+    /// Unique name (`<consumer>-<id>` unless given).
     pub name: String,
-    /// The declared agent it runs.
-    pub agent: String,
+    /// The consumer whose events this worker processes.
+    pub consumer: String,
     /// OS process id, once started.
     pub pid: Option<u32>,
     /// Reconciled state.

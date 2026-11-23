@@ -11,8 +11,8 @@ section() { printf '\n== %s ==\n' "$1"; }
 
 section "processes"
 expl ps
-section "agents"
-expl agent ls
+section "consumers"
+expl consumer ls
 section "goals"
 expl goal ls
 section "nodes"

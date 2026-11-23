@@ -6,8 +6,8 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use crate::agent::Agent;
 use crate::declaration::Route;
+use crate::event::Consumer;
 
 pub(super) struct Capacity(Vec<(PathBuf, NonZeroUsize)>);
 
@@ -22,16 +22,20 @@ impl Drop for Slot {
 }
 
 impl Capacity {
-    pub(super) fn new(state: &Path, agent: &Agent, route: Option<&Route<'_>>) -> io::Result<Self> {
+    pub(super) fn new(
+        state: &Path,
+        consumer: &Consumer,
+        route: Option<&Route<'_>>,
+    ) -> io::Result<Self> {
         let root = state.join("slots");
         let mut limits = Vec::new();
-        if let Some(limit) = agent.declaration().concurrency {
-            limits.push((directory(&root, "agent", agent.name()), limit));
+        if let Some(limit) = consumer.declaration().concurrency {
+            limits.push((directory(&root, "agent", consumer.name()), limit));
         }
         if let Some(route) = route {
             limits.extend(
                 route
-                    .groups(agent.name())
+                    .groups(consumer.name())
                     .map(|(name, limit)| (directory(&root, "router", name), limit)),
             );
         }
@@ -89,14 +93,26 @@ fn directory(root: &Path, kind: &str, name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Declaration, Role};
+    use crate::Declaration;
 
     #[test]
     fn workers_need_room_at_each_level_and_release_slots_on_drop() {
         let project = tempfile::tempdir().expect("project");
         let declaration = Declaration::parse(&format!(
             "{}{}",
-            Declaration::TEMPLATE,
+            Declaration::TEMPLATE
+                .replace(
+                    "[consumer.explorer]",
+                    "[consumer.explorer]\ngroup = \"exploration\""
+                )
+                .replace(
+                    "[consumer.planner]",
+                    "[consumer.planner]\ngroup = \"planning\""
+                )
+                .replace(
+                    "[consumer.verifier]",
+                    "[consumer.verifier]\ngroup = \"verification\""
+                ),
             r#"
 [routing]
 exploration = "all"
@@ -113,8 +129,10 @@ targets = ["explorer", "fringe"]
 policy = "weighted"
 concurrency = 1
 
-[agent.fringe]
-role = "exploration"
+[consumer.fringe]
+on = ["goal.added"]
+handler = "exploration"
+group = "exploration"
 driver = "generic"
 command = ["fringe"]
 replicas = 1
@@ -123,12 +141,12 @@ breadth = 1
         ))
         .expect("declaration");
         let capacity = |name| {
-            let agent = Agent::from_declaration(name, declaration.agent(name).expect("agent"))
-                .expect("driver");
+            let consumer =
+                Consumer::new(name, declaration.consumer(name).expect("consumer")).expect("driver");
             Capacity::new(
                 project.path(),
-                &agent,
-                declaration.explicit_route(agent.role()).as_ref(),
+                &consumer,
+                declaration.route_for(name).as_ref(),
             )
             .expect("capacity")
         };
@@ -149,6 +167,6 @@ breadth = 1
         assert!(fringe.try_acquire().expect("files").is_some());
         drop(planning);
         assert!(planner.try_acquire().expect("files").is_some());
-        assert!(declaration.explicit_route(Role::Evaluation).is_none());
+        assert!(declaration.route_for("evaluator").is_none());
     }
 }

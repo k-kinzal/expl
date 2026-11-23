@@ -31,16 +31,16 @@ pub(crate) enum SnapshotError {
     Sqlite(String),
 }
 
-/// A declared agent, as the operator wrote it.
+/// A declared consumer, as the operator wrote it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DeclaredAgent {
-    /// `[agent.<name>]`.
+pub(crate) struct DeclaredConsumer {
+    /// `[consumer.<name>]`.
     pub(crate) name: String,
-    /// Its role.
-    pub(crate) role: String,
+    /// Its event handler.
+    pub(crate) handler: expl_core::Handler,
     /// How many processes `expl up` keeps.
     pub(crate) replicas: usize,
-    /// Its share when its role's events are routed between agents.
+    /// Its share under legacy inline routing.
     pub(crate) weight: u32,
 }
 
@@ -61,8 +61,8 @@ pub(crate) struct Snapshot {
     pub(crate) goal_tree: GoalTree,
     /// The latest plan's paths, in the planner's order.
     pub(crate) paths: Vec<PlannedPath>,
-    /// Declared agents (empty when `expl.toml` cannot be read).
-    pub(crate) agents: Vec<DeclaredAgent>,
+    /// Declared consumers (empty when `expl.toml` cannot be read).
+    pub(crate) consumers: Vec<DeclaredConsumer>,
     /// Processes that have not exited (running, starting, or dead).
     pub(crate) processes: Vec<ProcessRecord>,
     /// The newest agent runs, newest first.
@@ -105,16 +105,16 @@ impl Snapshot {
             .filter(|p| p.state != ProcessState::Exited)
             .collect();
 
-        let agents = Declaration::load(&project.declaration_path())
+        let consumers = Declaration::load(&project.declaration_path())
             .map(|declaration| {
                 declaration
-                    .agent
+                    .consumer
                     .into_iter()
-                    .map(|(name, agent)| DeclaredAgent {
+                    .map(|(name, consumer)| DeclaredConsumer {
                         name,
-                        role: agent.role.as_str().to_owned(),
-                        replicas: agent.replicas,
-                        weight: agent.weight.unwrap_or(1),
+                        handler: consumer.handler,
+                        replicas: consumer.replicas,
+                        weight: consumer.legacy_weight().unwrap_or(1),
                     })
                     .collect()
             })
@@ -128,7 +128,7 @@ impl Snapshot {
             lineage,
             goal_tree,
             paths,
-            agents,
+            consumers,
             processes: records,
             runs,
         })
@@ -249,9 +249,11 @@ impl Snapshot {
     /// The processes of `agent` that have not exited.
     pub(crate) fn processes_of<'a>(
         &'a self,
-        agent: &'a str,
+        consumer: &'a str,
     ) -> impl Iterator<Item = &'a ProcessRecord> + 'a {
-        self.processes.iter().filter(move |p| p.agent == agent)
+        self.processes
+            .iter()
+            .filter(move |p| p.consumer == consumer)
     }
 }
 
@@ -345,6 +347,6 @@ mod tests {
         assert_eq!(snapshot.goals().len(), 1);
         assert!(snapshot.working_on().is_empty());
         assert!(snapshot.busy().is_empty());
-        assert!(snapshot.agents.is_empty(), "no expl.toml, no agents");
+        assert!(snapshot.consumers.is_empty(), "no expl.toml, no consumers");
     }
 }

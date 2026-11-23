@@ -2,14 +2,16 @@
 
 expl explores a problem space as a graph of hypotheses, which agents verify as git branches or as findings.
 
-Every change to the graph is an **event**. Agents declared in `expl.toml` react to the events of their role:
+Graph changes produce **events**. A goal command, a process following the trunk, or a handler that records a result can all produce events. Each **consumer** in `expl.toml` subscribes to specific events and declares how to handle them. The default configuration forms this cycle:
 
-- **exploration** proposes hypotheses — steps toward your goals, and for counter-exploration goals also backward from them;
-- **planning** assembles them into paths of hypotheses built on one another and sets their priorities;
-- **verification** tests each ready hypothesis, highest priority first: a change becomes a commit on its own branch, an investigation a finding, worked out in a private clone of the repository;
-- **evaluation** reads each verification's result: whether the hypothesis held (done, abandoned, or to be continued), and how far it moves each goal.
+| Events | Handler | Result |
+| --- | --- | --- |
+| `goal.added`, `node.evaluated`, `node.failed`, `origin.advanced`, `node.revisited` | `exploration` | Propose hypotheses, including backward searches from counter-exploration goals |
+| `node.proposed`, `node.evaluated`, `node.failed`, `goal.retired`, `origin.advanced` | `planning` | Assemble paths and set priorities, making eligible hypotheses ready |
+| `node.ready` | `verification` | Test the highest-priority ready hypothesis in a private clone and record a commit or finding |
+| `node.completed`, `node.failed`, `origin.advanced` | `evaluation` | Record whether a hypothesis held and how far the result moves each goal |
 
-Agents run as **processes**, managed like Docker containers. Processes of one agent share its events, so independent hypotheses are explored, verified, and evaluated in parallel. The graph, events, and processes live in SQLite under `.expl/`. Exploration never ends by itself: expl generates and verifies hypotheses, and choosing one is up to you.
+A **worker** is a process that leases an event, runs the handler, and acknowledges the result. Replicas share the same inbox, so independent events can run in parallel. The graph, event log, deliveries, and process records live in SQLite under `.expl/`. Exploration continues until a human stops it.
 
 expl follows the **trunk**, the default branch named by `trunk` in `expl.toml`. To adopt a hypothesis, merge its branch with git, resolving conflicts as usual. Running processes notice that the trunk moved, record its new position as the **origin**, and start exploring from there. A step counts as adopted when the trunk contains its commits, whether by merge, fast-forward, squash merge, or cherry-pick. The previous origins stay in the graph with what was adopted into each, so you can always see what was chosen and when, and still adopt a hypothesis that was left behind on an older origin.
 
@@ -22,14 +24,14 @@ cargo install --path expl_cli
 cargo install --path expl_ui      # optional: the `expl-ui` window (macOS/Linux, GPUI)
 ```
 
-Requires `git` and at least one agent CLI (`claude` or `codex`).
+Requires `git` and the commands configured for the consumers. The default uses `claude`.
 
 ## Quick start
 
 ```sh
 cd your-repo                      # needs at least one commit
 expl init                         # writes expl.toml, creates .expl/, origin = HEAD, trunk = current branch
-expl up                           # start every declared agent
+expl up                           # start the configured workers
 expl goal add "Fast startup" --objective "cold start under 100ms, measured by bench/startup.sh"
 expl ps                           # what each process is doing
 expl-ui &                         # or watch it: the graph, live
@@ -57,17 +59,17 @@ expl down
 | `expl path ls` | The latest plan's paths |
 | `expl hypothesis ls` | Hypotheses evaluated as satisfying a goal: the origin each was explored from, how far behind it is, and whether it is already adopted |
 | `expl origin ls` | The lineage: every origin, oldest first, with what it adopted and how the trunk scored against each goal |
-| `expl event ls [--kind K]… [--agent NAME]` | The event log; with `--agent`, how that agent's deliveries stand |
-| `expl agent ls` | Declared agents, concurrency limits, running processes, backlog |
-| `expl run AGENT [-d] [--name N] [--once] [--exit-when-idle]` | Start a process of an agent (foreground, or detached with `-d`) |
-| `expl up [AGENT…]` | Start processes until each assigned agent has `replicas` running |
+| `expl event ls [--kind K]… [--consumer NAME]` | The event log and optional delivery status for a consumer |
+| `expl consumer ls` | Subscriptions, handlers, concurrency limits, running workers, backlog |
+| `expl run CONSUMER [-d] [--name N] [--once] [--exit-when-idle]` | Start a consumer worker (foreground, or detached with `-d`) |
+| `expl up [CONSUMER…]` | Start workers until each assigned consumer has `replicas` running |
 | `expl down [-t SECS]` | Stop every running process |
 | `expl ps [-a]` (`expl process ls`) | List processes |
 | `expl logs PROC [-f]` | Print (or follow) a process log |
 | `expl stop PROC… [-t SECS]` / `expl kill PROC…` / `expl rm PROC… [-f]` | Stop gracefully / kill / remove records |
 | `expl process inspect PROC` | One process record |
 
-Processes are addressed by id or name (`<agent>-<id>` unless named with `--name`). Listings accept `-q` (ids only) and `--format json` (NDJSON). Data goes to stdout and status goes to stderr. Exit codes: `0` ok, `1` user input, `2` runtime, `64` configuration.
+Processes are addressed by id or name (`<consumer>-<id>` unless named with `--name`). Listings accept `-q` (ids only) and `--format json` (NDJSON). Data goes to stdout and status goes to stderr. Exit codes: `0` ok, `1` user input, `2` runtime, `64` configuration.
 
 ## Watching
 
@@ -75,22 +77,24 @@ Processes are addressed by id or name (`<agent>-<id>` unless named with `--name`
 
 ## Configuration
 
-`expl.toml` (written by `expl init`) declares the trunk and the agents:
+`expl init` writes `expl.toml` with the default cycle. Each consumer declares its event kinds in `on`, its graph operation in `handler`, and the command that supplies the handler's response. For example, these subscriptions run when a goal is added and when a step is ready, respectively.
 
 ```toml
-trunk = "main"                  # the default branch expl follows
+trunk = "main"
 
-[agent.explorer]
-role = "exploration"            # exploration | planning | verification | evaluation
-driver = "claude_code"          # claude_code | codex | generic
+[consumer.explorer]
+on = ["goal.added"]
+handler = "exploration"
+driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
-replicas = 1                    # processes `expl up` keeps running
-concurrency = 1                 # simultaneous reactions across those processes
-breadth = 3                     # exploration only: proposals per reaction
+replicas = 1
+concurrency = 1
+breadth = 3
 
-[agent.verifier]
-role = "verification"
+[consumer.verifier]
+on = ["node.ready"]
+handler = "verification"
 driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
@@ -99,36 +103,42 @@ concurrency = 2
 instructions = "Run the test suite before finishing."
 ```
 
-Agents run unattended in private clones under `.expl/worktrees/` with the whole Git history and free use of Git. Expl and the operator control the project's refs. `[workspace] frozen` lists Git pathspecs a step's commit keeps as they were. The default lets Claude Code edit files and run commands without prompting.
+The handler prepares the workspace and the request, validates the response, and records the result in the graph. Drivers include `claude_code`, `codex`, `cursor_agent`, and `generic`. Each `[[consumer.<name>.alternative]]` adds another command to the invocation rotation and failover. `timeout` bounds each attempt.
 
-A `generic` agent is any command that reads the prompt on stdin and prints a JSON object. expl sets `EXPL_AGENT`, `EXPL_ROLE`, `EXPL_EVENT`, `EXPL_NODE`, and `EXPL_RESPONSE_SCHEMA` for it.
+A `generic` command reads the handler's prompt on standard input and returns JSON on standard output. It receives `EXPL_CONSUMER`, `EXPL_HANDLER`, `EXPL_EVENT`, `EXPL_EVENT_ID` (the numeric log ID), `EXPL_NODE` when there is a subject, and `EXPL_RESPONSE_SCHEMA`. A command can use an algorithm or delegate to a service and return the same response schema. The subscription, retries, and graph updates belong to expl.
+
+Commands run in private clones with the full Git history. `[workspace] frozen` lists Git pathspecs a change step's commit keeps as they were where the step started. An exploration consumer that subscribes to `node.revisited` can set `revisit_cooldown` to publish that event after an idle interval, choosing a starting point at random.
 
 ### Routing and concurrency
 
-`[routing]` assigns a role's events to an agent or a named router. A router can target agents and other routers. At each level expl considers the targets with agents for the event's role and applies that router's policy. `first` takes the first eligible target in order. `weighted` distributes events by relative weight, with a default weight of one per target. Expl records the selected agent for each role and event, so retries and restarts keep the same recipient while it is eligible.
+Each consumer receives all events it subscribes to by default. For interchangeable consumers, give them the same `group` and point that group at a consumer or router in `[routing]`. Each event has one recipient per group. Consumers with independent work, such as exploration and evaluation on `origin.advanced`, can use separate groups or inboxes.
+
+For example, set `group = "directions"` on `explorer` and `fringe`, and `group = "checks"` on `verifier`. The following assigns one exploration perspective per subscribed event and limits all three consumers to one simultaneous reaction.
 
 ```toml
 [routing]
-exploration = "project"
-planning = "project"
-verification = "project"
-evaluation = "project"
+directions = "project"
+checks = "project"
 
 [router.project]
-targets = ["explorers", "planner", "verifier", "evaluator"]
+targets = ["perspectives", "verifier"]
 policy = "first"
 concurrency = 1
 
-[router.explorers]
+[router.perspectives]
 targets = ["explorer", "fringe"]
 policy = "weighted"
 weights = { explorer = 4, fringe = 1 }
 concurrency = 1
 ```
 
-`concurrency` is a positive limit on simultaneous reactions shared by all processes of an agent or all agents under a router. A reaction must have room under the agent's limit and every router limit that covers it. The shared `project` router above limits the four roles to one reaction at a time. Assigning only exploration through `explorers` applies the group limit to exploration alone. `replicas` controls the number of workers started by `expl up`. The same limits apply to workers started with `expl run`. Restart workers after changing the routing or limits.
+A router considers only members of the group that subscribe to the event. `first` picks the first eligible target. `weighted` splits events in proportion to the target weights, which default to one. Expl records the recipient for each group and event, so retries and restarts keep it while it remains eligible.
 
-Roles omitted from `[routing]` retain per-agent event delivery and any existing `weight` settings. Agents may omit `concurrency` to keep their existing execution behavior.
+`concurrency` limits simultaneous reactions across all workers of a consumer or all assigned descendants of a router. `replicas` controls how many workers `expl up` starts. Workers started with `expl run` share the same limits. Restart workers after editing their configuration.
+
+### Existing projects
+
+Existing `[agent.<name>]` declarations still load with the former event sets and routing. To migrate, rename each table to `[consumer.<name>]`, replace `role` with `handler`, and add the corresponding `on` list from the default cycle above. For explicit routing, keep the existing `[routing]` keys and set `group` to the former role on each routed consumer. Convert inline `weight` settings to a weighted router and use the former role as the group name. Keep consumer names to preserve their delivery history. The CLI also accepts `expl agent ls` and `expl event ls --agent` for existing scripts.
 
 ## License
 

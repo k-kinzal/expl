@@ -1,4 +1,4 @@
-//! [`Reaction`] — one agent responding to one delivered event.
+//! [`Reaction`] — one consumer responding to one delivered event.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -6,37 +6,37 @@ use std::path::Path;
 
 use serde::de::DeserializeOwned;
 
-use crate::agent::{Agent, AgentError, Invocation};
-use crate::event::{Delivery, Event, LeaseToken};
+use crate::agent::{AgentError, Invocation};
+use crate::event::{Consumer, Delivery, Event, LeaseToken};
 use crate::graph::{AgentRunStatus, Graph, NodeId};
+use crate::handler::{Context, HandlerError, Report};
 use crate::process::{Interrupt, ProcessId};
 use crate::prompt::Prompt;
-use crate::role::{Context, Report, RoleError};
 use crate::workspace::{AgentClone, ScratchWorkspace};
 
-/// Everything a role needs to react to one event.
+/// Everything a handler needs to react to one event.
 #[derive(Debug, Clone, Copy)]
 pub struct Reaction<'a> {
     context: &'a Context,
-    agent: &'a Agent,
+    consumer: &'a Consumer,
     process: ProcessId,
     delivery: &'a Delivery,
     interrupt: &'a Interrupt,
 }
 
 impl<'a> Reaction<'a> {
-    /// `agent`, hosted by `process`, reacting to `delivery`.
+    /// `consumer`, hosted by `process`, reacting to `delivery`.
     #[must_use]
     pub fn new(
         context: &'a Context,
-        agent: &'a Agent,
+        consumer: &'a Consumer,
         process: ProcessId,
         delivery: &'a Delivery,
         interrupt: &'a Interrupt,
     ) -> Self {
         Self {
             context,
-            agent,
+            consumer,
             process,
             delivery,
             interrupt,
@@ -49,10 +49,10 @@ impl<'a> Reaction<'a> {
         self.context
     }
 
-    /// The reacting agent.
+    /// The reacting consumer.
     #[must_use]
-    pub fn agent(&self) -> &'a Agent {
-        self.agent
+    pub fn consumer(&self) -> &'a Consumer {
+        self.consumer
     }
 
     /// The reaction's lease token.
@@ -84,10 +84,10 @@ impl<'a> Reaction<'a> {
     ///
     /// # Errors
     ///
-    /// [`RoleError::Malformed`] when the event names no node.
-    pub(crate) fn subject(&self) -> Result<NodeId, RoleError> {
-        self.event().node.ok_or_else(|| RoleError::Malformed {
-            role: self.agent.role().as_str(),
+    /// [`HandlerError::Malformed`] when the event names no node.
+    pub(crate) fn subject(&self) -> Result<NodeId, HandlerError> {
+        self.event().node.ok_or_else(|| HandlerError::Malformed {
+            handler: self.consumer.declaration().handler.as_str(),
             event: self.event().to_string(),
             reason: "it names no node".into(),
         })
@@ -112,7 +112,7 @@ impl<'a> Reaction<'a> {
         clone: &AgentClone,
         prompt: &Prompt,
         schema: &serde_json::Value,
-    ) -> Result<T, RoleError> {
+    ) -> Result<T, HandlerError> {
         self.run(graph, node, Place::Step(clone), prompt, schema, |_| Ok(()))
     }
 
@@ -122,7 +122,7 @@ impl<'a> Reaction<'a> {
     ///
     /// # Errors
     ///
-    /// [`RoleError::ScratchModified`], naming what changed, when the agent
+    /// [`HandlerError::ScratchModified`], naming what changed, when the agent
     /// moved HEAD, changed files, or left untracked files — whether or not
     /// it replied. The violation is appended to the run's log and the run
     /// is journaled as failed with it; the response is discarded.
@@ -133,7 +133,7 @@ impl<'a> Reaction<'a> {
         scratch: &ScratchWorkspace,
         prompt: &Prompt,
         schema: &serde_json::Value,
-    ) -> Result<T, RoleError> {
+    ) -> Result<T, HandlerError> {
         self.invoke_read_only_validated(graph, node, scratch, prompt, schema, |_| Ok(()))
     }
 
@@ -147,7 +147,7 @@ impl<'a> Reaction<'a> {
         prompt: &Prompt,
         schema: &serde_json::Value,
         validate: impl Fn(&T) -> Result<(), AgentError>,
-    ) -> Result<T, RoleError> {
+    ) -> Result<T, HandlerError> {
         self.run(
             graph,
             node,
@@ -166,27 +166,31 @@ impl<'a> Reaction<'a> {
         prompt: &Prompt,
         schema: &serde_json::Value,
         validate: impl Fn(&T) -> Result<(), AgentError>,
-    ) -> Result<T, RoleError> {
+    ) -> Result<T, HandlerError> {
         let (directory, scratch) = match place {
             Place::Step(clone) => (clone.path(), None),
             Place::Scratch(scratch) => (scratch.path(), Some(scratch)),
         };
-        let role = self.agent.role();
+        let handler = self.consumer.declaration().handler;
         let run_id = graph.begin_agent_run(
-            self.agent.name(),
-            role.as_str(),
+            self.consumer.name(),
+            handler.as_str(),
             Some(self.process.0),
             Some(self.event().id),
             node,
         )?;
         let logs = self.context.project().logs_dir();
         std::fs::create_dir_all(&logs)?;
-        let log = logs.join(format!("{:05}-{}.log", run_id.0, self.agent.name()));
+        let log = logs.join(format!("{:05}-{}.log", run_id.0, self.consumer.name()));
         graph.set_agent_run_log(run_id, &log)?;
 
         let mut facts = vec![
-            ("EXPL_AGENT".to_owned(), self.agent.name().to_owned()),
-            ("EXPL_ROLE".to_owned(), role.as_str().to_owned()),
+            ("EXPL_CONSUMER".to_owned(), self.consumer.name().to_owned()),
+            ("EXPL_HANDLER".to_owned(), handler.as_str().to_owned()),
+            ("EXPL_EVENT_ID".to_owned(), self.event().id.0.to_string()),
+            // Keep existing generic-command adapters working.
+            ("EXPL_AGENT".to_owned(), self.consumer.name().to_owned()),
+            ("EXPL_ROLE".to_owned(), handler.as_str().to_owned()),
             (
                 "EXPL_EVENT".to_owned(),
                 self.event().kind.as_str().to_owned(),
@@ -207,7 +211,8 @@ impl<'a> Reaction<'a> {
             restored.map_err(std::io::Error::other)
         };
         let outcome = self
-            .agent
+            .consumer
+            .agent()
             .invoke_validated(
                 &Invocation {
                     directory,
@@ -221,14 +226,16 @@ impl<'a> Reaction<'a> {
                 validate,
             )
             .map(|run| (run.response, run.session_id))
-            .map_err(RoleError::from);
+            .map_err(HandlerError::from);
         let outcome = match scratch {
-            Some(scratch) if !matches!(outcome, Err(RoleError::Agent(AgentError::Interrupted))) => {
+            Some(scratch)
+                if !matches!(outcome, Err(HandlerError::Agent(AgentError::Interrupted))) =>
+            {
                 match scratch.changes() {
                     Ok(changes) if changes.is_empty() => outcome,
                     Ok(changes) => {
-                        let violation = RoleError::ScratchModified {
-                            role: role.as_str(),
+                        let violation = HandlerError::ScratchModified {
+                            handler: handler.as_str(),
                             changes,
                         };
                         append_to_log(&log, &violation, outcome.as_ref().err());
@@ -250,7 +257,7 @@ impl<'a> Reaction<'a> {
                 Ok(decoded)
             }
             Err(error) => {
-                let status = if matches!(error, RoleError::Agent(AgentError::Interrupted)) {
+                let status = if matches!(error, HandlerError::Agent(AgentError::Interrupted)) {
                     AgentRunStatus::Interrupted
                 } else {
                     AgentRunStatus::Failed
@@ -274,7 +281,7 @@ enum Place<'a> {
 /// Append a read-only `violation` (and the agent's own `failure`, which it
 /// supersedes) to the run's raw log. Best effort: the run's journaled
 /// error records the violation either way.
-fn append_to_log(log: &Path, violation: &RoleError, failure: Option<&RoleError>) {
+fn append_to_log(log: &Path, violation: &HandlerError, failure: Option<&HandlerError>) {
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log) {
         writeln!(file, "\n[expl] {violation}").ok();
         if let Some(failure) = failure {

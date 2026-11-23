@@ -46,8 +46,8 @@ use crate::graph::{
     Conclusion, Decision, GoalTree, Graph, NewConclusion, NewEvaluation, Node, NodeId, NodeKind,
     NodeStatus,
 };
+use crate::handler::{HandlerError, Reaction, Report, digest};
 use crate::prompt::Prompt;
-use crate::role::{Reaction, Report, RoleError, digest};
 
 /// How many times one step is continued, at most: past that, evaluation
 /// decides between done and abandoned.
@@ -181,7 +181,7 @@ fn goals_schema() -> serde_json::Value {
     })
 }
 
-pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, RoleError> {
+pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report, HandlerError> {
     let id = reaction.subject()?;
     let node = graph.node(id)?;
     let event = reaction.event();
@@ -202,7 +202,7 @@ pub(crate) fn react(reaction: &Reaction<'_>, graph: &mut Graph) -> Result<Report
         return judge_origin(reaction, graph, &node);
     }
     let earlier = graph.conclusions_of(id)?;
-    let agent = reaction.agent().name();
+    let agent = reaction.consumer().name();
     // A redelivery after this agent already concluded (another evaluation
     // agent's perspective is its own).
     if let Some(last) = earlier
@@ -311,7 +311,7 @@ fn judge_origin(
     reaction: &Reaction<'_>,
     graph: &mut Graph,
     node: &Node,
-) -> Result<Report, RoleError> {
+) -> Result<Report, HandlerError> {
     let id = node.id;
     let goals = graph.goals()?;
     let evaluations = if goals.is_empty() {
@@ -473,7 +473,7 @@ fn prompt(
         },
         step = step.map(StepUnderJudgment::section).unwrap_or_default(),
         goals = digest::numbered_goals(goals, tree),
-        instructions = super::instructions_section(reaction.agent()),
+        instructions = super::instructions_section(reaction.consumer()),
         response = super::response_section(schema),
     ))
 }
@@ -508,7 +508,7 @@ fn investigation_prompt(
         step = step.section(),
         findings = findings(node, path),
         goals = digest::numbered_goals(goals, tree),
-        instructions = super::instructions_section(reaction.agent()),
+        instructions = super::instructions_section(reaction.consumer()),
         response = super::response_section(schema),
     ))
 }

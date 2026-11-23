@@ -3,7 +3,7 @@
 //!
 //! The response schema is written to a scratch file whose path is exported
 //! as `EXPL_RESPONSE_SCHEMA`, so wrappers around other CLIs can forward it,
-//! alongside the reaction's facts (`EXPL_AGENT`, `EXPL_ROLE`, `EXPL_EVENT`,
+//! alongside the reaction's facts (`EXPL_CONSUMER`, `EXPL_HANDLER`, `EXPL_EVENT`,
 //! `EXPL_NODE`). Only this driver exports them.
 //! Also the driver for scripted agents in tests.
 

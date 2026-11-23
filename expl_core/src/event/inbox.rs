@@ -1,4 +1,4 @@
-//! [`Inbox`] — one agent's view of the event log.
+//! [`Inbox`] — one consumer's view of the event log.
 
 use std::path::Path;
 
@@ -8,7 +8,6 @@ use crate::declaration::{Declaration, Route};
 use crate::event::{Event, EventId, EventKind};
 use crate::graph::NodeId;
 use crate::process::ProcessId;
-use crate::role::Role;
 use crate::store::{self, EPOCH, NOW, StoreError};
 
 /// How long before a lease expires without renewal. A process renews the
@@ -41,7 +40,7 @@ impl std::fmt::Display for LeaseToken {
     }
 }
 
-/// An event leased to one process of an agent.
+/// An event leased to one process of a consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delivery {
     /// The event.
@@ -56,10 +55,10 @@ pub struct Delivery {
 #[derive(Debug, thiserror::Error)]
 pub enum InboxError {
     /// The token no longer identifies a held lease.
-    #[error("agent `{agent}` no longer holds the lease on event {event}")]
+    #[error("consumer `{consumer}` no longer holds the lease on event {event}")]
     LeaseLost {
-        /// The agent whose inbox it is.
-        agent: String,
+        /// The consumer whose inbox it is.
+        consumer: String,
         /// The event whose lease was lost.
         event: EventId,
     },
@@ -78,16 +77,18 @@ const HELD_LEASE: &str = "status = 'leased' AND lease_token = ?3";
 const ROUTED_AWAY_NOTE: &str = "ignored: routed to `*`";
 
 fn routed_away() -> String {
-    format!("(:role IS NOT NULL AND d.status = 'done' AND d.note GLOB '{ROUTED_AWAY_NOTE}')")
+    format!("(:group IS NOT NULL AND d.status = 'done' AND d.note GLOB '{ROUTED_AWAY_NOTE}')")
 }
 
 /// A routed event is eligible when unassigned, already ours, or stranded
 /// with a former recipient that neither settled it nor still holds it.
-/// With a NULL role in the join, every event passes (legacy fan-out).
+/// With a NULL group, deliveries are independent of assignments.
+/// The SQLite columns `role` and `agent` still hold group and consumer
+/// names so existing workers and assignment records can be read.
 fn route_filter() -> String {
     format!(
         "(a.agent IS NULL OR a.agent = :agent OR (
-             a.agent NOT IN (SELECT value FROM json_each(:members)) AND NOT EXISTS (
+             a.agent NOT IN (SELECT value FROM json_each(:members, '$.\"' || e.kind || '\"')) AND NOT EXISTS (
                  SELECT 1 FROM deliveries previous
                  WHERE previous.event_id = e.id AND previous.agent = a.agent
                  AND (previous.status = 'failed' OR
@@ -103,18 +104,29 @@ pub(crate) enum Lease<T> {
     Granted(Delivery, T),
 }
 
-/// The deliveries of one agent. See the [module docs](crate::event).
+/// The deliveries of one consumer. See the [module docs](crate::event).
 pub struct Inbox {
     conn: Connection,
-    agent: String,
+    consumer: String,
 }
 
 impl std::fmt::Debug for Inbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inbox")
-            .field("agent", &self.agent)
+            .field("consumer", &self.consumer)
             .finish_non_exhaustive()
     }
+}
+
+/// The kind stored in an event row.
+fn event_kind(kind: &str) -> Result<EventKind, rusqlite::Error> {
+    kind.parse().map_err(|reason: String| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(reason)),
+        )
+    })
 }
 
 /// An event as read from its row.
@@ -124,16 +136,9 @@ fn event(
     node: Option<i64>,
     created_at: String,
 ) -> Result<Event, rusqlite::Error> {
-    let kind = kind.parse().map_err(|reason: String| {
-        rusqlite::Error::FromSqlConversionFailure(
-            1,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::other(reason)),
-        )
-    })?;
     Ok(Event {
         id: EventId(id),
-        kind,
+        kind: event_kind(kind)?,
         node: node.map(NodeId),
         created_at,
     })
@@ -148,22 +153,22 @@ fn kinds_sql(kinds: &[EventKind]) -> String {
 }
 
 impl Inbox {
-    /// The inbox of `agent` in the database at `path`.
+    /// The inbox of `consumer` in the database at `path`.
     ///
     /// # Errors
     ///
     /// [`StoreError`] when the database cannot be opened.
-    pub fn open(path: &Path, agent: &str) -> Result<Self, StoreError> {
+    pub fn open(path: &Path, consumer: &str) -> Result<Self, StoreError> {
         Ok(Self {
             conn: store::open(path)?,
-            agent: agent.to_owned(),
+            consumer: consumer.to_owned(),
         })
     }
 
-    /// The agent this inbox belongs to.
+    /// The consumer this inbox belongs to.
     #[must_use]
-    pub fn agent(&self) -> &str {
-        &self.agent
+    pub fn consumer(&self) -> &str {
+        &self.consumer
     }
 
     /// Lease the next deliverable event of `kinds` to `process`: the
@@ -171,13 +176,13 @@ impl Inbox {
     /// priority of their step first, so the most promising step is tried
     /// first however long ago it became ready.
     ///
-    /// Deliverable: never delivered to this agent, released, or leased by a
+    /// Deliverable: never delivered to this consumer, released, or leased by a
     /// process whose lease expired before its `max_attempts`-th attempt.
     /// Every lease counts as an attempt, so a delivery whose holders keep
     /// dying is [abandoned](Self::abandoned) rather than leased forever.
-    /// For this agent, an unexpired lease blocks other events about its node.
+    /// For this consumer, an unexpired lease blocks other events about its node.
     /// With `exclusive`, an unexpired lease blocks every event (single-flight
-    /// roles). Leasing an event replaces its previous token and revokes any
+    /// handlers). Leasing an event replaces its previous token and revokes any
     /// expired tokens that would conflict, preserving those deliveries for
     /// retry or abandonment.
     ///
@@ -205,7 +210,7 @@ impl Inbox {
     }
 
     /// Find or record an event's recipient before taking a delivery. Try
-    /// to acquire capacity only for work that belongs to this agent, and
+    /// to acquire capacity only for work that belongs to this consumer, and
     /// leave the event unleased when no slot is available.
     pub(crate) fn lease_with<T, E: From<rusqlite::Error>>(
         &mut self,
@@ -228,22 +233,22 @@ impl Inbox {
                     "SELECT EXISTS (SELECT 1 FROM deliveries WHERE agent = ?1 \
                      AND status = 'leased' AND leased_until >= {EPOCH})"
                 ),
-                [&self.agent],
+                [&self.consumer],
                 |r| r.get(0),
             )?;
             if busy {
                 return Ok(Lease::AtCapacity);
             }
         }
-        let role = route.map(|route| route.role.as_str());
-        let members = route.map(|route| serde_json::json!(route.members()).to_string());
+        let group = route.map(|route| route.group);
+        let members = route.map(Route::eligible_owners);
         let limit = if route.is_none() { "LIMIT 1" } else { "" };
         let mut statement = tx.prepare(&format!(
             "SELECT e.id, e.kind, e.node_id, e.created_at, \
                     CASE WHEN {routed_away} THEN 0 ELSE COALESCE(d.attempts, 0) END, a.agent \
                      FROM events e \
                      LEFT JOIN deliveries d ON d.agent = :agent AND d.event_id = e.id \
-                     LEFT JOIN assignments a ON a.role = :role AND a.event_id = e.id \
+                     LEFT JOIN assignments a ON a.role = :group AND a.event_id = e.id \
                      LEFT JOIN nodes n ON n.id = e.node_id \
                      WHERE e.kind IN ({kinds}) \
                      AND {route_filter} \
@@ -262,7 +267,7 @@ impl Inbox {
             routed_away = routed_away()
         ))?;
         let candidates = statement.query_map(named_params! {
-            ":agent": self.agent, ":max_attempts": max_attempts, ":role": role, ":members": members,
+            ":agent": self.consumer, ":max_attempts": max_attempts, ":group": group, ":members": members,
         }, |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -277,11 +282,11 @@ impl Inbox {
         let mut candidate = None;
         for next in candidates {
             let next = next?;
-            let (id, _, _, _, _, owner) = &next;
-            if let Some(route) = route.filter(|_| owner.as_deref() != Some(&self.agent)) {
-                let chosen = route.select(EventId(*id));
+            let (id, kind, _, _, _, owner) = &next;
+            if let Some(route) = route.filter(|_| owner.as_deref() != Some(&self.consumer)) {
+                let chosen = route.select(event_kind(kind)?, EventId(*id));
                 assignments.push((*id, chosen, owner.clone()));
-                if chosen != self.agent {
+                if chosen != self.consumer {
                     continue;
                 }
             }
@@ -304,7 +309,7 @@ impl Inbox {
                     // It cannot renew after the event moves to another agent.
                     revoke.execute(params![id, former])?;
                 }
-                assign.execute(params![role, id, agent])?;
+                assign.execute(params![group, id, agent])?;
             }
         }
         let Some((id, kind, node, created_at, attempts, _)) = candidate else {
@@ -323,7 +328,7 @@ impl Inbox {
                  WHERE agent = ?1 AND status = 'leased' AND lease_token IS NOT NULL \
                  AND event_id <> ?2 AND (?3 OR EXISTS ( \
                      SELECT 1 FROM events e WHERE e.id = deliveries.event_id AND e.node_id = ?4))",
-                params![self.agent, id, exclusive, node],
+                params![self.consumer, id, exclusive, node],
             )?;
         }
         let token: String = tx.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
@@ -336,7 +341,7 @@ impl Inbox {
                  process_id = ?3, attempts = ?5, \
                  leased_until = {EPOCH} + {LEASE_SECONDS}, lease_token = ?4, updated_at = {NOW}"
             ),
-            params![self.agent, id, process.0, token, attempts + 1],
+            params![self.consumer, id, process.0, token, attempts + 1],
         )?;
         tx.commit()?;
         Ok(Lease::Granted(
@@ -351,7 +356,7 @@ impl Inbox {
 
     fn lost(&self, delivery: &Delivery) -> InboxError {
         InboxError::LeaseLost {
-            agent: self.agent.clone(),
+            consumer: self.consumer.clone(),
             event: delivery.event.id,
         }
     }
@@ -377,13 +382,13 @@ impl Inbox {
                 "UPDATE deliveries SET status = 'done', leased_until = NULL, lease_token = NULL, \
                  note = ?4, updated_at = {NOW} WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE}"
             ),
-            params![self.agent, delivery.event.id.0, delivery.token.0, note],
+            params![self.consumer, delivery.event.id.0, delivery.token.0, note],
         )?;
         self.settled(delivery, changed)
     }
 
     /// While holding `delivery`, acknowledge every not-yet-handled event of
-    /// `kinds` up to `through` as covered by its reaction (roles that
+    /// `kinds` up to `through` as covered by its reaction (handlers that
     /// consider the whole graph, like planning, need not react once per
     /// event). Leased deliveries are left alone. Returns how many were
     /// covered.
@@ -407,12 +412,12 @@ impl Inbox {
                 "SELECT EXISTS (SELECT 1 FROM deliveries \
                  WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE})"
             ),
-            params![self.agent, delivery.event.id.0, delivery.token.0],
+            params![self.consumer, delivery.event.id.0, delivery.token.0],
             |r| r.get(0),
         )?;
         if !holding {
             return Err(InboxError::LeaseLost {
-                agent: self.agent.clone(),
+                consumer: self.consumer.clone(),
                 event: delivery.event.id,
             });
         }
@@ -430,7 +435,7 @@ impl Inbox {
                      updated_at = {NOW}",
                     kinds = kinds_sql(kinds)
                 ),
-                params![self.agent, through.0, note],
+                params![self.consumer, through.0, note],
             )?
         };
         tx.commit()?;
@@ -451,7 +456,7 @@ impl Inbox {
                  lease_token = NULL, attempts = MAX(attempts - 1, 0), updated_at = {NOW} \
                  WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE}"
             ),
-            params![self.agent, delivery.event.id.0, delivery.token.0],
+            params![self.consumer, delivery.event.id.0, delivery.token.0],
         )?;
         self.settled(delivery, changed)
     }
@@ -479,7 +484,7 @@ impl Inbox {
                      WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE} RETURNING status"
                 ),
                 params![
-                    self.agent,
+                    self.consumer,
                     delivery.event.id.0,
                     delivery.token.0,
                     error,
@@ -508,7 +513,7 @@ impl Inbox {
                  lease_token = NULL, note = ?4, updated_at = {NOW} \
                  WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE}"
             ),
-            params![self.agent, delivery.event.id.0, delivery.token.0, error],
+            params![self.consumer, delivery.event.id.0, delivery.token.0, error],
         )?;
         self.settled(delivery, changed)
     }
@@ -539,7 +544,7 @@ impl Inbox {
              AND d.leased_until < {EPOCH} AND d.attempts >= ?2 ORDER BY e.id",
             kinds = kinds_sql(kinds)
         ))?;
-        let rows = statement.query_map(params![self.agent, max_attempts], |r| {
+        let rows = statement.query_map(params![self.consumer, max_attempts], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -577,7 +582,7 @@ impl Inbox {
                  WHERE agent = ?1 AND event_id = ?2 AND status = 'leased' \
                  AND COALESCE(lease_token, '') = ?3 AND leased_until < {EPOCH}"
             ),
-            params![self.agent, delivery.event.id.0, delivery.token.0],
+            params![self.consumer, delivery.event.id.0, delivery.token.0],
         )?;
         Ok(changed == 1)
     }
@@ -595,12 +600,12 @@ impl Inbox {
                 "UPDATE deliveries SET leased_until = {EPOCH} + {LEASE_SECONDS} \
                  WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE}"
             ),
-            params![self.agent, delivery.event.id.0, delivery.token.0],
+            params![self.consumer, delivery.event.id.0, delivery.token.0],
         )?;
         self.settled(delivery, changed)
     }
 
-    /// Events of `kinds` not yet handled by this agent (pending, never
+    /// Events of `kinds` not yet handled by this consumer (pending, never
     /// delivered, or leased).
     ///
     /// # Errors
@@ -610,25 +615,24 @@ impl Inbox {
         self.count_backlog(kinds, None)
     }
 
-    /// Backlog for an agent under the declaration's role assignments.
+    /// Backlog for this consumer's configured subscription and routing.
     /// Unassigned events count until a process records their recipient.
     ///
     /// # Errors
     ///
     /// SQLite failure.
-    pub fn declared_backlog(
-        &self,
-        declaration: &Declaration,
-        role: Role,
-    ) -> Result<usize, rusqlite::Error> {
-        let route = declaration.explicit_route(role);
+    pub fn declared_backlog(&self, declaration: &Declaration) -> Result<usize, rusqlite::Error> {
+        let Some(consumer) = declaration.consumer.get(&self.consumer) else {
+            return Ok(0);
+        };
+        let route = declaration.route_for(&self.consumer);
         if route
             .as_ref()
-            .is_some_and(|route| !route.members().contains(self.agent()))
+            .is_some_and(|route| !route.members().contains(self.consumer.as_str()))
         {
             return Ok(0);
         }
-        self.count_backlog(role.reactions(), route.as_ref())
+        self.count_backlog(&consumer.on, route.as_ref())
     }
 
     fn count_backlog(
@@ -639,13 +643,13 @@ impl Inbox {
         if kinds.is_empty() {
             return Ok(0);
         }
-        let role = route.map(|route| route.role.as_str());
-        let members = route.map(|route| serde_json::json!(route.members()).to_string());
+        let group = route.map(|route| route.group);
+        let members = route.map(Route::eligible_owners);
         let count: i64 = self.conn.query_row(
             &format!(
                 "SELECT COUNT(*) FROM events e \
                  LEFT JOIN deliveries d ON d.agent = :agent AND d.event_id = e.id \
-                 LEFT JOIN assignments a ON a.role = :role AND a.event_id = e.id \
+                 LEFT JOIN assignments a ON a.role = :group AND a.event_id = e.id \
                  WHERE e.kind IN ({kinds}) \
                  AND {route_filter} \
                  AND (d.event_id IS NULL OR d.status IN ('pending', 'leased') OR {routed_away})",
@@ -653,27 +657,21 @@ impl Inbox {
                 route_filter = route_filter(),
                 routed_away = routed_away()
             ),
-            named_params! {":agent": self.agent, ":role": role, ":members": members},
+            named_params! {":agent": self.consumer, ":group": group, ":members": members},
             |r| r.get(0),
         )?;
         Ok(count as usize)
     }
 
-    /// The one agent of `role` that `event` is assigned to, among the
-    /// agents sharing the role by weight: the assignment already recorded,
-    /// or else `proposed`, recorded now. The first process to route an
-    /// event decides, atomically, and every later call — from any process,
-    /// whatever weights it loaded, before or after a restart — returns that
-    /// same agent, so exactly one weighted agent reacts to the event.
-    /// Assign before reacting to an event or acknowledging it as routed
-    /// elsewhere.
+    /// Record or read the first assignment for a legacy weighted inbox.
+    /// Peers agree on the recipient even while running different weights.
     ///
     /// # Errors
     ///
     /// SQLite failure.
-    pub fn assign(
+    pub(crate) fn assign(
         &self,
-        role: Role,
+        group: &str,
         event: EventId,
         proposed: &str,
     ) -> Result<String, rusqlite::Error> {
@@ -681,56 +679,55 @@ impl Inbox {
             "INSERT INTO assignments (role, event_id, agent) VALUES (?1, ?2, ?3) \
              ON CONFLICT (role, event_id) DO UPDATE SET agent = assignments.agent \
              RETURNING agent",
-            params![role.as_str(), event.0, proposed],
+            params![group, event.0, proposed],
             |r| r.get(0),
         )
     }
 
-    /// Move `event` of `role` from `from`, an agent that will never handle it
-    /// (no longer declared for the role), to `to`, unless another process
-    /// already moved it; the agent it is assigned to afterwards.
+    /// Move `event` to `to` if it is still assigned to `from`.
+    /// Returns its current recipient.
     ///
     /// # Errors
     ///
     /// SQLite failure.
-    pub fn reassign(
+    pub(crate) fn reassign(
         &self,
-        role: Role,
+        group: &str,
         event: EventId,
         from: &str,
         to: &str,
     ) -> Result<String, rusqlite::Error> {
         self.conn.execute(
             "UPDATE assignments SET agent = ?4 WHERE role = ?1 AND event_id = ?2 AND agent = ?3",
-            params![role.as_str(), event.0, from, to],
+            params![group, event.0, from, to],
         )?;
         self.conn.query_row(
             "SELECT agent FROM assignments WHERE role = ?1 AND event_id = ?2",
-            params![role.as_str(), event.0],
+            params![group, event.0],
             |r| r.get(0),
         )
     }
 
-    /// The agent of `role` that `event` was assigned to, if it was.
+    /// The recipient of `event` in `group`, if assigned.
     ///
     /// # Errors
     ///
     /// SQLite failure.
-    pub fn assignment(
+    pub(crate) fn assignment(
         &self,
-        role: Role,
+        group: &str,
         event: EventId,
     ) -> Result<Option<String>, rusqlite::Error> {
         self.conn
             .query_row(
                 "SELECT agent FROM assignments WHERE role = ?1 AND event_id = ?2",
-                params![role.as_str(), event.0],
+                params![group, event.0],
                 |r| r.get(0),
             )
             .optional()
     }
 
-    /// The delivery status of `event` for this agent, if it was ever
+    /// The delivery status of `event` for this consumer, if it was ever
     /// delivered.
     ///
     /// # Errors
@@ -740,7 +737,7 @@ impl Inbox {
         self.conn
             .query_row(
                 "SELECT status FROM deliveries WHERE agent = ?1 AND event_id = ?2",
-                params![self.agent, event.0],
+                params![self.consumer, event.0],
                 |r| r.get(0),
             )
             .optional()
@@ -826,9 +823,9 @@ mod tests {
     }
 
     #[test]
-    fn a_route_reassigns_unfinished_legacy_work_when_its_owner_leaves() {
+    fn a_route_reassigns_unfinished_work_when_its_owner_unsubscribes() {
         let f = fixture();
-        let role = Role::Planning;
+        let group = "planning";
         let mut former = Inbox::open(&f.db, "former").expect("inbox");
         let mut planner = Inbox::open(&f.db, "planner").expect("inbox");
         let lease = |inbox: &mut Inbox| {
@@ -839,7 +836,7 @@ mod tests {
         };
         let abandoned = lease(&mut former);
         former
-            .assign(role, abandoned.event.id, "former")
+            .assign(group, abandoned.event.id, "former")
             .expect("assignment");
         let ignored = lease(&mut planner);
         assert_eq!(ignored.event.id, abandoned.event.id);
@@ -848,16 +845,36 @@ mod tests {
             .expect("ack");
         let complete = lease(&mut former);
         former
-            .assign(role, complete.event.id, "former")
+            .assign(group, complete.event.id, "former")
             .expect("assignment");
         former.ack(&complete, Some("planned")).expect("ack");
 
         let declaration = Declaration::parse(&format!(
-            "{}\n[routing]\nplanning = \"planner\"\n",
-            Declaration::TEMPLATE
+            "{}{}",
+            Declaration::TEMPLATE.replace(
+                "[consumer.planner]",
+                "[consumer.planner]\ngroup = \"planning\""
+            ),
+            r#"
+[consumer.former]
+on = ["node.evaluated"]
+handler = "planning"
+group = "planning"
+driver = "generic"
+command = ["planner"]
+replicas = 1
+
+[routing]
+planning = "planners"
+
+[router.planners]
+targets = ["former", "planner"]
+policy = "first"
+concurrency = 1
+"#
         ))
         .expect("declaration");
-        let route = declaration.explicit_route(role).expect("route");
+        let route = declaration.route_for("planner").expect("route");
         let take = |inbox: &mut Inbox| {
             inbox
                 .lease_with::<_, rusqlite::Error>(
@@ -872,6 +889,7 @@ mod tests {
         };
         assert!(matches!(take(&mut planner), Lease::Idle));
         expire(&f.db, "former", abandoned.event.id);
+        assert_eq!(planner.declared_backlog(&declaration).expect("backlog"), 1);
         let Lease::Granted(reassigned, ()) = take(&mut planner) else {
             panic!("unfinished event was not reassigned");
         };
@@ -1258,7 +1276,7 @@ mod tests {
                         };
                         Inbox::open(&db, agent)
                             .expect("inbox")
-                            .assign(Role::Exploration, event, proposed)
+                            .assign("exploration", event, proposed)
                             .expect("assign")
                     })
                 })
@@ -1274,15 +1292,15 @@ mod tests {
         // An assignment to an agent that is gone moves once, to whichever
         // recipient asks first.
         let gone = Inbox::open(&f.db, "explorer").expect("inbox");
-        gone.assign(Role::Exploration, EventId(2), "removed")
+        gone.assign("exploration", EventId(2), "removed")
             .expect("assign");
         assert_eq!(
-            gone.reassign(Role::Exploration, EventId(2), "removed", "explorer")
+            gone.reassign("exploration", EventId(2), "removed", "explorer")
                 .expect("reassign"),
             "explorer"
         );
         assert_eq!(
-            gone.reassign(Role::Exploration, EventId(2), "removed", "contrarian")
+            gone.reassign("exploration", EventId(2), "removed", "contrarian")
                 .expect("reassign"),
             "explorer"
         );
@@ -1296,26 +1314,24 @@ mod tests {
         };
         assert_eq!(
             reopened
-                .assign(Role::Exploration, event, other)
+                .assign("exploration", event, other)
                 .expect("assign"),
             first
         );
         assert_eq!(
             reopened
-                .assignment(Role::Exploration, event)
+                .assignment("exploration", event)
                 .expect("assignment"),
             Some(first)
         );
         // Each role assigns its events on its own.
         assert_eq!(
-            reopened
-                .assignment(Role::Planning, event)
-                .expect("assignment"),
+            reopened.assignment("planning", event).expect("assignment"),
             None
         );
         assert_eq!(
             reopened
-                .assign(Role::Planning, event, "planner")
+                .assign("planning", event, "planner")
                 .expect("assign"),
             "planner"
         );

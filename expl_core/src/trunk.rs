@@ -330,8 +330,8 @@ mod tests {
     use super::*;
     use crate::event::{EventKind, Inbox};
     use crate::graph::ChangeResult;
+    use crate::handler::Handler;
     use crate::process::ProcessId;
-    use crate::role::Role;
     use crate::workspace::Workspaces;
     use std::path::Path;
 
@@ -415,7 +415,7 @@ mod tests {
             self.graph.plan_step(id, 1).expect("plan");
             let mut inbox = Inbox::open(&self.project.database_path(), "verifier").expect("inbox");
             let delivery = inbox
-                .lease(Role::Verification.reactions(), ProcessId(1), false, 3)
+                .lease(Handler::Verification.events(), ProcessId(1), false, 3)
                 .expect("lease")
                 .expect("node.ready");
             assert_eq!(delivery.event.node, Some(id));
@@ -737,7 +737,7 @@ mod tests {
     fn an_empty_commit_is_a_new_origin_and_is_evaluated() {
         let mut fx = Fixture::new();
         let trunk = Trunk::new(&fx.project, Some("main"));
-        let kinds = Role::Evaluation.reactions();
+        let kinds = Handler::Evaluation.events();
         let mut evaluator = Inbox::open(&fx.project.database_path(), "evaluator").expect("inbox");
         while let Some(delivery) = evaluator
             .lease(kinds, ProcessId(1), false, crate::process::MAX_ATTEMPTS)

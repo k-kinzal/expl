@@ -1,6 +1,6 @@
 //! Command dispatch: one module per resource or verb.
 
-mod agent;
+mod consumer;
 mod doctor;
 mod event;
 mod goal;
@@ -20,7 +20,7 @@ use std::path::Path;
 use expl_core::{Context, Declaration, Graph, Processes, Project};
 
 use crate::cli::{
-    AgentCommand, Cli, Command, EventCommand, GraphCommand, HypothesisCommand, OriginCommand,
+    Cli, Command, ConsumerCommand, EventCommand, GraphCommand, HypothesisCommand, OriginCommand,
     PathCommand, ProcessCommand,
 };
 use crate::error::CliError;
@@ -41,7 +41,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Hypothesis(HypothesisCommand::Ls(args)) => hypothesis::ls(&start, &args),
         Command::Origin(OriginCommand::Ls(args)) => origin::ls(&start, &args),
         Command::Event(EventCommand::Ls(args)) => event::ls(&start, &args),
-        Command::Agent(AgentCommand::Ls(args)) => agent::ls(&start, &args),
+        Command::Consumer(ConsumerCommand::Ls(args)) => consumer::ls(&start, &args),
         Command::Process(command) => process::process(&start, command),
         Command::Run(args) => run::run(&start, &args),
         Command::Up(args) => up::up(&start, &args),

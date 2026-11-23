@@ -1,11 +1,4 @@
-//! [`Declaration`] — `expl.toml`, what the operator wrote.
-//!
-//! The declaration names the project's [agents](crate::agent::Agent): for
-//! each, its role, the AI CLI that carries it out (and alternative CLIs its
-//! invocations are routed across), and how many processes `expl up` keeps
-//! running. Following iter's "no implicit defaults" rule,
-//! every field the runtime needs is spelled out; `expl init` writes a
-//! complete [`TEMPLATE`](Declaration::TEMPLATE).
+//! The project declaration in `expl.toml`: event consumers and routing.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -17,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::agent::DriverKind;
-use crate::event::EventId;
+use crate::event::{EventId, EventKind};
+use crate::handler::Handler;
 use crate::project::Project;
-use crate::role::Role;
 
 mod routing;
 
@@ -50,15 +43,15 @@ pub enum DeclarationError {
     /// The declaration is well-formed but inconsistent.
     #[error("invalid declaration: {0}")]
     Invalid(String),
-    /// No agent has this name.
-    #[error("no agent named `{0}` in expl.toml")]
-    UnknownAgent(String),
-    /// An agent's `timeout` (or one of its alternatives') is zero or not a
+    /// No consumer has this name.
+    #[error("no consumer named `{0}` in expl.toml")]
+    UnknownConsumer(String),
+    /// A consumer's `timeout` (or one of its alternatives') is zero or not a
     /// duration.
-    #[error("agent `{agent}`: invalid `timeout`: {source}")]
+    #[error("consumer `{consumer}`: invalid `timeout`: {source}")]
     Timeout {
-        /// The agent declaring it.
-        agent: String,
+        /// The consumer declaring it.
+        consumer: String,
         /// Why the value is unusable.
         #[source]
         source: TimeoutError,
@@ -127,25 +120,89 @@ impl fmt::Display for Timeout {
     }
 }
 
-/// The whole `expl.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// The whole `expl.toml`, with legacy declarations normalized to consumers.
+#[derive(Debug, Clone, Serialize)]
 pub struct Declaration {
-    /// The default branch expl follows: whenever it moves, the origin
-    /// advances to it and exploration starts again from there.
-    #[serde(default)]
+    /// The default branch expl follows.
     pub trunk: Option<String>,
-    /// How what an agent produces is taken in.
-    #[serde(default)]
+    /// How changes are taken in.
     pub workspace: WorkspaceDeclaration,
-    /// Named agents.
-    pub agent: BTreeMap<String, AgentDeclaration>,
-    /// Named routers, whose targets are agents or other routers.
-    #[serde(default)]
+    /// Named event consumers.
+    pub consumer: BTreeMap<String, ConsumerDeclaration>,
+    /// Named routers, whose targets are consumers or other routers.
     pub router: BTreeMap<String, RouterDeclaration>,
-    /// Where to route the events of each explicitly assigned role.
+    /// Name of each consumer group and its routing target.
+    pub routing: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeclarationFile {
     #[serde(default)]
-    pub routing: BTreeMap<Role, String>,
+    trunk: Option<String>,
+    #[serde(default)]
+    workspace: WorkspaceDeclaration,
+    #[serde(default)]
+    consumer: BTreeMap<String, ConsumerDeclaration>,
+    #[serde(default)]
+    router: BTreeMap<String, RouterDeclaration>,
+    #[serde(default)]
+    routing: BTreeMap<String, String>,
+    #[serde(default)]
+    agent: BTreeMap<String, ConsumerDeclaration>,
+}
+
+impl DeclarationFile {
+    fn into_declaration(mut self) -> Result<Declaration, DeclarationError> {
+        if !self.agent.is_empty() && !self.consumer.is_empty() {
+            return Err(DeclarationError::Invalid(
+                "`[agent]` and `[consumer]` cannot be used together".to_owned(),
+            ));
+        }
+        for (name, consumer) in &self.consumer {
+            if consumer.weight.is_some() {
+                return Err(DeclarationError::Invalid(format!(
+                    "consumer `{name}`: set weights on a router"
+                )));
+            }
+        }
+        if !self.agent.is_empty() {
+            if let Some(root) = self.routing.remove("execution")
+                && self
+                    .routing
+                    .insert("verification".to_owned(), root)
+                    .is_some()
+            {
+                return Err(DeclarationError::Invalid(
+                    "legacy routing declares both `execution` and `verification`".to_owned(),
+                ));
+            }
+            for name in self.routing.keys() {
+                if !Handler::ALL.iter().any(|handler| handler.as_str() == name) {
+                    return Err(DeclarationError::Invalid(format!(
+                        "unknown legacy routing key `{name}`"
+                    )));
+                }
+            }
+            for agent in self.agent.values_mut() {
+                agent.on = agent.handler.events().to_vec();
+                let group = agent.handler.as_str();
+                if self.routing.contains_key(group) {
+                    agent.group = Some(group.to_owned());
+                }
+            }
+            self.consumer = self.agent;
+        }
+        let declaration = Declaration {
+            trunk: self.trunk,
+            workspace: self.workspace,
+            consumer: self.consumer,
+            router: self.router,
+            routing: self.routing,
+        };
+        declaration.validate()?;
+        Ok(declaration)
+    }
 }
 
 /// `[workspace]`.
@@ -159,12 +216,19 @@ pub struct WorkspaceDeclaration {
     pub frozen: Vec<String>,
 }
 
-/// One `[agent.<name>]`.
+/// One `[consumer.<name>]`: when to react, what to do, and how to run it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentDeclaration {
-    /// What the agent does, and so which events it reacts to.
-    pub role: Role,
+pub struct ConsumerDeclaration {
+    /// The graph events that trigger this consumer.
+    #[serde(default)]
+    pub on: Vec<EventKind>,
+    /// How to handle a delivered event.
+    #[serde(alias = "role")]
+    pub handler: Handler,
+    /// Optional shared delivery group, declared under `[routing]`.
+    #[serde(default)]
+    pub group: Option<String>,
     /// Which driver translates for its CLI.
     pub driver: DriverKind,
     /// Program and leading arguments, e.g. `["claude"]`.
@@ -175,24 +239,17 @@ pub struct AgentDeclaration {
     /// Extra environment variables for the CLI.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// Project-specific guidance appended to the role's built-in prompt.
+    /// Project-specific guidance appended to the handler prompt.
     #[serde(default)]
     pub instructions: Option<String>,
     /// Processes `expl up` keeps running.
     pub replicas: usize,
-    /// Maximum concurrent reactions of this agent across all its processes.
+    /// Maximum concurrent reactions across this consumer's workers.
     #[serde(default)]
     pub concurrency: Option<NonZeroUsize>,
-    /// Share of its role's events. Agents of one role that declare a
-    /// weight split that role's events between them in proportion — each
-    /// event goes to exactly one of them — instead of each reacting to
-    /// every event. Agents without a weight react to every event of their
-    /// role. Use it to route one role across agents with different
-    /// instructions (e.g. a mainstream and a contrarian exploration). An
-    /// event's recipient is recorded when it is first routed, so changed
-    /// weights only route the events that come after.
-    #[serde(default)]
-    pub weight: Option<u32>,
+    // Legacy inline weighted fan-out. New declarations use a weighted router.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weight: Option<u32>,
     /// Exploration only: maximum steps proposed per reaction.
     #[serde(default)]
     pub breadth: Option<usize>,
@@ -201,9 +258,8 @@ pub struct AgentDeclaration {
     /// grows deep before anything runs.
     #[serde(default)]
     pub speculate: Option<bool>,
-    /// Exploration only: seconds an idle process waits after its last
-    /// exploration before it revisits a random starting point. Without it,
-    /// an exploration reacts to events only and never revisits.
+    /// Exploration only: seconds of idle time before a worker publishes
+    /// `node.revisited`. Applies when this consumer subscribes to that event.
     #[serde(default)]
     pub revisit_cooldown: Option<u64>,
     /// Exploration only: what one exploration looks at — `"node"` (the
@@ -217,7 +273,7 @@ pub struct AgentDeclaration {
     /// attempt runs until the CLI exits.
     #[serde(default)]
     pub timeout: Option<Timeout>,
-    /// Further CLIs that can carry out the agent (`[[agent.<name>.alternative]]`).
+    /// Further CLIs that can supply the handler response (`[[consumer.<name>.alternative]]`).
     /// Invocations are routed across the primary CLI and these in turn, and
     /// fall over to the next one when a CLI fails.
     #[serde(default)]
@@ -255,7 +311,13 @@ pub struct CliDeclaration {
     pub timeout: Option<Timeout>,
 }
 
-impl AgentDeclaration {
+impl ConsumerDeclaration {
+    /// Inline routing weight of a legacy consumer, if declared.
+    #[must_use]
+    pub fn legacy_weight(&self) -> Option<u32> {
+        self.weight
+    }
+
     /// Every CLI of the agent, primary first, each with the `timeout` that
     /// bounds it (its own, else the agent's).
     #[must_use]
@@ -279,21 +341,15 @@ impl Declaration {
     /// The declaration `expl init` writes.
     pub const TEMPLATE: &'static str = r#"# expl declaration. See README.md and `expl --help`.
 #
-# Each [agent.<name>] is started as processes (`expl run <name>`, or
-# `expl up` for `replicas` of each assigned agent). An agent reacts to the graph
-# events of its role:
-#   exploration  — goal.added, node.evaluated, origin.advanced → proposes hypotheses (steps);
-#                  when idle, every `revisit_cooldown` seconds it explores again
-#                  from a random starting point (node.revisited)
-#   planning     — node.proposed/evaluated/failed, goal.retired, origin.advanced → paths and priorities
-#   verification — node.ready                      → verifies the step: commits on its branch, or a finding
-#   evaluation   — node.completed, origin.advanced → whether it held, verdicts against goals
+# Each [consumer.<name>] subscribes to the events listed in `on` and runs
+# its `handler` when one arrives. `expl run <name>` starts a worker and
+# `expl up` starts the declared number of `replicas`.
 #
-# Optional `concurrency` limits simultaneous reactions across an agent's
-# workers, including extra processes started by `expl run`. To route each
-# role's events to one agent, set its target in `[routing]`. A target can be
-# an agent or a `[router.<name>]` with `targets`, `policy` and `concurrency`.
-# Each router shares its concurrency limit across its assigned descendants.
+# Consumers have separate inboxes unless they share a delivery `group`.
+# In [routing], assign the group to a consumer or [router.<name>].
+# Routers choose among targets subscribed to the event. Optional
+# `concurrency` limits simultaneous reactions across workers; a router's
+# limit is shared across its assigned consumers.
 #
 # `driver` selects how the CLI is spoken to:
 #   claude_code  — `claude --print --output-format json --json-schema ...`
@@ -301,15 +357,15 @@ impl Declaration {
 #   cursor_agent — `cursor-agent --print --output-format json ...`
 #   generic      — any command: prompt on stdin, JSON response on stdout
 #
-# An agent may name further CLIs with [[agent.<name>.alternative]] (driver,
+# A consumer may use further CLIs with [[consumer.<name>.alternative]] (driver,
 # command, args, env). Its invocations are then routed across all of them in
 # turn, falling over to the next CLI when one fails.
 #
 # An optional `timeout` (seconds, or a duration such as "30m") bounds each
 # CLI attempt: past it, the CLI is stopped and the attempt fails like any
-# other. An alternative's own `timeout` overrides the agent's.
+# other. An alternative's own `timeout` overrides the consumer's.
 #
-# Agents run unattended inside expl-owned git worktrees, so the defaults
+# Agents run unattended inside private clones, so the defaults
 # below let Claude Code edit files and run commands without asking.
 
 # The default branch. Merge the hypotheses you choose into it with git;
@@ -324,8 +380,9 @@ trunk = "main"
 [workspace]
 frozen = []
 
-[agent.explorer]
-role = "exploration"
+[consumer.explorer]
+on = ["goal.added", "node.evaluated", "node.failed", "origin.advanced", "node.revisited"]
+handler = "exploration"
 driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
@@ -334,24 +391,27 @@ concurrency = 1
 breadth = 3
 revisit_cooldown = 600          # idle: explore again from a random node every 10 minutes
 
-[agent.planner]
-role = "planning"
+[consumer.planner]
+on = ["node.proposed", "node.evaluated", "node.failed", "goal.retired", "origin.advanced"]
+handler = "planning"
 driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
 replicas = 1
 concurrency = 1
 
-[agent.verifier]
-role = "verification"
+[consumer.verifier]
+on = ["node.ready"]
+handler = "verification"
 driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
 replicas = 2
 concurrency = 2
 
-[agent.evaluator]
-role = "evaluation"
+[consumer.evaluator]
+on = ["node.completed", "node.failed", "origin.advanced"]
+handler = "evaluation"
 driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
@@ -382,13 +442,7 @@ concurrency = 1
             path: path.display().to_string(),
             source,
         })?;
-        let declaration: Self =
-            toml::from_str(&text).map_err(|source| DeclarationError::Parse {
-                path: path.display().to_string(),
-                source,
-            })?;
-        declaration.validate()?;
-        Ok(declaration)
+        Self::parse_at(&text, &path.display().to_string())
     }
 
     /// Parse and validate declaration text.
@@ -397,61 +451,90 @@ concurrency = 1
     ///
     /// [`DeclarationError::Parse`] or [`DeclarationError::Invalid`].
     pub fn parse(text: &str) -> Result<Self, DeclarationError> {
-        let declaration: Self = toml::from_str(text).map_err(|source| DeclarationError::Parse {
-            path: Project::DECLARATION_FILE.to_owned(),
-            source,
-        })?;
-        declaration.validate()?;
-        Ok(declaration)
+        Self::parse_at(text, Project::DECLARATION_FILE)
+    }
+
+    fn parse_at(text: &str, path: &str) -> Result<Self, DeclarationError> {
+        let file: DeclarationFile =
+            toml::from_str(text).map_err(|source| DeclarationError::Parse {
+                path: path.to_owned(),
+                source,
+            })?;
+        file.into_declaration()
     }
 
     fn validate(&self) -> Result<(), DeclarationError> {
         let invalid = |name: &str, what: &str| {
-            Err(DeclarationError::Invalid(format!("agent `{name}`: {what}")))
+            Err(DeclarationError::Invalid(format!(
+                "consumer `{name}`: {what}"
+            )))
         };
         if self.workspace.frozen.iter().any(|p| p.trim().is_empty()) {
             return Err(DeclarationError::Invalid(
                 "`workspace.frozen` holds an empty pathspec".to_owned(),
             ));
         }
-        for (name, agent) in &self.agent {
-            if agent
+        for (name, consumer) in &self.consumer {
+            if consumer.on.is_empty() {
+                return invalid(name, "`on` must list at least one event");
+            }
+            for (i, event) in consumer.on.iter().enumerate() {
+                if !consumer.handler.events().contains(event) {
+                    return invalid(
+                        name,
+                        &format!("`{}` does not handle `{event}`", consumer.handler),
+                    );
+                }
+                if consumer.on[..i].contains(event) {
+                    return invalid(name, &format!("duplicate event `{event}` in `on`"));
+                }
+            }
+            if let Some(group) = &consumer.group
+                && !self.routing.contains_key(group)
+            {
+                return invalid(name, &format!("unknown delivery group `{group}`"));
+            }
+            if consumer
                 .clis()
                 .iter()
                 .any(|cli| cli.command.first().is_none_or(|p| p.trim().is_empty()))
             {
                 return invalid(name, "`command` is empty");
             }
-            for timeout in agent.clis().iter().filter_map(|cli| cli.timeout.as_ref()) {
+            for timeout in consumer
+                .clis()
+                .iter()
+                .filter_map(|cli| cli.timeout.as_ref())
+            {
                 timeout
                     .duration()
                     .map_err(|source| DeclarationError::Timeout {
-                        agent: name.clone(),
+                        consumer: name.clone(),
                         source,
                     })?;
             }
-            if agent.weight == Some(0) {
+            if consumer.weight == Some(0) {
                 return invalid(
                     name,
                     "`weight` must be >= 1 (leave it out to receive every event)",
                 );
             }
-            match agent.role {
-                Role::Exploration => {
-                    if agent.breadth.is_none_or(|b| b == 0) {
+            match consumer.handler {
+                Handler::Exploration => {
+                    if consumer.breadth.is_none_or(|b| b == 0) {
                         return invalid(name, "exploration needs `breadth` >= 1");
                     }
                 }
-                Role::Planning | Role::Verification | Role::Evaluation => {
-                    if agent.breadth.is_some()
-                        || agent.speculate.is_some()
-                        || agent.revisit_cooldown.is_some()
-                        || agent.scope.is_some()
+                Handler::Planning | Handler::Verification | Handler::Evaluation => {
+                    if consumer.breadth.is_some()
+                        || consumer.speculate.is_some()
+                        || consumer.revisit_cooldown.is_some()
+                        || consumer.scope.is_some()
                     {
                         return invalid(
                             name,
                             "`breadth`, `revisit_cooldown`, `scope` and `speculate` apply to \
-                             exploration agents only",
+                             the exploration handler only",
                         );
                     }
                 }
@@ -468,13 +551,13 @@ concurrency = 1
     /// proposal for [`Inbox::assign`](crate::event::Inbox::assign), whose
     /// recorded assignment every process obeys.
     #[must_use]
-    pub fn route(&self, agent: &str, event: EventId) -> Option<&str> {
-        let role = self.agent.get(agent)?.role;
-        self.agent.get(agent)?.weight?;
+    pub(crate) fn legacy_route(&self, agent: &str, event: EventId) -> Option<&str> {
+        let role = self.consumer.get(agent)?.handler;
+        self.consumer.get(agent)?.weight?;
         let shares: Vec<(&str, u64)> = self
-            .agent
+            .consumer
             .iter()
-            .filter(|(_, a)| a.role == role)
+            .filter(|(_, a)| a.handler == role)
             .filter_map(|(name, a)| a.weight.map(|w| (name.as_str(), u64::from(w))))
             .collect();
         let total: u64 = shares.iter().map(|(_, w)| w).sum();
@@ -492,22 +575,30 @@ concurrency = 1
     /// an assignment to an agent that does not (one since removed, or no
     /// longer weighted) would never be handled.
     #[must_use]
-    pub fn shares_with(&self, agent: &str, other: &str) -> bool {
-        match (self.agent.get(agent), self.agent.get(other)) {
-            (Some(agent), Some(other)) => agent.role == other.role && other.weight.is_some(),
+    pub(crate) fn legacy_shares_with(&self, agent: &str, other: &str) -> bool {
+        match (self.consumer.get(agent), self.consumer.get(other)) {
+            (Some(agent), Some(other)) => agent.handler == other.handler && other.weight.is_some(),
             _ => false,
         }
     }
 
-    /// The agent named `name`.
+    /// Whether an assigned consumer handles this event with the given operation.
+    #[must_use]
+    pub fn handles(&self, handler: Handler, event: EventKind) -> bool {
+        self.consumer.iter().any(|(name, consumer)| {
+            consumer.handler == handler && consumer.on.contains(&event) && self.is_assigned(name)
+        })
+    }
+
+    /// The consumer named `name`.
     ///
     /// # Errors
     ///
-    /// [`DeclarationError::UnknownAgent`].
-    pub fn agent(&self, name: &str) -> Result<&AgentDeclaration, DeclarationError> {
-        self.agent
+    /// [`DeclarationError::UnknownConsumer`].
+    pub fn consumer(&self, name: &str) -> Result<&ConsumerDeclaration, DeclarationError> {
+        self.consumer
             .get(name)
-            .ok_or_else(|| DeclarationError::UnknownAgent(name.to_owned()))
+            .ok_or_else(|| DeclarationError::UnknownConsumer(name.to_owned()))
     }
 }
 
@@ -527,9 +618,12 @@ mod tests {
     #[test]
     fn template_is_a_valid_declaration() {
         let declaration = Declaration::parse(Declaration::TEMPLATE).expect("template parses");
-        assert_eq!(declaration.agent.len(), 4);
-        assert_eq!(declaration.agent["verifier"].role, Role::Verification);
-        assert_eq!(declaration.agent["verifier"].replicas, 2);
+        assert_eq!(declaration.consumer.len(), 4);
+        assert_eq!(
+            declaration.consumer["verifier"].handler,
+            Handler::Verification
+        );
+        assert_eq!(declaration.consumer["verifier"].replicas, 2);
         assert_eq!(declaration.trunk.as_deref(), Some("main"));
         let none = Declaration::parse(&Declaration::template(None)).expect("parses");
         assert_eq!(none.trunk, None);
@@ -538,12 +632,14 @@ mod tests {
     }
 
     #[test]
-    fn exploration_settings_are_role_specific() {
-        let text = Declaration::TEMPLATE
-            .replace("role = \"planning\"", "role = \"planning\"\nbreadth = 2");
+    fn exploration_settings_are_handler_specific() {
+        let text = Declaration::TEMPLATE.replace(
+            "handler = \"planning\"",
+            "handler = \"planning\"\nbreadth = 2",
+        );
         let error = Declaration::parse(&text).expect_err("breadth on planner");
         assert!(
-            error.to_string().contains("exploration agents only"),
+            error.to_string().contains("the exploration handler only"),
             "{error}"
         );
         let text = Declaration::TEMPLATE.replace("breadth = 3\n", "");
@@ -552,29 +648,72 @@ mod tests {
     }
 
     #[test]
+    fn subscriptions_must_name_distinct_events_supported_by_the_handler() {
+        for (on, problem) in [
+            ("", "`on` must list at least one event"),
+            ("\"goal.added\"", "does not handle `goal.added`"),
+            (
+                "\"node.ready\", \"node.ready\"",
+                "duplicate event `node.ready`",
+            ),
+        ] {
+            let config =
+                Declaration::TEMPLATE.replace("on = [\"node.ready\"]", &format!("on = [{on}]"));
+            let error = Declaration::parse(&config).expect_err(problem);
+            assert!(error.to_string().contains(problem), "{error}");
+        }
+    }
+
+    #[test]
+    fn legacy_explicit_routing_keeps_its_assignment_namespace() {
+        let config = r#"
+[agent.check]
+role = "execution"
+driver = "generic"
+command = ["check"]
+replicas = 1
+
+[routing]
+execution = "check"
+"#;
+        let declaration = Declaration::parse(config).expect("legacy declaration");
+        assert_eq!(declaration.consumer["check"].on, [EventKind::NodeReady]);
+        let route = declaration.route_for("check").expect("route");
+        assert_eq!(route.group, "verification");
+        assert_eq!(route.select(EventKind::NodeReady, EventId(1)), "check");
+    }
+
+    #[test]
     fn weighted_agents_split_their_role_by_weight() {
+        let legacy = Declaration::TEMPLATE
+            .lines()
+            .filter(|line| !line.starts_with("on = "))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace("[consumer.", "[agent.")
+            .replace("handler = ", "role = ");
         let text = format!(
             "{}\n[agent.contrarian]\nrole = \"exploration\"\ndriver = \"generic\"\n\
              command = [\"x\"]\nreplicas = 1\nbreadth = 1\nweight = 1\n",
-            Declaration::TEMPLATE.replace("breadth = 3\n", "breadth = 3\nweight = 3\n")
+            legacy.replace("breadth = 3\n", "breadth = 3\nweight = 3\n")
         );
         let declaration = Declaration::parse(&text).expect("parses");
         let mut counts = BTreeMap::new();
         for id in 1..=4000 {
-            let explorer = declaration.route("explorer", EventId(id));
-            let contrarian = declaration.route("contrarian", EventId(id));
+            let explorer = declaration.legacy_route("explorer", EventId(id));
+            let contrarian = declaration.legacy_route("contrarian", EventId(id));
             assert_eq!(explorer, contrarian, "every agent agrees on e{id}");
             *counts.entry(explorer.expect("routed")).or_insert(0) += 1;
         }
         assert!((2800..3200).contains(&counts["explorer"]), "{counts:?}");
         assert!((800..1200).contains(&counts["contrarian"]), "{counts:?}");
         // Unweighted agents react to everything of their role.
-        assert_eq!(declaration.route("planner", EventId(1)), None);
-        assert!(declaration.shares_with("explorer", "contrarian"));
-        assert!(!declaration.shares_with("explorer", "removed"));
-        assert!(!declaration.shares_with("explorer", "planner"));
+        assert_eq!(declaration.legacy_route("planner", EventId(1)), None);
+        assert!(declaration.legacy_shares_with("explorer", "contrarian"));
+        assert!(!declaration.legacy_shares_with("explorer", "removed"));
+        assert!(!declaration.legacy_shares_with("explorer", "planner"));
 
-        let zero = Declaration::TEMPLATE.replace("breadth = 3\n", "breadth = 3\nweight = 0\n");
+        let zero = legacy.replace("breadth = 3\n", "breadth = 3\nweight = 0\n");
         let error = Declaration::parse(&zero).expect_err("zero weight");
         assert!(
             error.to_string().contains("`weight` must be >= 1"),
@@ -585,20 +724,20 @@ mod tests {
     #[test]
     fn alternatives_follow_the_primary_cli() {
         let text = format!(
-            "{}\n[[agent.planner.alternative]]\ndriver = \"codex\"\ncommand = [\"codex\"]\n\
+            "{}\n[[consumer.planner.alternative]]\ndriver = \"codex\"\ncommand = [\"codex\"]\n\
              env = {{ A = \"1\" }}\n",
             Declaration::TEMPLATE
         );
         let declaration = Declaration::parse(&text).expect("parses");
-        let clis = declaration.agent["planner"].clis();
+        let clis = declaration.consumer["planner"].clis();
         assert_eq!(clis.len(), 2);
         assert_eq!(clis[0].driver, DriverKind::ClaudeCode);
         assert_eq!(clis[1].driver, DriverKind::Codex);
         assert_eq!(clis[1].env["A"], "1");
-        assert_eq!(declaration.agent["verifier"].clis().len(), 1);
+        assert_eq!(declaration.consumer["verifier"].clis().len(), 1);
 
         let empty = format!(
-            "{}\n[[agent.planner.alternative]]\ndriver = \"codex\"\ncommand = []\n",
+            "{}\n[[consumer.planner.alternative]]\ndriver = \"codex\"\ncommand = []\n",
             Declaration::TEMPLATE
         );
         let error = Declaration::parse(&empty).expect_err("empty command");
@@ -607,19 +746,19 @@ mod tests {
 
     fn with_timeouts(agent: &str, alternative: &str) -> Result<Declaration, DeclarationError> {
         Declaration::parse(&format!(
-            "[agent.a]\nrole = \"planning\"\ndriver = \"generic\"\ncommand = [\"x\"]\n\
+            "[consumer.a]\non = [\"node.proposed\"]\nhandler = \"planning\"\ndriver = \"generic\"\ncommand = [\"x\"]\n\
              replicas = 1\n{agent}\n\
-             [[agent.a.alternative]]\ndriver = \"generic\"\ncommand = [\"y\"]\n{alternative}\n"
+             [[consumer.a.alternative]]\ndriver = \"generic\"\ncommand = [\"y\"]\n{alternative}\n"
         ))
     }
 
     #[test]
     fn timeouts_are_parsed_and_bad_ones_rejected() {
         let template = Declaration::parse(Declaration::TEMPLATE).expect("parses");
-        assert!(template.agent.values().all(|a| a.timeout.is_none()));
+        assert!(template.consumer.values().all(|a| a.timeout.is_none()));
 
         let timeouts = |agent: &str, alternative: &str| -> Vec<Option<Duration>> {
-            with_timeouts(agent, alternative).expect("parses").agent["a"]
+            with_timeouts(agent, alternative).expect("parses").consumer["a"]
                 .clis()
                 .iter()
                 .map(|cli| cli.timeout.as_ref().map(|t| t.duration().expect("valid")))
@@ -642,7 +781,7 @@ mod tests {
         ] {
             let error = with_timeouts(agent, alternative).expect_err("bad timeout");
             assert!(
-                matches!(&error, DeclarationError::Timeout { agent, .. } if agent == "a"),
+                matches!(&error, DeclarationError::Timeout { consumer, .. } if consumer == "a"),
                 "{agent} {alternative}: {error:?}"
             );
             assert!(error.to_string().contains(reason), "{error}");

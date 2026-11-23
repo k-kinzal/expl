@@ -1,7 +1,7 @@
 //! [`Context`] — the collaborators every reaction shares.
 
-use crate::agent::Agent;
 use crate::declaration::{Declaration, DeclarationError};
+use crate::event::Consumer;
 use crate::graph::{Graph, GraphError};
 use crate::project::Project;
 use crate::workspace::Workspaces;
@@ -45,14 +45,14 @@ impl Context {
         &self.workspaces
     }
 
-    /// The declared agent `name`, brought to life.
+    /// The declared event consumer `name`, brought to life.
     ///
     /// # Errors
     ///
-    /// [`DeclarationError::UnknownAgent`], or
+    /// [`DeclarationError::UnknownConsumer`], or
     /// [`DeclarationError::Timeout`] for an unusable `timeout`.
-    pub fn agent(&self, name: &str) -> Result<Agent, DeclarationError> {
-        Agent::from_declaration(name, self.declaration.agent(name)?)
+    pub fn consumer(&self, name: &str) -> Result<Consumer, DeclarationError> {
+        Consumer::new(name, self.declaration.consumer(name)?)
     }
 
     /// A fresh connection to the project's graph.

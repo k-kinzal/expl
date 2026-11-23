@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use expl_core::testing::scaled;
 
-/// One script plays every role. Exploration proposes a step only for a new
+/// One script supplies responses for every handler. Exploration proposes a step only for a new
 /// goal or a failed step, so the graph settles (a survey answers with
 /// `@DIR@/survey.json`); verification fails while `@DIR@/fail` exists, else
 /// writes a file named after its node
@@ -31,27 +31,29 @@ use expl_core::testing::scaled;
 /// `README.md` there; with `@DIR@/switch-fails` too, it then exits 1
 /// instead of reporting.
 const AGENT: &str = r#"#!/bin/sh
-if [ "$EXPL_ROLE" = exploration ] && [ "$EXPL_EVENT" = node.revisited ] && [ -f "@DIR@/fast-revisits" ]; then
+case "$EXPL_EVENT_ID" in ""|*[!0-9]*) exit 3 ;; esac
+[ -n "$EXPL_CONSUMER" ] || exit 3
+if [ "$EXPL_HANDLER" = exploration ] && [ "$EXPL_EVENT" = node.revisited ] && [ -f "@DIR@/fast-revisits" ]; then
   prompt="@DIR@/prompts/exploration-revisit.txt"
   if [ ! -f "$prompt" ]; then cat > "$prompt"; fi
   echo '{"nodes":[]}'
   exit 0
 fi
 mkdir -p "@DIR@/prompts"
-cat > "@DIR@/prompts/$EXPL_ROLE-$$.txt"
-map=$(sed -n 's/^`\(.*map\.json\)`$/\1/p' "@DIR@/prompts/$EXPL_ROLE-$$.txt" | head -n 1)
+cat > "@DIR@/prompts/$EXPL_HANDLER-$$.txt"
+map=$(sed -n 's/^`\(.*map\.json\)`$/\1/p' "@DIR@/prompts/$EXPL_HANDLER-$$.txt" | head -n 1)
 if [ -n "$map" ]; then cp "$map" "@DIR@/map.json"; fi
-case "$EXPL_ROLE" in
+case "$EXPL_HANDLER" in
 exploration)
-  if grep -q '^## Map' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
+  if grep -q '^## Map' "@DIR@/prompts/$EXPL_HANDLER-$$.txt"; then
     cat "@DIR@/survey.json"
-  elif [ "$EXPL_EVENT" = goal.added ] && grep -q 'subgoal of' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
+  elif [ "$EXPL_EVENT" = goal.added ] && grep -q 'subgoal of' "@DIR@/prompts/$EXPL_HANDLER-$$.txt"; then
     echo '{"nodes":[{"title":"Aim at the top goal","objective":"x","before":[2]},{"title":"Aim at the subgoal","objective":"y","before":[]}]}'
   elif [ "$EXPL_EVENT" = goal.added ]; then
     echo '{"nodes":[{"title":"Write hello","objective":"Create hello.txt"}]}'
-  elif grep -q '^## Assumed done' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
+  elif grep -q '^## Assumed done' "@DIR@/prompts/$EXPL_HANDLER-$$.txt"; then
     echo '{"nodes":[{"title":"After the open step","objective":"z","before":[]}]}'
-  elif grep -q '^## Failed step' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
+  elif grep -q '^## Failed step' "@DIR@/prompts/$EXPL_HANDLER-$$.txt"; then
     echo '{"nodes":[{"title":"Write hello in smaller steps","objective":"Create an empty hello.txt"}]}'
   else
     echo '{"nodes":[]}'
@@ -65,7 +67,7 @@ planning)
   fi ;;
 verification)
   while [ -f "@DIR@/slow" ]; do sleep 0.2; done
-  if grep -q '^## Question' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
+  if grep -q '^## Question' "@DIR@/prompts/$EXPL_HANDLER-$$.txt"; then
     if [ -f "@DIR@/investigation-writes" ]; then echo made > hello.txt; fi
     if [ -f hello.txt ]; then answer=yes; else answer=no; fi
     if [ -f "@DIR@/finding.json" ]; then cat "@DIR@/finding.json"; exit 0; fi
@@ -111,7 +113,7 @@ evaluation)
     sh "@DIR@/evaluation.sh"
   elif [ "$EXPL_EVENT" = node.failed ]; then
     echo '{"evaluations":[]}'
-  elif grep -q '^## Findings' "@DIR@/prompts/$EXPL_ROLE-$$.txt"; then
+  elif grep -q '^## Findings' "@DIR@/prompts/$EXPL_HANDLER-$$.txt"; then
     echo '{"evaluations":[{"goal":2,"satisfied":true,"score":100,"reason":"answered"}]}'
   elif ls node-*.txt > /dev/null 2>&1; then
     echo '{"evaluations":[{"goal":2,"satisfied":true,"score":90,"reason":"file exists"}]}'
@@ -278,7 +280,7 @@ fn sandbox() -> Sandbox {
 }
 
 #[test]
-fn events_flow_through_every_role() {
+fn events_flow_through_every_handler() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
     let goal = ok(
@@ -334,7 +336,7 @@ fn events_flow_through_every_role() {
         );
     }
     // Every agent has reacted to everything addressed to it.
-    for agent in json_lines(&ok(repo, &["agent", "ls", "--format", "json"])) {
+    for agent in json_lines(&ok(repo, &["consumer", "ls", "--format", "json"])) {
         assert_eq!(agent["backlog"], 0, "{agent}");
     }
     // The processes went idle and exited; none is left running.
@@ -642,7 +644,7 @@ fn falling_over_starts_the_next_cli_clean_and_keeps_a_merge_in_progress() {
     std::fs::write(
         repo.join("expl.toml"),
         format!(
-            "{declaration}\n[[agent.verifier.alternative]]\ndriver = \"generic\"\ncommand = [\"{}\"]\n",
+            "{declaration}\n[[consumer.verifier.alternative]]\ndriver = \"generic\"\ncommand = [\"{}\"]\n",
             failing.display()
         ),
     )
@@ -814,7 +816,7 @@ fn planning_settles_only_the_proposals_it_was_shown() {
             &[
                 "event",
                 "ls",
-                "--agent",
+                "--consumer",
                 "planner",
                 "--kind",
                 "node.proposed",
@@ -862,7 +864,7 @@ fn an_invalid_plan_falls_over_to_the_alternative_cli() {
     std::fs::write(
         repo.join("expl.toml"),
         format!(
-            "{declaration}\n[[agent.planner.alternative]]\ndriver = \"generic\"\ncommand = [\"{}\"]\n",
+            "{declaration}\n[[consumer.planner.alternative]]\ndriver = \"generic\"\ncommand = [\"{}\"]\n",
             invalid.display()
         ),
     )
@@ -971,7 +973,7 @@ fn up_runs_every_agent_until_down() {
     let verifier = ok(repo, &["ps", "--format", "json"])
         .lines()
         .map(json)
-        .find(|p| p["agent"] == "verifier")
+        .find(|p| p["consumer"] == "verifier")
         .expect("a verifier");
     let name = verifier["name"].as_str().expect("name");
     assert!(ok(repo, &["logs", name]).contains("started process"));
@@ -1031,7 +1033,7 @@ fn an_abandoned_start_gives_its_replica_slot_back() {
     let verifiers = || {
         json_lines(&ok(repo, &["ps", "--format", "json"]))
             .into_iter()
-            .filter(|p| p["agent"] == "verifier")
+            .filter(|p| p["consumer"] == "verifier")
             .collect::<Vec<_>>()
     };
     assert_eq!(verifiers().len(), 2);
@@ -1087,7 +1089,7 @@ fn stopping_mid_verification_gives_the_event_back() {
             "ls",
             "--kind",
             "node.ready",
-            "--agent",
+            "--consumer",
             "verifier",
             "--format",
             "json",
@@ -1180,7 +1182,7 @@ fn usage_errors_exit_with_code_one() {
     assert_eq!(out.status.code(), Some(1));
     let out = expl(&sandbox.repo, &["run", "nobody"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("no agent named `nobody`"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no consumer named `nobody`"));
     let out = expl(&sandbox.repo, &["stop", "nothing"]);
     assert_eq!(out.status.code(), Some(1));
 }
@@ -1298,7 +1300,7 @@ fn the_origin_follows_the_trunk() {
     // The process that noticed (the latest planner) says so in its log.
     let planner = json_lines(&ok(repo, &["ps", "-a", "--format", "json"]))
         .into_iter()
-        .filter(|p| p["agent"] == "planner")
+        .filter(|p| p["consumer"] == "planner")
         .max_by_key(|p| p["id"].as_i64())
         .expect("a planner process");
     let log = ok(repo, &["logs", planner["name"].as_str().expect("name")]);
@@ -1511,7 +1513,7 @@ fn a_step_that_moves_refs_in_its_clone(target: &str, fallback: bool) {
         std::fs::write(
             repo.join("expl.toml"),
             format!(
-                "{declaration}\n[[agent.verifier.alternative]]\ndriver = \"generic\"\ncommand = [\"{}\"]\n",
+                "{declaration}\n[[consumer.verifier.alternative]]\ndriver = \"generic\"\ncommand = [\"{}\"]\n",
                 dir.join("agent.sh").display()
             ),
         )
@@ -1656,24 +1658,82 @@ fn idle_exploration_revisits_random_starting_points() {
 }
 
 #[test]
-fn nested_routers_assign_one_worker_and_share_capacity_across_roles() {
+fn failure_can_be_explored_when_evaluation_subscribes_only_to_completion() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
     let path = repo.join("expl.toml");
-    let base = std::fs::read_to_string(&path).expect("declaration");
+    let config = std::fs::read_to_string(&path)
+        .expect("declaration")
+        .replace(
+            "on = [\"node.completed\", \"node.failed\", \"origin.advanced\"]",
+            "on = [\"node.completed\"]",
+        );
+    std::fs::write(path, config).expect("declaration");
+
+    ok(repo, &["goal", "add", "G"]);
+    let step = ok(repo, &["node", "add", "Try a step", "--priority", "1"]);
+    sandbox.marker("fail", true);
+    ok(repo, &["run", "verifier", "--once"]);
+    ok(repo, &["run", "evaluator", "--exit-when-idle"]);
+
+    let consumers = json_lines(&ok(repo, &["consumer", "ls", "--format", "json"]));
+    let evaluator = consumers
+        .iter()
+        .find(|c| c["name"] == "evaluator")
+        .expect("evaluator");
+    assert_eq!(evaluator["on"], serde_json::json!(["node.completed"]));
+    assert_eq!(evaluator["backlog"], 0);
+    assert_eq!(
+        json_lines(&ok(
+            repo,
+            &[
+                "event",
+                "ls",
+                "--consumer",
+                "evaluator",
+                "--kind",
+                "node.failed",
+                "--format",
+                "json",
+            ]
+        ))[0]["delivery"],
+        "undelivered",
+    );
+
+    ok(repo, &["run", "explorer", "--exit-when-idle"]);
+    let failed = node(repo, &step);
+    let runs = failed["agent_runs"].as_array().expect("runs");
+    assert!(runs.iter().any(|r| r["role"] == "exploration"), "{failed}");
+}
+
+#[test]
+fn nested_routers_assign_one_worker_and_share_capacity_across_groups() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let path = repo.join("expl.toml");
+    let base = std::fs::read_to_string(&path)
+        .expect("declaration")
+        .replace(
+            "[consumer.explorer]",
+            "[consumer.explorer]\ngroup = \"directions\"",
+        )
+        .replace(
+            "[consumer.verifier]",
+            "[consumer.verifier]\ngroup = \"checks\"",
+        );
     let fringe = base
-        .split("\n[agent.")
+        .split("\n[consumer.")
         .find(|section| section.starts_with("explorer]"))
         .expect("explorer")
         .replacen("explorer]", "fringe]", 1);
     std::fs::write(
         &path,
         format!(
-            "{base}\n[agent.{fringe}\n{}",
+            "{base}\n[consumer.{fringe}\n{}",
             r#"
 [routing]
-exploration = "all"
-verification = "all"
+directions = "all"
+checks = "all"
 
 [router.all]
 targets = ["explorers", "verifier"]
@@ -1737,6 +1797,7 @@ fn weighted_agents_of_one_role_split_its_events() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
     let declaration = std::fs::read_to_string(repo.join("expl.toml")).expect("read");
+    let declaration = legacy_declaration(&declaration);
     let explorer = declaration
         .split("\n[agent.")
         .find(|section| section.starts_with("explorer]"))
@@ -1794,6 +1855,15 @@ fn weighted_agents_of_one_role_split_its_events() {
     assert!(explorer > 0 && contrarian > 0, "{explorer} + {contrarian}");
 }
 
+fn legacy_declaration(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.starts_with("on = "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("[consumer.", "[agent.")
+        .replace("handler = ", "role = ")
+}
+
 /// `base` with a `contrarian` exploration beside the `explorer`, the two
 /// sharing the role by weight, nearly every event routed to `favored`.
 fn weighted_declaration(base: &str, favored: &str) -> String {
@@ -1820,6 +1890,7 @@ fn weighted_assignments_hold_across_declarations_and_restarts() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;
     let base = std::fs::read_to_string(repo.join("expl.toml")).expect("read");
+    let base = legacy_declaration(&base);
     let favor = |agent: &str| {
         std::fs::write(repo.join("expl.toml"), weighted_declaration(&base, agent))
             .expect("declaration");
@@ -1835,7 +1906,7 @@ fn weighted_assignments_hold_across_declarations_and_restarts() {
             &[
                 "event",
                 "ls",
-                "--agent",
+                "--consumer",
                 agent,
                 "--kind",
                 "goal.added",
@@ -2115,7 +2186,7 @@ fn a_graph_wide_exploration_surveys_and_attaches_anywhere() {
 
     let declaration = std::fs::read_to_string(repo.join("expl.toml")).expect("read");
     let explorer = declaration
-        .split("\n[agent.")
+        .split("\n[consumer.")
         .find(|section| section.starts_with("explorer]"))
         .expect("explorer section")
         .to_owned();
@@ -2123,7 +2194,7 @@ fn a_graph_wide_exploration_surveys_and_attaches_anywhere() {
     std::fs::write(
         repo.join("expl.toml"),
         format!(
-            "{declaration}\n[agent.{}\nscope = \"graph\"\n",
+            "{declaration}\n[consumer.{}\nscope = \"graph\"\n",
             surveyor.trim_end()
         ),
     )
