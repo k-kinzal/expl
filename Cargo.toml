@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "expl_runtime",
     "expl_core",
     "expl_cli",
     "expl_ui",
@@ -17,6 +18,7 @@ authors = ["expl contributors"]
 # Policy (inherited from iter): `anyhow` is test-only. Library and binary code
 # carry typed `thiserror` errors so every failure has a named category.
 [workspace.dependencies]
+expl_runtime = { path = "expl_runtime", version = "0.1.0" }
 expl_core = { path = "expl_core", version = "0.1.0" }
 
 thiserror = "2"

@@ -129,6 +129,12 @@ impl Project {
         self.root.join(Self::STATE_DIR)
     }
 
+    /// Local marker containing the managed daemon directory.
+    #[must_use]
+    pub fn cluster_path(&self) -> PathBuf {
+        self.state_dir().join("cluster")
+    }
+
     /// `.expl/expl.db` — the graph.
     #[must_use]
     pub fn database_path(&self) -> PathBuf {

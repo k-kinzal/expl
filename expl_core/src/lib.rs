@@ -1,4 +1,4 @@
-//! Core runtime for expl: an event-driven exploration of a problem space.
+//! The general-purpose exploration application built on [`expl_runtime`].
 //!
 //! The graph holds origins, hypotheses and goals. Each mutation produces
 //! an event. Configured consumers subscribe to those events and run handlers
@@ -8,7 +8,7 @@
 //! - [`graph`] — nodes, edges, plans, evaluations and the events they produce.
 //! - [`event`] — subscriptions and leased deliveries.
 //! - [`handler`] — graph operations that run in response to an event.
-//! - [`agent`] — the runner and drivers that get a structured response from a command.
+//! - [`agent`] — the runtime drivers that get a structured response from a command.
 //! - [`process`] — workers and the process table behind `expl ps`.
 //! - [`workspace`] — node worktrees and scratch worktrees.
 //! - [`trunk`] — following the default branch: the origin moves with it.
@@ -23,21 +23,21 @@
 
 #![deny(rust_2018_idioms)]
 
-pub mod agent;
 pub mod declaration;
 pub mod doctor;
 pub mod event;
 pub mod git;
 pub mod graph;
 pub mod handler;
+pub mod overview;
 pub mod process;
 pub mod project;
-pub mod prompt;
 pub mod store;
 mod telemetry;
-pub mod testing;
 pub mod trunk;
 pub mod workspace;
+
+pub use expl_runtime::{agent, prompt, testing};
 
 pub use agent::{Agent, AgentDriver, AgentError, AgentRun, DriverKind};
 pub use declaration::{

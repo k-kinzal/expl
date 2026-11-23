@@ -13,11 +13,13 @@ name = "expl"
 path = "src/main.rs"
 
 [dependencies]
+expl_runtime.workspace = true
 expl_core.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
+tempfile.workspace = true
 rusqlite.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["metrics"] }
@@ -26,7 +28,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-tempfile.workspace = true
 expl_core.workspace = true
 
 [lints]

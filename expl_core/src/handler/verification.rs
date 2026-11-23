@@ -350,6 +350,28 @@ fn carry_out(
     // its tip, the outcome and the events are published together below, and
     // only while this delivery still holds the step.
     pause(Window::Publish);
+    if reaction.lease_lost() {
+        return Err(HandlerError::Agent(AgentError::Interrupted));
+    }
+    let context = reaction.context();
+    if let Some(remote) = &context.declaration().workspace.remote {
+        let git = crate::git::Git::in_worktree(context.project().root());
+        let reference = format!("refs/heads/{branch}");
+        git.run(&["remote", "get-url", "--", remote])
+            .map_err(WorkspaceError::from)?;
+        git.network(
+            &[
+                "push",
+                "--no-follow-tags",
+                &format!("--force-with-lease={reference}:"),
+                "--",
+                remote,
+                &format!("{head}:{reference}"),
+            ],
+            reaction.interrupt(),
+        )
+        .map_err(WorkspaceError::from)?;
+    }
     if !succeeded {
         return fail(graph, token, node, branch, Some(head), summary);
     }
@@ -486,6 +508,7 @@ fn investigate(
             graph.unclaim(id, token)?;
             return Err(error);
         }
+        Err(error @ HandlerError::Agent(AgentError::Transport(_))) => return Err(error),
         Err(error @ HandlerError::Agent(_)) => {
             return fail(
                 graph,
@@ -584,6 +607,7 @@ fn invoke(
             }
             Err(error)
         }
+        Err(error @ HandlerError::Agent(AgentError::Transport(_))) => Err(error),
         Err(error @ HandlerError::Agent(_)) => {
             Ok((false, format!("verification agent failed: {error}")))
         }

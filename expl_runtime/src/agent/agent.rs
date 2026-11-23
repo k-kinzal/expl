@@ -10,9 +10,9 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -22,28 +22,16 @@ use opentelemetry::trace::TraceContextExt;
 use opentelemetry::{Context, KeyValue};
 use serde::de::DeserializeOwned;
 
+use crate::Interrupt;
+use crate::agent::supervisor::{End, Reaped, reap_group, wait};
 use crate::agent::{
     AgentDriver, AgentError, AgentRequest, AgentRun, ClaudeCodeDriver, CodexDriver,
     CursorAgentDriver, DriverKind, GenericDriver,
 };
-use crate::declaration::{CliDeclaration, TimeoutError};
-use crate::process::Interrupt;
+use crate::cluster::{Cluster, CommandSpec, Outcome};
+use crate::command::{CliDeclaration, TimeoutError};
 use crate::prompt::Prompt;
 use crate::telemetry;
-
-/// How long an interrupted or timed-out invocation gets to exit after
-/// SIGTERM.
-const TERMINATION_GRACE: Duration = Duration::from_secs(5);
-
-/// How long children an exited CLI left behind get to exit after SIGTERM
-/// before they are killed.
-const LEFTOVER_GRACE: Duration = Duration::from_secs(2);
-
-/// How long a process group gets to vanish after SIGKILL. A member that
-/// outlives it is stuck where it cannot even be killed; past this bound the
-/// attempt fails with [`AgentError::Lingering`] instead of handing the
-/// working directory on.
-const KILL_GRACE: Duration = Duration::from_secs(5);
 
 /// How long the output is still read once the CLI and its process group are
 /// gone. A process that escaped the group can hold the pipes open forever;
@@ -87,21 +75,23 @@ impl std::fmt::Debug for Invocation<'_> {
 pub struct Agent {
     name: String,
     env: BTreeMap<String, String>,
-    clis: Vec<Cli>,
+    clis: Vec<DriverConfig>,
     /// Where the next invocation's route starts.
     turn: AtomicUsize,
+    cluster: Option<Cluster>,
 }
 
-/// One CLI that can carry out an agent.
-struct Cli {
-    driver: Box<dyn AgentDriver>,
+/// One driver, with its own environment and attempt timeout.
+pub struct DriverConfig {
+    /// Converts input and output for this runner.
+    pub driver: Box<dyn AgentDriver>,
     /// Environment of this CLI alone, over the agent's `env`.
-    env: BTreeMap<String, String>,
+    pub env: BTreeMap<String, String>,
     /// How long one attempt may run.
-    timeout: Option<Duration>,
+    pub timeout: Option<Duration>,
 }
 
-impl Cli {
+impl DriverConfig {
     fn from_declaration(declaration: CliDeclaration) -> Result<Self, TimeoutError> {
         let CliDeclaration {
             driver,
@@ -112,7 +102,7 @@ impl Cli {
         } = declaration;
         let timeout = timeout
             .as_ref()
-            .map(crate::declaration::Timeout::duration)
+            .map(crate::command::Timeout::duration)
             .transpose()?;
         let driver: Box<dyn AgentDriver> = match driver {
             DriverKind::ClaudeCode => Box::new(ClaudeCodeDriver::new(command, args)),
@@ -130,7 +120,7 @@ impl Cli {
 
 impl std::fmt::Debug for Agent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let drivers: Vec<DriverKind> = self.clis.iter().map(|c| c.driver.kind()).collect();
+        let drivers: Vec<_> = self.clis.iter().map(|c| c.driver.label()).collect();
         f.debug_struct("Agent")
             .field("name", &self.name)
             .field("drivers", &drivers)
@@ -144,22 +134,40 @@ impl Agent {
     /// # Errors
     ///
     /// [`TimeoutError`] when a CLI's timeout is invalid.
-    pub(crate) fn new(
+    pub fn new(
         name: &str,
         env: BTreeMap<String, String>,
         clis: Vec<CliDeclaration>,
     ) -> Result<Self, TimeoutError> {
         let clis = clis
             .into_iter()
-            .map(Cli::from_declaration)
+            .map(DriverConfig::from_declaration)
             .collect::<Result<_, _>>()?;
-        Ok(Self {
+        Ok(Self::from_drivers(name, env, clis))
+    }
+
+    /// Build an agent using application-provided drivers.
+    #[must_use]
+    pub fn from_drivers(
+        name: &str,
+        env: BTreeMap<String, String>,
+        clis: Vec<DriverConfig>,
+    ) -> Self {
+        Self {
             name: name.to_owned(),
             env,
             clis,
             // Replicas start their routes at different CLIs.
             turn: AtomicUsize::new(std::process::id() as usize),
-        })
+            cluster: None,
+        }
+    }
+
+    /// Route command attempts through cluster members.
+    #[must_use]
+    pub fn with_cluster(mut self, cluster: Cluster) -> Self {
+        self.cluster = Some(cluster);
+        self
     }
 
     /// Invoke the agent once and return its structured response decoded
@@ -185,7 +193,11 @@ impl Agent {
 
     /// Invoke the agent, treating a response that fails `validate` as a
     /// failed CLI attempt, just like a response that does not decode.
-    pub(crate) fn invoke_validated<R: DeserializeOwned>(
+    ///
+    /// # Errors
+    ///
+    /// As in [`Self::invoke`], including validation failures.
+    pub fn invoke_validated<R: DeserializeOwned>(
         &self,
         invocation: &Invocation<'_>,
         validate: impl Fn(&R) -> Result<(), AgentError>,
@@ -208,7 +220,7 @@ impl Agent {
             let context = telemetry::span(
                 "expl.agent.attempt",
                 vec![
-                    KeyValue::new("expl.agent.driver", cli.driver.kind().label()),
+                    KeyValue::new("expl.agent.driver", cli.driver.label()),
                     KeyValue::new("expl.agent.attempt", (offset + 1) as i64),
                     KeyValue::new("expl.agent.fallback", offset > 0),
                 ],
@@ -236,11 +248,13 @@ impl Agent {
                 Ok(run) => return Ok(run),
                 Err(AgentError::Interrupted) => return Err(AgentError::Interrupted),
                 // The directory is still in use: no other CLI may start on it.
-                Err(error @ AgentError::Lingering { .. }) => return Err(error),
+                Err(error @ (AgentError::Lingering { .. } | AgentError::Transport(_))) => {
+                    return Err(error);
+                }
                 Err(error) if count == 1 => return Err(error),
                 Err(error) => {
-                    writeln!(log, "=== {} failed: {error} ===", cli.driver.kind().label())?;
-                    failures.push(format!("{}: {error}", cli.driver.kind().label()));
+                    writeln!(log, "=== {} failed: {error} ===", cli.driver.label())?;
+                    failures.push(format!("{}: {error}", cli.driver.label()));
                 }
             }
         }
@@ -253,11 +267,16 @@ impl Agent {
     /// One attempt with `cli`, logged to `log`.
     fn attempt(
         &self,
-        cli: &Cli,
+        cli: &DriverConfig,
         invocation: &Invocation<'_>,
         log: File,
     ) -> Result<AgentRun, AgentError> {
-        let scratch = tempfile::Builder::new().prefix("expl-agent-").tempdir()?;
+        let scratch = match &self.cluster {
+            Some(cluster) => tempfile::Builder::new()
+                .prefix("expl-agent-")
+                .tempdir_in(cluster.root())?,
+            None => tempfile::Builder::new().prefix("expl-agent-").tempdir()?,
+        };
         let request = AgentRequest {
             prompt: invocation.prompt,
             response_schema: invocation.response_schema,
@@ -283,10 +302,49 @@ impl Agent {
             log,
             "=== agent `{}` ({}) ===",
             self.name,
-            cli.driver.kind().label()
+            cli.driver.label()
         )?;
         writeln!(log, "=== command: {:?}", command.process)?;
         writeln!(log, "=== prompt ===\n{}\n=== output ===", invocation.prompt)?;
+        if let Some(cluster) = &self.cluster {
+            let spec = CommandSpec::capture(&command.process, invocation.directory);
+            let mut stdout = RemoteLog::new(log.try_clone()?, "");
+            let mut stderr = RemoteLog::new(log.try_clone()?, "[stderr] ");
+            let result = cluster.execute(
+                spec,
+                command.stdin.as_deref(),
+                cli.timeout,
+                invocation.interrupt,
+                (&mut stdout, &mut stderr),
+            );
+            let stdout = stdout.finish()?;
+            let stderr = stderr.finish()?;
+            let status = match result.map_err(AgentError::Transport)? {
+                Outcome::Exited(status) => {
+                    let status = ExitStatus::from_raw(status);
+                    writeln!(log, "=== exit: {status} ===")?;
+                    status
+                }
+                Outcome::TimedOut => {
+                    writeln!(log, "=== timed out ===")?;
+                    return Err(AgentError::TimedOut {
+                        after: cli.timeout.unwrap_or_default(),
+                    });
+                }
+                Outcome::Interrupted => {
+                    writeln!(log, "=== interrupted ===")?;
+                    return Err(AgentError::Interrupted);
+                }
+                Outcome::Lingering { group } => return Err(AgentError::Lingering { group }),
+                Outcome::Failed(error) => return Err(AgentError::Launch(error)),
+            };
+            let output = std::process::Output {
+                status,
+                stdout,
+                stderr,
+            };
+            return cli.driver.interpret(&output, &request);
+        }
         let log = Arc::new(Mutex::new(log));
 
         let mut child = command.process.spawn().map_err(|error| {
@@ -325,7 +383,11 @@ impl Agent {
             .take()
             .map(|pipe| tee(pipe, Arc::clone(&log), "[stderr] "));
 
-        let end = wait(&mut child, invocation.interrupt, deadline.map(|(at, _)| at))?;
+        let end = wait(
+            &mut child,
+            || invocation.interrupt.is_raised(),
+            deadline.map(|(at, _)| at),
+        )?;
         if let End::Exited(status) = end
             && let Some(code) = status.code()
         {
@@ -384,112 +446,6 @@ impl Agent {
             (End::TimedOut, Some((_, after))) => Err(AgentError::TimedOut { after }),
             (End::Interrupted | End::TimedOut, _) => Err(AgentError::Interrupted),
         }
-    }
-}
-
-/// How waiting for a child ended.
-#[derive(Debug, Clone, Copy)]
-enum End {
-    /// It exited by itself.
-    Exited(ExitStatus),
-    /// The hosting process was asked to stop, so the child was stopped.
-    Interrupted,
-    /// The deadline passed, so the child was stopped.
-    TimedOut,
-}
-
-/// Wait for the child until it exits; on interrupt, or once `deadline`
-/// passes, stop its whole process group (TERM, then KILL after a grace
-/// period) until the leader is gone. Members that outlive the leader are
-/// [`reap_group`]'s to stop.
-fn wait(
-    child: &mut Child,
-    interrupt: &Interrupt,
-    deadline: Option<Instant>,
-) -> std::io::Result<End> {
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(End::Exited(status));
-        }
-        let end = if interrupt.is_raised() {
-            End::Interrupted
-        } else if deadline.is_some_and(|at| Instant::now() >= at) {
-            End::TimedOut
-        } else {
-            thread::sleep(Duration::from_millis(100));
-            continue;
-        };
-        signal_group(child.id(), "-TERM");
-        let grace = Instant::now() + TERMINATION_GRACE;
-        while Instant::now() < grace {
-            if child.try_wait()?.is_some() {
-                return Ok(end);
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        signal_group(child.id(), "-KILL");
-        child.wait()?;
-        return Ok(end);
-    }
-}
-
-/// Send `signal` to the process group led by `pid`; `true` when the group
-/// still had a member to receive it.
-fn signal_group(pid: u32, signal: &str) -> bool {
-    // Best effort: the group may already be gone.
-    Command::new("kill")
-        .arg(signal)
-        .arg("--")
-        .arg(format!("-{pid}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-/// What [`reap_group`] found of a process group whose leader is gone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reaped {
-    /// Nothing was left of it.
-    Empty,
-    /// Members were left; they are gone now.
-    Stopped,
-    /// Members were left, and some survived SIGKILL for [`KILL_GRACE`].
-    Lingering,
-}
-
-/// Stop whatever is left of the process group led by the exited CLI `pid`
-/// (TERM, then KILL after a grace period), and wait until no member is left,
-/// so background children can neither hold its pipes open nor keep working
-/// in its directory once the attempt is over.
-fn reap_group(pid: u32) -> Reaped {
-    if !signal_group(pid, "-TERM") {
-        return Reaped::Empty;
-    }
-    if vanishes(pid, LEFTOVER_GRACE) {
-        return Reaped::Stopped;
-    }
-    signal_group(pid, "-KILL");
-    if vanishes(pid, KILL_GRACE) {
-        Reaped::Stopped
-    } else {
-        Reaped::Lingering
-    }
-}
-
-/// Whether the process group led by `pid` has no member left by `grace`
-/// from now. A killed member stays a member until its parent reaps it,
-/// so this also waits for that.
-fn vanishes(pid: u32, grace: Duration) -> bool {
-    let by = Instant::now() + grace;
-    loop {
-        if !signal_group(pid, "-0") {
-            return true;
-        }
-        if Instant::now() >= by {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -571,11 +527,60 @@ fn tee(pipe: impl Read + Send + 'static, log: Arc<Mutex<File>>, prefix: &'static
     Tee { handle, captured }
 }
 
+/// Tee a remote output file as it grows, preserving the bytes drivers need.
+struct RemoteLog {
+    log: File,
+    prefix: &'static str,
+    bytes: Vec<u8>,
+    logged: usize,
+}
+
+impl RemoteLog {
+    fn new(log: File, prefix: &'static str) -> Self {
+        Self {
+            log,
+            prefix,
+            bytes: Vec::new(),
+            logged: 0,
+        }
+    }
+
+    fn finish(mut self) -> std::io::Result<Vec<u8>> {
+        if self.logged < self.bytes.len() {
+            write!(self.log, "{}", self.prefix)?;
+            self.log.write_all(&self.bytes[self.logged..])?;
+            self.log.write_all(b"\n")?;
+        }
+        Ok(self.bytes)
+    }
+}
+
+impl Write for RemoteLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        while let Some(end) = self.bytes[self.logged..]
+            .iter()
+            .position(|&byte| byte == b'\n')
+        {
+            let end = self.logged + end + 1;
+            self.log.write_all(self.prefix.as_bytes())?;
+            self.log.write_all(&self.bytes[self.logged..end])?;
+            self.logged = end;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.log.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::declaration::Declaration;
+    use crate::agent::supervisor::{LEFTOVER_GRACE, TERMINATION_GRACE};
     use crate::testing::scaled;
+    use std::process::Command;
 
     /// The longest a CLI with a `timeout` of 1s may take to be stopped
     /// when it goes on the first TERM: its timeout, plus the
@@ -586,9 +591,32 @@ mod tests {
     }
 
     fn agent(text: &str) -> Agent {
-        let declaration = Declaration::parse(text).expect("declaration");
-        let consumer = declaration.consumer("a").expect("consumer");
-        Agent::new("a", consumer.env.clone(), consumer.clis()).expect("runner")
+        let mut definition: toml::Value = toml::from_str(text).expect("declaration");
+        let consumer = definition["agent"]["a"].as_table_mut().expect("consumer");
+        let alternatives = consumer.remove("alternative");
+        let env = consumer
+            .remove("env")
+            .map_or_else(BTreeMap::new, |env| env.try_into().expect("env"));
+        consumer.remove("role");
+        consumer.remove("replicas");
+        let mut primary: CliDeclaration = toml::Value::Table(consumer.clone())
+            .try_into()
+            .expect("primary command");
+        let mut alternatives: Vec<CliDeclaration> =
+            alternatives.map_or_else(Vec::new, |value| value.try_into().expect("alternatives"));
+        for alternative in &mut alternatives {
+            alternative.timeout = alternative
+                .timeout
+                .take()
+                .or_else(|| primary.timeout.clone());
+        }
+        primary.env = BTreeMap::new();
+        Agent::new(
+            "a",
+            env,
+            std::iter::once(primary).chain(alternatives).collect(),
+        )
+        .expect("runner")
     }
 
     fn invoke(agent: &Agent, log: &Path) -> Result<AgentRun, AgentError> {

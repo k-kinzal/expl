@@ -2516,3 +2516,165 @@ fn a_partial_evaluation_records_nothing_until_a_complete_retry() {
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["node"], step["node"]["id"]);
 }
+
+struct Daemon(std::process::Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        drop(self.0.kill());
+        drop(self.0.wait());
+    }
+}
+
+fn daemon(repo: &Path, name: &str, cluster: Option<&Path>) -> Daemon {
+    let mut command = expl_command(repo);
+    command
+        .args(["daemon", "--member", name])
+        .env("EXPL_TEST_MEMBER", name);
+    if let Some(cluster) = cluster {
+        command.arg("--cluster").arg(cluster);
+    }
+    Daemon(command.spawn().expect("daemon"))
+}
+
+fn member_role(repo: &Path, member: &str, role: &str) -> bool {
+    let out = expl(repo, &["--member", member, "cluster", "status"]);
+    out.status.success() && json(&String::from_utf8_lossy(&out.stdout))["role"] == role
+}
+
+fn job_member(repo: &Path, step: &str) -> Option<String> {
+    std::fs::read_to_string(
+        repo.parent()
+            .expect("sandbox")
+            .join(format!("member-{step}")),
+    )
+    .ok()
+}
+
+#[test]
+fn clustered_workers_use_members_and_survive_a_leader_crash() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let agent = sandbox.dir.path().join("agent.sh");
+    let commands = std::fs::read_to_string(&agent).expect("agent").replace(
+        "verification)\n",
+        &format!(
+            "verification)\n  echo \"$EXPL_TEST_MEMBER\" > \"{}/member-$EXPL_NODE\"\n",
+            sandbox.dir.path().display()
+        ),
+    );
+    std::fs::write(agent, commands).expect("instrument fake agent");
+    let path = sandbox.dir.path().join("cluster");
+    let mut first = daemon(repo, "alpha", Some(&path));
+    wait_until(repo, "the first leader", || {
+        member_role(repo, "alpha", "leader")
+    });
+    let _second = daemon(repo, "beta", Some(&path));
+    wait_until(repo, "a follower", || member_role(repo, "beta", "member"));
+
+    let through = |args: &[&str]| {
+        let mut cmd = vec!["--member", "beta"];
+        cmd.extend_from_slice(args);
+        ok(repo, &cmd)
+    };
+    assert_eq!(
+        ok(
+            sandbox.dir.path(),
+            &[
+                "--cluster",
+                path.to_str().expect("cluster directory"),
+                "--member",
+                "beta",
+                "goal",
+                "add",
+                "distributed",
+            ]
+        ),
+        "2"
+    );
+    sandbox.slow(true);
+    let a = through(&["node", "add", "A", "--priority", "10"]);
+    let b = through(&["node", "add", "B", "--priority", "9"]);
+    let workers = through(&["up", "verifier"]);
+    wait_until(repo, "both machines to run a job", || {
+        job_member(repo, &a).is_some() && job_member(repo, &b).is_some()
+    });
+    let mut members = [job_member(repo, &a).unwrap(), job_member(repo, &b).unwrap()];
+    members.sort();
+    assert_eq!(members, ["alpha\n", "beta\n"]);
+    let snapshot = through(&["runtime-overview"]);
+    let snapshot: expl_core::overview::Overview =
+        serde_json::from_str(&snapshot).expect("window view");
+    assert!(
+        snapshot
+            .nodes
+            .iter()
+            .any(|node| node.title == "distributed")
+    );
+    assert!(through(&["goal", "ls"]).contains("distributed"));
+
+    first.0.kill().expect("crash the leader");
+    first.0.wait().expect("reap the leader");
+    wait_until(repo, "the follower to take over", || {
+        member_role(repo, "beta", "leader")
+    });
+    sandbox.slow(false);
+    wait_until(repo, "both deliveries to settle after failover", || {
+        [a.as_str(), b.as_str()]
+            .iter()
+            .all(|id| json(&through(&["node", "inspect", id]))["node"]["status"] == "completed")
+    });
+    for worker in workers.lines() {
+        assert_eq!(
+            json(&through(&["process", "inspect", worker]))["state"],
+            "running"
+        );
+    }
+    through(&["down", "--time", &down_time()]);
+    assert!(through(&["ps", "-q"]).is_empty());
+    assert_eq!(git(repo, &["show", "HEAD:README.md"]), "hello");
+}
+
+#[test]
+fn a_single_daemon_serves_the_same_cli_and_uses_a_git_remote() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let remote = sandbox.dir.path().join("remote.git");
+    git(
+        repo,
+        &["init", "--bare", "-q", remote.to_str().expect("remote")],
+    );
+    git(
+        repo,
+        &["remote", "add", "origin", remote.to_str().expect("remote")],
+    );
+    git(repo, &["push", "origin", "main"]);
+    let declaration = repo.join("expl.toml");
+    let contents = std::fs::read_to_string(&declaration).expect("declaration");
+    std::fs::write(
+        &declaration,
+        contents.replace("frozen = []", "frozen = []\nremote = \"origin\""),
+    )
+    .unwrap();
+    let _daemon = daemon(repo, "local", None);
+    wait_until(repo, "standalone daemon", || {
+        member_role(repo, "local", "leader")
+    });
+    let step = ok(repo, &["node", "add", "publish me", "--priority", "1"]);
+    ok(repo, &["run", "verifier", "--exit-when-idle"]);
+    let record = node(repo, &step);
+    let branch = record["node"]["branch"].as_str().expect("branch");
+    let head = record["node"]["head_commit"].as_str().expect("tip");
+    assert_eq!(git(&remote, &["rev-parse", branch]), head);
+    let original = git(repo, &["rev-parse", "main"]);
+    git(
+        repo,
+        &["push", "origin", &format!("{branch}:refs/heads/main")],
+    );
+    ok(repo, &["run", "evaluator", "-d"]);
+    wait_until(repo, "remote trunk adoption", || {
+        ok(repo, &["origin", "ls"]).contains("publish me")
+    });
+    assert_eq!(git(repo, &["rev-parse", "main"]), original);
+    ok(repo, &["down", "--time", &down_time()]);
+}

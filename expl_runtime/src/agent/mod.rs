@@ -22,8 +22,9 @@ mod driver;
 mod error;
 pub mod response;
 mod run;
+pub(crate) mod supervisor;
 
-pub use agent::{Agent, Invocation};
+pub use agent::{Agent, DriverConfig, Invocation};
 pub use driver::{AgentCommand, AgentDriver, AgentRequest, DriverKind};
 pub use drivers::{ClaudeCodeDriver, CodexDriver, CursorAgentDriver, GenericDriver};
 pub use error::AgentError;

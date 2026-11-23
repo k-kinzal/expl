@@ -20,6 +20,9 @@
 //! it is enough to merge: the origin moves within seconds.
 
 use std::collections::BTreeSet;
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TraceContextExt;
@@ -28,6 +31,7 @@ use thiserror::Error;
 
 use crate::git::{Git, GitError};
 use crate::graph::{Graph, GraphError, NewOrigin, NodeFilter, NodeId, NodeKind, NodeStatus};
+use crate::process::Interrupt;
 use crate::project::Project;
 use crate::telemetry;
 
@@ -43,6 +47,9 @@ pub enum TrunkError {
     /// The trunk branch does not exist.
     #[error("trunk branch `{0}` does not exist")]
     MissingBranch(String),
+    /// The remote polling lock could not be used.
+    #[error("cannot coordinate Git fetch: {0}")]
+    FetchLock(#[from] std::io::Error),
     /// git could not tell whether `trunk` holds `commit` (for instance, a
     /// commit no longer exists), so what the trunk took in is unknown.
     #[error("cannot tell whether {trunk} holds {commit}: {source}")]
@@ -90,6 +97,7 @@ struct Observation {
 pub struct Trunk {
     git: Git,
     branch: Option<String>,
+    remote: Option<(String, PathBuf, Interrupt)>,
 }
 
 impl Trunk {
@@ -100,7 +108,20 @@ impl Trunk {
         Self {
             git: Git::in_worktree(project.root()),
             branch: branch.filter(|b| !b.is_empty()).map(str::to_owned),
+            remote: None,
         }
+    }
+
+    /// Follow the configured Git remote instead of the checkout's branch.
+    #[must_use]
+    pub fn with_remote(
+        mut self,
+        project: &Project,
+        remote: Option<&str>,
+        interrupt: &Interrupt,
+    ) -> Self {
+        self.remote = remote.map(|name| (name.to_owned(), project.state_dir(), interrupt.clone()));
+        self
     }
 
     /// Every branch that is or was the trunk: the declared one and each
@@ -197,6 +218,55 @@ impl Trunk {
         }
     }
 
+    /// Share one fetch across worker replicas. A private tracking ref
+    /// keeps the owner's local branch separate from the remote observation.
+    fn fetch(
+        &self,
+        remote: &str,
+        state: &Path,
+        branch: &str,
+        interrupt: &Interrupt,
+    ) -> Result<String, TrunkError> {
+        let tracking = format!("refs/expl/trunk/{remote}/{branch}");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(state.join("fetch.lock"))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(tracking),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        let stamp = state.join("fetch-stamp");
+        if let Ok(metadata) = std::fs::metadata(&stamp)
+            && metadata
+                .modified()?
+                .elapsed()
+                .is_ok_and(|age| age < Duration::from_secs(2))
+            && std::fs::read_to_string(&stamp)? == tracking
+        {
+            return Ok(tracking);
+        }
+        self.git.run(&["remote", "get-url", "--", remote])?;
+        self.git.network(
+            &[
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--",
+                remote,
+                &format!("+refs/heads/{branch}:{tracking}"),
+            ],
+            interrupt,
+        )?;
+        let tip = self.git.resolve_commit(&tracking)?;
+        self.git
+            .run(&["update-ref", &format!("refs/expl/origins/{tip}"), &tip])?;
+        std::fs::write(stamp, &tracking)?;
+        Ok(tracking)
+    }
+
     /// Read the trunk's tip and what it adopts relative to the active
     /// origin. `None` when there is no trunk to follow, or it has not moved.
     fn observe(&self, graph: &Graph) -> Result<Option<Observation>, TrunkError> {
@@ -209,9 +279,14 @@ impl Trunk {
         else {
             return Ok(None);
         };
+        let reference = if let Some((remote, state, interrupt)) = &self.remote {
+            self.fetch(remote, state, &branch, interrupt)?
+        } else {
+            format!("refs/heads/{branch}")
+        };
         let commit = self
             .git
-            .resolve_commit(&format!("refs/heads/{branch}"))
+            .resolve_commit(&reference)
             .map_err(|_| TrunkError::MissingBranch(branch.clone()))?;
         let previous = current.head_commit.clone().unwrap_or_default();
         if commit == previous {
@@ -373,7 +448,7 @@ mod tests {
     /// helper that realises a step as a commit on its own branch.
     struct Fixture {
         _dir: tempfile::TempDir,
-        root: std::path::PathBuf,
+        root: PathBuf,
         project: Project,
         graph: Graph,
     }

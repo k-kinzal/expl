@@ -1,10 +1,9 @@
 //! [`Process`] — one consumer worker: lease an event, react, acknowledge.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use expl_runtime::worker::{Active, with_heartbeat};
 use opentelemetry::KeyValue;
 use thiserror::Error;
 
@@ -111,7 +110,7 @@ pub trait ProcessObserver: Sync {
 }
 
 /// The lease a process is reacting under, shared with its heartbeat.
-type Held = Mutex<Option<(Delivery, Interrupt)>>;
+type Held = Active<Delivery>;
 
 /// `Ok(None)` when the lease was lost.
 fn holding<T>(result: Result<T, InboxError>) -> Result<Option<T>, ProcessError> {
@@ -170,62 +169,52 @@ impl<'a> Process<'a> {
         let telemetry = WorkerTelemetry::new(observer, self.consumer, &record);
         telemetry.observe(&ProcessActivity::Started(&record));
 
-        let finished = AtomicBool::new(false);
-        let held = Held::default();
-        let result = thread::scope(|scope| {
-            scope.spawn(|| self.beat(&finished, &held));
-            let result = self.serve(&processes, &held, options, &telemetry);
-            finished.store(true, Ordering::SeqCst);
-            result
-        });
+        let database = project.database_path();
+        let mut heartbeat = None;
+        let result = with_heartbeat(
+            Duration::from_secs(HEARTBEAT_SECONDS),
+            move |held| {
+                if self
+                    .context
+                    .authority()
+                    .is_some_and(|authority| !authority.is_live())
+                {
+                    self.interrupt.raise();
+                }
+                if heartbeat.is_none() {
+                    heartbeat = Processes::open(&database, &project.processes_dir())
+                        .ok()
+                        .zip(Inbox::open(&database, self.consumer.name()).ok());
+                }
+                if let Some((processes, inbox)) = &heartbeat {
+                    self.beat(processes, inbox, held);
+                }
+            },
+            |held| self.serve(&processes, held, options, &telemetry),
+        );
         let reason = match &result {
             Ok(reason) => reason.clone(),
             Err(error) => format!("error: {error}"),
         };
         telemetry.observe(&ProcessActivity::Exiting(&reason));
-        processes.exit(self.id, &reason)?;
+        if self
+            .context
+            .authority()
+            .is_none_or(expl_runtime::cluster::Authority::is_live)
+        {
+            processes.exit(self.id, &reason)?;
+        }
         result
     }
 
     /// Heartbeat: prove liveness, renew the held lease (interrupting the
     /// reaction when it is lost), and turn a recorded stop request into an
     /// interrupt.
-    fn beat(&self, finished: &AtomicBool, held: &Held) {
-        let project = self.context.project();
-        let database = project.database_path();
-        let (Ok(processes), Ok(inbox)) = (
-            Processes::open(&database, &project.processes_dir()),
-            Inbox::open(&database, self.consumer.name()),
-        ) else {
-            return;
-        };
-        let tick = Duration::from_millis(100);
-        let mut elapsed = Duration::ZERO;
-        while !finished.load(Ordering::SeqCst) {
-            if elapsed.is_zero() {
-                if let Ok(true) = processes.heartbeat(self.id) {
-                    self.interrupt.raise();
-                }
-                // Locked while renewing, so a lease being settled is not
-                // renewed (nor reported lost) after it was given up.
-                let held = held
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some((delivery, interrupt)) = held.as_ref() {
-                    match inbox.renew(delivery) {
-                        Err(InboxError::LeaseLost { .. }) => interrupt.lose_lease(),
-                        // A failed renewal only shortens the lease; the next
-                        // beat retries.
-                        Ok(()) | Err(InboxError::Sqlite(_)) => {}
-                    }
-                }
-            }
-            thread::sleep(tick);
-            elapsed += tick;
-            if elapsed >= Duration::from_secs(HEARTBEAT_SECONDS) {
-                elapsed = Duration::ZERO;
-            }
+    fn beat(&self, processes: &Processes, inbox: &Inbox, held: &Held) {
+        if matches!(processes.heartbeat(self.id), Ok(true)) {
+            self.interrupt.raise();
         }
+        held.renew(|delivery| !matches!(inbox.renew(delivery), Err(InboxError::LeaseLost { .. })));
     }
 
     fn serve(
@@ -253,7 +242,11 @@ impl<'a> Process<'a> {
             .is_some_and(|route| route.groups(self.consumer.name()).next().is_some());
         let mut inbox = Inbox::open(&database, self.consumer.name())?;
         let mut graph = Graph::open(&database)?;
-        let trunk = Trunk::new(project, declaration.trunk.as_deref());
+        let trunk = Trunk::new(project, declaration.trunk.as_deref()).with_remote(
+            project,
+            declaration.workspace.remote.as_deref(),
+            &self.interrupt,
+        );
         let weighted = route.is_none()
             && declaration.legacy_shares_with(self.consumer.name(), self.consumer.name());
         let mut activity = "";
@@ -380,16 +373,11 @@ impl<'a> Process<'a> {
 
             let covered = graph.last_event()?;
             let interrupt = self.interrupt.for_reaction();
-            *held
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some((delivery.clone(), interrupt.clone()));
             let reaction =
                 Reaction::new(self.context, self.consumer, self.id, &delivery, &interrupt);
-            let result = handler.react(&reaction, &mut graph);
-            held.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
+            let result = held.react(delivery.clone(), &interrupt, || {
+                handler.react(&reaction, &mut graph)
+            });
             let lost = || observer.observe(&ProcessActivity::LeaseLost(&delivery));
             match result {
                 _ if interrupt.lease_lost() => lost(),
@@ -608,6 +596,8 @@ fn random_below(bound: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use crate::event::{EventId, EventKind};
     use crate::graph::{Answer, NodeStatus};

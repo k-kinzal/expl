@@ -35,6 +35,11 @@ impl Consumer {
         })
     }
 
+    pub(crate) fn with_cluster(mut self, cluster: expl_runtime::cluster::Cluster) -> Self {
+        self.agent = self.agent.with_cluster(cluster);
+        self
+    }
+
     /// The name used to track subscriptions, deliveries and processes.
     #[must_use]
     pub fn name(&self) -> &str {

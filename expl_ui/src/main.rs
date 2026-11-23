@@ -1,8 +1,8 @@
 //! `expl-ui` — a live window onto an expl exploration.
 //!
 //! It only reads: the graph (nodes, edges, verdicts, and the trunk's
-//! lineage of origins), the process table, and the event log, polled from
-//! `.expl/expl.db`. Everything it shows is also
+//! lineage of origins), and the process table. It polls the daemon for
+//! managed projects and reads the local database otherwise. Everything it shows is also
 //! available from `expl graph show`, `expl ps`, and `expl event ls`; the
 //! window just shows it at once and keeps it current.
 

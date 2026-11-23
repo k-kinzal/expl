@@ -51,6 +51,14 @@ pub(crate) struct Cli {
     #[arg(short = 'C', global = true, value_name = "DIR")]
     pub(crate) directory: Option<PathBuf>,
 
+    /// Shared daemon directory. A managed checkout uses its saved directory by default.
+    #[arg(long, global = true, env = "EXPL_CLUSTER", value_name = "DIR")]
+    pub(crate) cluster: Option<PathBuf>,
+
+    /// Daemon member to run or contact.
+    #[arg(long, global = true, env = "EXPL_MEMBER", default_value = "local")]
+    pub(crate) member: String,
+
     /// Subcommand to dispatch.
     #[command(subcommand)]
     pub(crate) command: Command,
@@ -59,6 +67,14 @@ pub(crate) struct Cli {
 /// Top-level subcommands.
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Serve the project as leader or member. A single daemon elects itself.
+    Daemon,
+    /// Show the selected daemon and the elected leader.
+    Cluster(ClusterArgs),
+    #[command(hide = true)]
+    RuntimeOverview,
+    #[command(hide = true)]
+    RuntimeJob { name: String, peer: String },
     /// Initialise expl in the current git repository.
     #[command(
         long_about = "Create .expl/ (database, worktrees, logs), write expl.toml if absent, \
@@ -126,6 +142,18 @@ pub(crate) enum Command {
     Kill(ProcessTargetsArgs),
     /// Remove exited processes (alias of `expl process rm`).
     Rm(ProcessRmArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ClusterArgs {
+    #[command(subcommand)]
+    pub(crate) command: ClusterCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ClusterCommand {
+    /// Show the daemon role and the current leader as JSON.
+    Status,
 }
 
 /// `expl init`.

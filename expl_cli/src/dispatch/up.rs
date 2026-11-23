@@ -43,6 +43,9 @@ pub(crate) fn up(start: &Path, args: &UpArgs) -> Result<(), CliError> {
             status(&format!("{name}: {running}/{} running", consumer.replicas));
             continue;
         }
+        if context.authority().is_some() {
+            table.retire_dead(name)?;
+        }
         for _ in running..consumer.replicas {
             // Reuse `expl run -d` so `up` and `run -d` start processes the
             // same way; it prints the process name on stdout.

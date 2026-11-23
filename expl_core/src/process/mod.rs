@@ -12,14 +12,13 @@
 //! it held expire so its events are delivered again.
 
 mod capacity;
-mod interrupt;
 // Defining module named for the concept it defines — the path echo is deliberate.
 mod process;
 mod processes;
 mod record;
 mod telemetry;
 
-pub use interrupt::Interrupt;
+pub use expl_runtime::Interrupt;
 pub use process::{
     MAX_ATTEMPTS, Process, ProcessActivity, ProcessError, ProcessObserver, ProcessOptions,
 };

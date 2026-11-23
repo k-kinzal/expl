@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use expl_runtime::event::{Disposition, Lease as RuntimeLease, Settlement};
 use rusqlite::{Connection, OptionalExtension, named_params, params};
 
 use crate::declaration::{Declaration, Route};
@@ -345,17 +346,13 @@ impl Inbox {
                 params![self.consumer, id, exclusive, node],
             )?;
         }
-        let token: String = tx.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
-        tx.execute(
-            &format!(
-                "INSERT INTO deliveries \
-                 (agent, event_id, status, process_id, attempts, leased_until, lease_token) \
-                 VALUES (?1, ?2, 'leased', ?3, 1, {EPOCH} + {LEASE_SECONDS}, ?4) \
-                 ON CONFLICT (agent, event_id) DO UPDATE SET status = 'leased', \
-                 process_id = ?3, attempts = ?5, \
-                 leased_until = {EPOCH} + {LEASE_SECONDS}, lease_token = ?4, updated_at = {NOW}"
-            ),
-            params![self.consumer, id, process.0, token, attempts + 1],
+        let token = RuntimeLease::grant(
+            &tx,
+            &self.consumer,
+            id,
+            process.0,
+            attempts + 1,
+            LEASE_SECONDS,
         )?;
         tx.commit()?;
         Ok(Lease::Granted(
@@ -375,12 +372,26 @@ impl Inbox {
         }
     }
 
-    /// `Ok` when `changed` rows prove the lease of `delivery` was held.
-    fn settled(&self, delivery: &Delivery, changed: usize) -> Result<(), InboxError> {
-        if changed == 0 {
-            Err(self.lost(delivery))
-        } else {
-            Ok(())
+    fn lease_identity<'a>(&'a self, delivery: &'a Delivery) -> RuntimeLease<'a> {
+        RuntimeLease {
+            consumer: &self.consumer,
+            event: delivery.event.id.0,
+            token: delivery.token.as_str(),
+        }
+    }
+
+    fn settle(
+        &self,
+        delivery: &Delivery,
+        disposition: Disposition<'_>,
+    ) -> Result<bool, InboxError> {
+        match self
+            .lease_identity(delivery)
+            .settle(&self.conn, disposition)?
+        {
+            Settlement::Lost => Err(self.lost(delivery)),
+            Settlement::Retrying => Ok(true),
+            Settlement::Settled => Ok(false),
         }
     }
 
@@ -391,14 +402,8 @@ impl Inbox {
     /// [`InboxError::LeaseLost`] when this lease is no longer held;
     /// otherwise SQLite failure.
     pub fn ack(&self, delivery: &Delivery, note: Option<&str>) -> Result<(), InboxError> {
-        let changed = self.conn.execute(
-            &format!(
-                "UPDATE deliveries SET status = 'done', leased_until = NULL, lease_token = NULL, \
-                 note = ?4, updated_at = {NOW} WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE}"
-            ),
-            params![self.consumer, delivery.event.id.0, delivery.token.0, note],
-        )?;
-        self.settled(delivery, changed)
+        self.settle(delivery, Disposition::Acknowledge(note))
+            .map(drop)
     }
 
     /// While holding `delivery`, acknowledge every not-yet-handled event of
@@ -464,15 +469,7 @@ impl Inbox {
     /// [`InboxError::LeaseLost`] when this lease is no longer held;
     /// otherwise SQLite failure.
     pub fn release(&self, delivery: &Delivery) -> Result<(), InboxError> {
-        let changed = self.conn.execute(
-            &format!(
-                "UPDATE deliveries SET status = 'pending', leased_until = NULL, \
-                 lease_token = NULL, attempts = MAX(attempts - 1, 0), updated_at = {NOW} \
-                 WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE}"
-            ),
-            params![self.consumer, delivery.event.id.0, delivery.token.0],
-        )?;
-        self.settled(delivery, changed)
+        self.settle(delivery, Disposition::Release).map(drop)
     }
 
     /// The reaction to `delivery` failed: deliver it again later, or give
@@ -488,29 +485,13 @@ impl Inbox {
         error: &str,
         max_attempts: i64,
     ) -> Result<bool, InboxError> {
-        let status: Option<String> = self
-            .conn
-            .query_row(
-                &format!(
-                    "UPDATE deliveries SET \
-                     status = CASE WHEN attempts < ?5 THEN 'pending' ELSE 'failed' END, \
-                     leased_until = NULL, lease_token = NULL, note = ?4, updated_at = {NOW} \
-                     WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE} RETURNING status"
-                ),
-                params![
-                    self.consumer,
-                    delivery.event.id.0,
-                    delivery.token.0,
-                    error,
-                    max_attempts
-                ],
-                |r| r.get(0),
-            )
-            .optional()?;
-        match status {
-            Some(status) => Ok(status == "pending"),
-            None => Err(self.lost(delivery)),
-        }
+        self.settle(
+            delivery,
+            Disposition::Retry {
+                note: error,
+                max_attempts,
+            },
+        )
     }
 
     /// The reaction to `delivery` failed and must not be retried, whatever
@@ -521,15 +502,7 @@ impl Inbox {
     /// [`InboxError::LeaseLost`] when this lease is no longer held;
     /// otherwise SQLite failure.
     pub fn give_up(&self, delivery: &Delivery, error: &str) -> Result<(), InboxError> {
-        let changed = self.conn.execute(
-            &format!(
-                "UPDATE deliveries SET status = 'failed', leased_until = NULL, \
-                 lease_token = NULL, note = ?4, updated_at = {NOW} \
-                 WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE}"
-            ),
-            params![self.consumer, delivery.event.id.0, delivery.token.0, error],
-        )?;
-        self.settled(delivery, changed)
+        self.settle(delivery, Disposition::Fail(error)).map(drop)
     }
 
     /// Deliveries of `kinds` whose holder died on their last attempt: the
@@ -609,14 +582,14 @@ impl Inbox {
     /// [`InboxError::LeaseLost`] when this lease is no longer held;
     /// otherwise SQLite failure.
     pub fn renew(&self, delivery: &Delivery) -> Result<(), InboxError> {
-        let changed = self.conn.execute(
-            &format!(
-                "UPDATE deliveries SET leased_until = {EPOCH} + {LEASE_SECONDS} \
-                 WHERE agent = ?1 AND event_id = ?2 AND {HELD_LEASE}"
-            ),
-            params![self.consumer, delivery.event.id.0, delivery.token.0],
-        )?;
-        self.settled(delivery, changed)
+        if self
+            .lease_identity(delivery)
+            .renew(&self.conn, LEASE_SECONDS)?
+        {
+            Ok(())
+        } else {
+            Err(self.lost(delivery))
+        }
     }
 
     /// Events of `kinds` not yet handled by this consumer (pending, never

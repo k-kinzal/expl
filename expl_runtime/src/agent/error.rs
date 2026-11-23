@@ -13,6 +13,9 @@ pub enum AgentError {
     /// I/O while talking to the child or writing its log.
     #[error("agent I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    /// The selected cluster member or command transport became unavailable.
+    #[error("agent transport failed: {0}")]
+    Transport(#[source] std::io::Error),
     /// The CLI reported failure in its own dialect.
     #[error("agent failed{}: {message}", code.map(|c| format!(" (exit {c})")).unwrap_or_default())]
     Failed {
@@ -49,10 +52,13 @@ pub enum AgentError {
 }
 
 impl AgentError {
-    pub(crate) fn telemetry_kind(&self) -> &'static str {
+    /// Stable category for metrics and tracing.
+    #[must_use]
+    pub fn telemetry_kind(&self) -> &'static str {
         match self {
             Self::Launch(_) => "agent.launch",
             Self::Io(_) => "agent.io",
+            Self::Transport(_) => "agent.transport",
             Self::Failed { .. } => "agent.failed",
             Self::Interrupted => "agent.interrupted",
             Self::TimedOut { .. } => "agent.timeout",

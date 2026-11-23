@@ -67,6 +67,11 @@ pub trait AgentDriver: Send + Sync {
     /// The closed discriminant of this driver.
     fn kind(&self) -> DriverKind;
 
+    /// A short label for this driver in logs and traces.
+    fn label(&self) -> &'static str {
+        self.kind().label()
+    }
+
     /// Outbound: assemble one invocation for `request`.
     ///
     /// # Errors

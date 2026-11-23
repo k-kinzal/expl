@@ -1724,6 +1724,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "expl_core",
+ "expl_runtime",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -1740,9 +1741,24 @@ dependencies = [
 name = "expl_core"
 version = "0.1.0"
 dependencies = [
+ "expl_runtime",
  "humantime",
  "opentelemetry",
  "opentelemetry_sdk",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "expl_runtime"
+version = "0.1.0"
+dependencies = [
+ "humantime",
+ "opentelemetry",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1759,6 +1775,7 @@ dependencies = [
  "clap",
  "expl_core",
  "gpui",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
 ]

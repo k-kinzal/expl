@@ -54,6 +54,9 @@ pub(crate) enum CliError {
     /// Agent.
     #[error(transparent)]
     Agent(#[from] AgentError),
+    /// Project view for the window client.
+    #[error(transparent)]
+    Overview(expl_core::overview::OverviewError),
     /// Checking the graph against git.
     #[error(transparent)]
     Doctor(#[from] DoctorError),
@@ -102,6 +105,7 @@ impl CliError {
             | Self::Handler(_)
             | Self::Process(_)
             | Self::Agent(_)
+            | Self::Overview(_)
             | Self::Doctor(_)
             | Self::Io { .. } => exit::RUNTIME,
         }

@@ -12,11 +12,7 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 
-/// Timestamp expression for every `*_at` text column (UTC, RFC 3339).
-pub(crate) const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
-
-/// Unix-seconds expression for lease and heartbeat arithmetic.
-pub(crate) const EPOCH: &str = "CAST(strftime('%s','now') AS INTEGER)";
+pub(crate) use expl_runtime::event::{EPOCH, NOW};
 
 /// Opening or migrating the database failed.
 #[derive(Debug, thiserror::Error)]
@@ -24,6 +20,14 @@ pub enum StoreError {
     /// SQLite failure.
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// SQLite could not apply the required journal mode.
+    #[error("database requires {expected} journaling, got {actual}")]
+    JournalMode {
+        /// Required journal mode.
+        expected: &'static str,
+        /// Actual mode reported by SQLite.
+        actual: String,
+    },
     /// The database was created by a newer expl.
     #[error("database schema version {found} is newer than supported version {supported}")]
     SchemaTooNew {
@@ -220,6 +224,11 @@ UPDATE assignments SET role = 'verification' WHERE role = 'execution';
 ALTER TABLE events ADD COLUMN traceparent TEXT;
 ALTER TABLE events ADD COLUMN tracestate TEXT;
 ",
+    r"
+ALTER TABLE processes ADD COLUMN resume INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE processes ADD COLUMN run_once INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE processes ADD COLUMN exit_when_idle INTEGER NOT NULL DEFAULT 0;
+",
 ];
 
 const CONCLUSIONS_MIGRATION: &str = r"
@@ -259,26 +268,41 @@ CREATE UNIQUE INDEX deliveries_token ON deliveries (lease_token) WHERE lease_tok
 pub fn open(path: &Path) -> Result<Connection, StoreError> {
     let mut conn = Connection::open(path)?;
     conn.busy_timeout(Duration::from_secs(30))?;
-    wal(&conn)?;
+    let shared = path
+        .parent()
+        .is_some_and(|dir| dir.join("cluster").is_file());
+    journal(&conn, if shared { "DELETE" } else { "WAL" })?;
+    if shared {
+        conn.pragma_update(None, "synchronous", "FULL")?;
+    }
     conn.pragma_update(None, "foreign_keys", true)?;
     migrate(&mut conn)?;
     Ok(conn)
 }
 
-/// Switch `conn` to WAL. Switching a new database needs it to itself, and
-/// SQLite reports a busy one at once rather than waiting, so a process
+/// Use rollback journaling on clustered storage. The WAL index is only
+/// shared by processes on one host. Switching modes needs exclusive access;
+/// SQLite can report a busy database at once rather than waiting, so a process
 /// opening it alongside another retries for as long as the busy timeout.
-fn wal(conn: &Connection) -> Result<(), StoreError> {
+fn journal(conn: &Connection, mode: &'static str) -> Result<(), StoreError> {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        match conn.pragma_update(None, "journal_mode", "WAL") {
+        match conn
+            .pragma_update_and_check(None, "journal_mode", mode, |row| row.get::<_, String>(0))
+        {
             Err(rusqlite::Error::SqliteFailure(error, _))
                 if error.code == rusqlite::ErrorCode::DatabaseBusy
                     && std::time::Instant::now() < deadline =>
             {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            result => return Ok(result?),
+            Ok(actual) if !actual.eq_ignore_ascii_case(mode) => {
+                return Err(StoreError::JournalMode {
+                    expected: mode,
+                    actual,
+                });
+            }
+            result => return result.map(drop).map_err(StoreError::from),
         }
     }
 }
@@ -344,6 +368,40 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_database_from_before_daemons_keeps_its_events_and_gains_recovery_fields() {
+        let dir = tempfile::tempdir().expect("project directory");
+        let path = dir.path().join("expl.db");
+        let conn = Connection::open(&path).expect("database");
+        let version = MIGRATIONS.len() - 1;
+        for sql in &MIGRATIONS[..version] {
+            conn.execute_batch(sql).expect("old migration");
+        }
+        conn.pragma_update(None, "user_version", version as i64)
+            .expect("old version");
+        conn.execute(
+            "INSERT INTO events (kind, traceparent) VALUES ('goal.added', 'trace')",
+            [],
+        )
+        .expect("an existing event");
+        drop(conn);
+        std::fs::write(dir.path().join("cluster"), "shared").expect("managed marker");
+        let conn = open(&path).expect("migrate");
+        let trace: String = conn
+            .query_row("SELECT traceparent FROM events", [], |row| row.get(0))
+            .expect("existing trace");
+        assert_eq!(trace, "trace");
+        let columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('processes')
+             WHERE name IN ('resume', 'run_once', 'exit_when_idle')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("new columns");
+        assert_eq!(columns, 3);
+    }
 
     #[test]
     fn either_version_nine_schema_migrates_to_both_features() {

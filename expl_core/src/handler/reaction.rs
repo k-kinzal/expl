@@ -83,6 +83,10 @@ impl<'a> Reaction<'a> {
         self.interrupt.lease_lost()
     }
 
+    pub(crate) fn interrupt(&self) -> &Interrupt {
+        self.interrupt
+    }
+
     /// The node the event is about.
     ///
     /// # Errors
@@ -258,7 +262,12 @@ impl<'a> Reaction<'a> {
             .map_err(HandlerError::from);
         let outcome = match scratch {
             Some(scratch)
-                if !matches!(outcome, Err(HandlerError::Agent(AgentError::Interrupted))) =>
+                if !matches!(
+                    outcome,
+                    Err(HandlerError::Agent(
+                        AgentError::Interrupted | AgentError::Transport(_)
+                    ))
+                ) =>
             {
                 match scratch.changes() {
                     Ok(changes) if changes.is_empty() => outcome,

@@ -12,7 +12,7 @@ mod node;
 mod origin;
 mod path;
 mod process;
-mod run;
+pub(crate) mod run;
 mod up;
 
 use std::path::Path;
@@ -32,6 +32,15 @@ pub(crate) fn dispatch(cli: Cli) -> Result<(), CliError> {
         None => std::env::current_dir().map_err(|e| CliError::io("current directory", e))?,
     };
     match cli.command {
+        Command::Daemon | Command::Cluster(_) | Command::RuntimeJob { .. } => Err(CliError::Usage(
+            "daemon command must run at the client entry point".to_owned(),
+        )),
+
+        Command::RuntimeOverview => {
+            let project = Project::discover(&start)?;
+            let view = expl_core::overview::Overview::load(&project).map_err(CliError::Overview)?;
+            crate::output::json_pretty(&view)
+        }
         Command::Init(args) => init::init(&start, &args),
         Command::Doctor(args) => doctor::doctor(&start, &args),
         Command::Goal(command) => goal::goal(&start, command),
@@ -65,7 +74,11 @@ pub(crate) fn open(start: &Path) -> Result<(Project, Graph), CliError> {
 pub(crate) fn load(start: &Path) -> Result<Context, CliError> {
     let project = Project::discover(start)?;
     let declaration = Declaration::load(&project.declaration_path())?;
-    Ok(Context::new(project, declaration))
+    let context = Context::new(project, declaration);
+    Ok(match crate::daemon::authority()? {
+        Some(authority) => context.with_authority(authority),
+        None => context,
+    })
 }
 
 /// The process table of `project`.

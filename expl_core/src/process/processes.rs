@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
+use crate::process::ProcessOptions;
 use crate::process::{ProcessId, ProcessRecord, ProcessState, ProcessStatus};
 use crate::store::{self, EPOCH, NOW, StoreError};
 
@@ -98,13 +99,37 @@ impl Processes {
         name: Option<&str>,
         detached: bool,
     ) -> Result<ProcessRecord, rusqlite::Error> {
+        self.register(consumer, name, detached, None)
+    }
+
+    /// Register a detached worker whose configuration survives a promotion.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failure, including a duplicate name.
+    pub fn create_resumable(
+        &mut self,
+        consumer: &str,
+        name: Option<&str>,
+        options: ProcessOptions,
+    ) -> Result<ProcessRecord, rusqlite::Error> {
+        self.register(consumer, name, true, Some(options))
+    }
+
+    fn register(
+        &mut self,
+        consumer: &str,
+        name: Option<&str>,
+        detached: bool,
+        resume: Option<ProcessOptions>,
+    ) -> Result<ProcessRecord, rusqlite::Error> {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             &format!(
-                "INSERT INTO processes (name, agent, status, detached, log_path, start_by) \
-                 VALUES (?1, ?2, 'created', ?3, '', {EPOCH} + {STARTUP_SECONDS})"
+                "INSERT INTO processes (name, agent, status, detached, log_path, start_by, resume, run_once, exit_when_idle) \
+                 VALUES (?1, ?2, 'created', ?3, '', {EPOCH} + {STARTUP_SECONDS}, ?4, ?5, ?6)"
             ),
             params![
                 name.map_or_else(
@@ -112,7 +137,10 @@ impl Processes {
                     str::to_owned
                 ),
                 consumer,
-                detached
+                detached,
+                resume.is_some(),
+                resume.is_some_and(|options| options.once),
+                resume.is_some_and(|options| options.exit_when_idle),
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -124,6 +152,78 @@ impl Processes {
         )?;
         tx.commit()?;
         self.get(ProcessId(id))
+    }
+
+    /// Retire restart requests from dead workers being replaced by `up`.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failure.
+    pub fn retire_dead(&self, consumer: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            &format!(
+                "UPDATE processes SET resume = 0 WHERE resume = 1
+                      AND agent = ?1 AND status = 'running'
+                      AND heartbeat_at < {EPOCH} - {STALE_SECONDS}"
+            ),
+            [consumer],
+        )?;
+        Ok(())
+    }
+
+    /// Recover the queue and the desired detached workers for a new term.
+    /// The elected daemon calls this under the exclusive handover barrier.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failure.
+    pub fn recover(&mut self) -> Result<Vec<(ProcessRecord, ProcessOptions)>, rusqlite::Error> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            &format!(
+                "UPDATE processes SET status = 'exited', activity = NULL, resume = 0,
+                 exit_reason = 'leader changed', finished_at = {NOW}
+                 WHERE status <> 'exited' AND (resume = 0 OR stop_requested = 1)"
+            ),
+            [],
+        )?;
+        tx.execute(
+            &format!(
+                "UPDATE processes SET status = 'created', pid = NULL, heartbeat_at = NULL,
+                 activity = NULL, start_by = {EPOCH} + {STARTUP_SECONDS}
+                 WHERE resume = 1 AND stop_requested = 0"
+            ),
+            [],
+        )?;
+        tx.execute(
+            "UPDATE deliveries SET leased_until = 0 WHERE status = 'leased'",
+            [],
+        )?;
+        tx.execute(&format!(
+            "UPDATE agent_runs SET status = 'interrupted', error = 'leader changed', finished_at = {NOW}
+             WHERE status = 'running'"
+        ), [])?;
+        let workers = {
+            let mut query = tx.prepare(&format!(
+                "SELECT {COLUMNS}, run_once, exit_when_idle FROM processes
+                 WHERE resume = 1 AND stop_requested = 0 ORDER BY id"
+            ))?;
+            query
+                .query_map([], |row| {
+                    Ok((
+                        record_from_row(row)?,
+                        ProcessOptions {
+                            once: row.get(15)?,
+                            exit_when_idle: row.get(16)?,
+                        },
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        tx.commit()?;
+        Ok(workers)
     }
 
     /// The record with `id`.
@@ -228,7 +328,7 @@ impl Processes {
             // abandoned by someone else since it was read.
             let changed = self.conn.execute(
                 &format!(
-                    "UPDATE processes SET status = 'exited', activity = NULL, exit_reason = ?2, \
+                    "UPDATE processes SET status = 'exited', activity = NULL, resume = 0, exit_reason = ?2, \
                      finished_at = {NOW} WHERE id = ?1 AND {EXPIRED}"
                 ),
                 params![id, reason],
@@ -295,7 +395,7 @@ impl Processes {
     pub fn exit(&self, id: ProcessId, reason: &str) -> Result<(), rusqlite::Error> {
         self.conn.execute(
             &format!(
-                "UPDATE processes SET status = 'exited', activity = NULL, exit_reason = ?2, \
+                "UPDATE processes SET status = 'exited', activity = NULL, resume = 0, exit_reason = ?2, \
                  finished_at = {NOW} WHERE id = ?1"
             ),
             params![id.0, reason],

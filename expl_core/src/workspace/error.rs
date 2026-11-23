@@ -72,6 +72,15 @@ pub enum WorkspaceError {
     },
 }
 
+impl From<expl_runtime::git::CloneError> for WorkspaceError {
+    fn from(error: expl_runtime::git::CloneError) -> Self {
+        match error {
+            expl_runtime::git::CloneError::Git(error) => Self::Git(error),
+            expl_runtime::git::CloneError::Io(error) => Self::Io(error),
+        }
+    }
+}
+
 /// How [`WorkspaceError::LeftBranch`] names where HEAD points.
 fn describe_head(head: Option<&str>) -> String {
     match head {

@@ -1,10 +1,8 @@
 //! The project declaration in `expl.toml`: event consumers and routing.
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -13,6 +11,8 @@ use crate::agent::DriverKind;
 use crate::event::{EventId, EventKind};
 use crate::handler::Handler;
 use crate::project::Project;
+
+pub use expl_runtime::command::{CliDeclaration, Timeout, TimeoutError};
 
 mod routing;
 
@@ -56,68 +56,6 @@ pub enum DeclarationError {
         #[source]
         source: TimeoutError,
     },
-}
-
-/// A declared [`Timeout`] is not a usable duration.
-#[derive(Debug, Error)]
-pub enum TimeoutError {
-    /// The value is zero or negative.
-    #[error("`{0}` is not a positive duration")]
-    NotPositive(Timeout),
-    /// The text is not a duration.
-    #[error("`{value}` is not a duration: {source}")]
-    Unparsable {
-        /// The declared text.
-        value: String,
-        /// Underlying error.
-        #[source]
-        source: humantime::DurationError,
-    },
-}
-
-/// How long one CLI attempt may run before expl stops it: whole seconds
-/// (`timeout = 1800`) or a humantime string (`timeout = "30m"`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Timeout {
-    /// Whole seconds.
-    Seconds(i64),
-    /// A humantime duration such as `"90s"` or `"1h 30m"`.
-    Text(String),
-}
-
-impl Timeout {
-    /// The declared duration.
-    ///
-    /// # Errors
-    ///
-    /// [`TimeoutError`] when the value is zero, negative, or not a duration.
-    pub fn duration(&self) -> Result<Duration, TimeoutError> {
-        let duration = match self {
-            Self::Seconds(seconds) => u64::try_from(*seconds)
-                .map(Duration::from_secs)
-                .map_err(|_| TimeoutError::NotPositive(self.clone()))?,
-            Self::Text(text) => humantime::parse_duration(text.trim()).map_err(|source| {
-                TimeoutError::Unparsable {
-                    value: text.clone(),
-                    source,
-                }
-            })?,
-        };
-        if duration.is_zero() {
-            return Err(TimeoutError::NotPositive(self.clone()));
-        }
-        Ok(duration)
-    }
-}
-
-impl fmt::Display for Timeout {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Seconds(seconds) => write!(f, "{seconds}"),
-            Self::Text(text) => f.write_str(text),
-        }
-    }
 }
 
 /// The whole `expl.toml`, with legacy declarations normalized to consumers.
@@ -228,6 +166,9 @@ pub struct WorkspaceDeclaration {
     /// clone and may change them there; the change stays in the clone.
     #[serde(default)]
     pub frozen: Vec<String>,
+    /// Optional Git remote to follow and publish committed hypotheses to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
 }
 
 /// One `[consumer.<name>]`: when to react, what to do, and how to run it.
@@ -303,26 +244,6 @@ pub enum Scope {
     Node,
     /// The whole graph at once.
     Graph,
-}
-
-/// One alternative CLI of an agent: the same fields that declare the
-/// agent's primary CLI.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CliDeclaration {
-    /// Which driver translates for this CLI.
-    pub driver: DriverKind,
-    /// Program and leading arguments, e.g. `["codex"]`.
-    pub command: Vec<String>,
-    /// Extra arguments appended after the driver's own flags.
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Extra environment variables for this CLI, over the agent's `env`.
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-    /// How long one attempt of this CLI may run, over the agent's `timeout`.
-    #[serde(default)]
-    pub timeout: Option<Timeout>,
 }
 
 impl ConsumerDeclaration {
@@ -483,6 +404,15 @@ concurrency = 1
                 "consumer `{name}`: {what}"
             )))
         };
+        if let Some(remote) = &self.workspace.remote
+            && (remote.starts_with('-')
+                || remote.is_empty()
+                || remote.bytes().any(|byte| byte.is_ascii_whitespace()))
+        {
+            return Err(DeclarationError::Invalid(
+                "`workspace.remote` must name a configured Git remote".to_owned(),
+            ));
+        }
         if self.workspace.frozen.iter().any(|p| p.trim().is_empty()) {
             return Err(DeclarationError::Invalid(
                 "`workspace.frozen` holds an empty pathspec".to_owned(),
@@ -627,6 +557,8 @@ fn spread(mut x: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]

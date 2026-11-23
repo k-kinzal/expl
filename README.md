@@ -42,10 +42,55 @@ expl origin ls                    # the lineage: every origin, what it adopted, 
 expl down
 ```
 
+## Running a daemon
+
+Use `expl daemon` in an initialized checkout to run a standalone daemon. A single daemon elects itself and also executes commands. In another terminal, use the same `expl up`, `expl goal add`, `expl logs`, and other commands. An unmanaged checkout can still run the quick start directly.
+
+For multiple machines, put the checkout and a coordination directory on shared storage and mount both at the **same absolute paths** on all machines. Use one initialized checkout and stop any existing workers before starting the first daemon. Each machine needs Git, a compatible `expl` binary, and the configured agent commands and credentials. Run the daemons under the same service account on storage that provides cross-host file locking, coherent reads, atomic renames, and durable SQLite rollback journaling. See [SQLite's network filesystem requirements](https://sqlite.org/useovernet.html).
+
+```sh
+# On machine A
+expl -C /shared/project --cluster /shared/expl-cluster --member a daemon
+
+# On machine B
+expl -C /shared/project --cluster /shared/expl-cluster --member b daemon
+
+# From either machine, through member b
+export EXPL_MEMBER=b
+expl --cluster /shared/expl-cluster cluster status
+expl --cluster /shared/expl-cluster up
+expl --cluster /shared/expl-cluster ps
+```
+
+The checkout remembers its daemon directory, and `EXPL_MEMBER` selects the local daemon for both `expl` and `expl-ui`. The leader owns the graph, deliveries, routing, Git publication, and worker records. Members forward operations to the leader and run commands in their assigned private clones. The leader distributes commands by the number already queued or running on each member. Use the existing `replicas` and `concurrency` settings to increase parallelism.
+
+The shared election lock admits one leader. If it exits, a surviving member takes over after the previous leader's application processes release their guards. It recovers the deliveries and restarts the detached workers that were still requested. An interrupted CLI operation can be inspected through the new leader. Stop workers with `expl down` before shutting down the daemons if the workers should stay stopped.
+
+### Git remote
+
+In a managed or unmanaged checkout, set `remote = "origin"` under `[workspace]` to follow the remote trunk and publish change-step branches to that remote. The leader fetches the trunk into a private tracking ref, so the local checkout can stay where it is. Agents still work in isolated clones. Adopt a branch from your own checkout with Git, then push the updated trunk. The configured Git remote must allow the daemon's account to fetch the trunk and create branch refs.
+
+```toml
+[workspace]
+remote = "origin"
+frozen = []
+```
+
+## Building a specialized explorer
+
+[`expl_runtime`](expl_runtime/src/lib.rs) is the reusable event and agent orchestration crate. [`expl_core`](expl_core/src/lib.rs) is its general-purpose exploration application. The runtime has no dependency on Expl's graph, goal types, or four handlers.
+
+- [`event::EventLog`](expl_runtime/src/event.rs) stores named events with application-defined payloads and provides a durable inbox. Publish in the same SQLite transaction as the application change that produced the event. Implement different routing or priority rules by selecting a candidate in your own transaction and using `event::Lease` to grant, renew, and settle it. Expl uses its own graph-aware selection with those same lease operations.
+- [`worker::with_heartbeat`](expl_runtime/src/worker.rs) keeps an in-flight lease alive and interrupts the handler when its lease is replaced. Your application defines its handlers, the state they write, and the events they emit.
+- [`agent::Agent`](expl_runtime/src/agent/mod.rs) runs typed command/response contracts with built-in or custom drivers. [`git::AgentClone`](expl_runtime/src/git/agent_clone.rs) provides isolated Git workspaces with restoration and file snapshots. [`cluster::Cluster`](expl_runtime/src/cluster/mod.rs) gives the same application an elected daemon, forwarded control operations, and distributed command execution.
+
+For example, a mathematical explorer can define a literature-search event, store the resulting references in its own data model, and schedule a proof check as a command in the relevant Git workspace. The application decides how that command's result changes the search and which event to emit next.
+
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
+| `expl daemon` / `expl cluster status` | Serve a standalone or clustered project / show the selected member and current leader |
 | `expl init [--base REV] [--trunk BRANCH]` | Initialise; the first origin starts at `REV`, and the trunk to follow (default: the current branch) is written to `expl.toml` |
 | `expl goal add TITLE [--objective TEXT] [--counter] [--under GOAL]…` | Add a goal (`goal.added`); `--counter` also explores backward from it; `--under` makes it a subgoal of those goals |
 | `expl goal nest ID [--under GOAL]…` | Place an existing goal under other goals as their subgoal (none: back to the top level) |

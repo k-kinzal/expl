@@ -3,6 +3,7 @@
 #![deny(rust_2018_idioms)]
 
 mod cli;
+mod daemon;
 mod dispatch;
 mod error;
 mod observer;
@@ -15,8 +16,8 @@ use clap::Parser;
 
 fn main() -> ExitCode {
     let cli = cli::Cli::parse();
-    match dispatch::dispatch(cli) {
-        Ok(()) => ExitCode::SUCCESS,
+    match daemon::dispatch(cli) {
+        Ok(code) => ExitCode::from(code),
         Err(error) => {
             output::report_error(&error);
             ExitCode::from(error.exit_code())

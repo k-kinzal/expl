@@ -17,6 +17,7 @@ expl_core.workspace = true
 gpui.workspace = true
 thiserror.workspace = true
 clap.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

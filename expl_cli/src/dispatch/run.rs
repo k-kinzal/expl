@@ -32,9 +32,17 @@ pub(crate) fn run(start: &Path, args: &RunArgs) -> Result<(), CliError> {
     std::fs::create_dir_all(project.processes_dir())
         .map_err(|e| CliError::io("create process log directory", e))?;
 
+    let options = ProcessOptions {
+        once: args.once,
+        exit_when_idle: args.exit_when_idle,
+    };
     if args.detach {
-        let record = table.create(consumer.name(), args.name.as_deref(), true)?;
-        if let Err(error) = spawn_detached(project, &record, args) {
+        let record = if context.authority().is_some() {
+            table.create_resumable(consumer.name(), args.name.as_deref(), options)?
+        } else {
+            table.create(consumer.name(), args.name.as_deref(), true)?
+        };
+        if let Err(error) = spawn_detached(project, &record, options, None) {
             table.exit(record.id, &format!("failed to start: {error}"))?;
             return Err(error);
         }
@@ -60,10 +68,6 @@ pub(crate) fn run(start: &Path, args: &RunArgs) -> Result<(), CliError> {
     let interrupt =
         Interrupt::on_signals().map_err(|e| CliError::io("install signal handlers", e))?;
     let observer = ActivityLog::new(&record.name, tee);
-    let options = ProcessOptions {
-        once: args.once,
-        exit_when_idle: args.exit_when_idle,
-    };
     let _telemetry = Telemetry::start(project, context.declaration().telemetry.as_ref(), true);
     Process::new(&context, &consumer, record.id, interrupt).run(options, &observer)?;
     Ok(())
@@ -77,11 +81,12 @@ fn open_log(record: &ProcessRecord) -> Result<File, CliError> {
         .map_err(|e| CliError::io(format!("open {}", record.log_path), e))
 }
 
-fn spawn_detached(
+pub(crate) fn spawn_detached(
     project: &Project,
     record: &ProcessRecord,
-    args: &RunArgs,
-) -> Result<(), CliError> {
+    options: ProcessOptions,
+    authority: Option<&expl_runtime::cluster::Authority>,
+) -> Result<std::process::Child, CliError> {
     let exe = std::env::current_exe().map_err(|e| CliError::io("locate the expl binary", e))?;
     let log = open_log(record)?;
     let log_err = log
@@ -91,21 +96,23 @@ fn spawn_detached(
     command
         .arg("-C")
         .arg(project.root())
-        .args(["run", &args.consumer, "--adopt", &record.id.0.to_string()])
+        .args(["run", &record.consumer, "--adopt", &record.id.0.to_string()])
         .current_dir(project.root())
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(log_err)
         .process_group(0);
-    if args.once {
+    if let Some(authority) = authority {
+        crate::daemon::bind(&mut command, project.root(), authority)?;
+    }
+    if options.once {
         command.arg("--once");
     }
-    if args.exit_when_idle {
+    if options.exit_when_idle {
         command.arg("--exit-when-idle");
     }
     // The child outlives this command; it is not waited for.
     command
         .spawn()
-        .map(drop)
         .map_err(|e| CliError::io("start detached process", e))
 }

@@ -1,136 +1,72 @@
-//! [`Snapshot`] — everything the window shows, read from the project
-//! database in one go.
-//!
-//! The UI never holds a connection: each poll opens the database, reads a
-//! snapshot, and drops it. Writers (the processes) are never blocked for
-//! longer than one read, and the UI cannot drift from the graph.
+//! [`Snapshot`] — the data and derived relations the window shows.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use expl_core::overview::{Overview, OverviewError};
 use expl_core::{
-    AgentRunRecord, AgentRunStatus, Declaration, Edge, Evaluation, GoalTree, Graph, GraphError,
-    Lineage, Node, NodeFilter, NodeId, NodeKind, NodeStatus, PlannedPath, ProcessId, ProcessRecord,
-    ProcessState, Processes, Project, StoreError,
+    AgentRunRecord, AgentRunStatus, Evaluation, GoalTree, Lineage, Node, NodeId, NodeKind,
+    NodeStatus, ProcessId, ProcessRecord, Project,
 };
 use thiserror::Error;
 
-/// How many of the newest agent runs are kept (for per-node history).
-const RUN_TAIL: usize = 400;
-
-/// Reading a snapshot failed.
+/// Reading a project snapshot failed.
 #[derive(Debug, Error)]
 pub(crate) enum SnapshotError {
-    /// The graph could not be read.
     #[error(transparent)]
-    Graph(#[from] GraphError),
-    /// The process table could not be opened.
-    #[error(transparent)]
-    Store(#[from] StoreError),
-    /// SQLite failure outside the graph.
-    #[error("process table: {0}")]
-    Sqlite(String),
+    Overview(#[from] OverviewError),
+    #[error("could not read daemon snapshot: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("could not decode daemon snapshot: {0}")]
+    Decode(#[from] serde_json::Error),
 }
 
-/// A declared consumer, as the operator wrote it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DeclaredConsumer {
-    /// `[consumer.<name>]`.
-    pub(crate) name: String,
-    /// Its event handler.
-    pub(crate) handler: expl_core::Handler,
-    /// How many processes `expl up` keeps.
-    pub(crate) replicas: usize,
-    /// Its share under legacy inline routing.
-    pub(crate) weight: u32,
-}
-
-/// One consistent view of the project.
+/// One view of the project, with relations derived from the returned graph.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Snapshot {
-    /// Every node, by id.
-    pub(crate) nodes: Vec<Node>,
-    /// Every edge.
-    pub(crate) edges: Vec<Edge>,
-    /// Every evaluation, oldest first.
-    pub(crate) evaluations: Vec<Evaluation>,
-    /// Steps that satisfy a goal → the goals they satisfy.
-    pub(crate) satisfying: BTreeMap<NodeId, Vec<NodeId>>,
-    /// The trunk's history: every origin and what was adopted into it.
+    overview: Overview,
     pub(crate) lineage: Lineage,
-    /// Which goals are subgoals of which.
     pub(crate) goal_tree: GoalTree,
-    /// The latest plan's paths, in the planner's order.
-    pub(crate) paths: Vec<PlannedPath>,
-    /// Declared consumers (empty when `expl.toml` cannot be read).
-    pub(crate) consumers: Vec<DeclaredConsumer>,
-    /// Processes that have not exited (running, starting, or dead).
-    pub(crate) processes: Vec<ProcessRecord>,
-    /// The newest agent runs, newest first.
-    pub(crate) runs: Vec<AgentRunRecord>,
+}
+
+impl std::ops::Deref for Snapshot {
+    type Target = Overview;
+
+    fn deref(&self) -> &Overview {
+        &self.overview
+    }
 }
 
 impl Snapshot {
-    /// Read a snapshot of `project`.
-    ///
-    /// # Errors
-    ///
-    /// [`SnapshotError`] when the database cannot be read.
+    /// Read through the daemon in managed projects.
     pub(crate) fn load(project: &Project) -> Result<Self, SnapshotError> {
-        let graph = Graph::open(&project.database_path())?;
-        let processes = Processes::open(&project.database_path(), &project.processes_dir())?;
-
-        let nodes = graph.nodes(&NodeFilter::default())?;
-        let edges = graph.edges()?;
-        let evaluations = graph.evaluations()?;
-        let mut satisfying: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-        for evaluation in graph.satisfying()? {
-            satisfying
-                .entry(evaluation.node)
-                .or_default()
-                .push(evaluation.goal);
-        }
-
-        let lineage = Lineage::of(&nodes, &edges);
-        let goal_tree = GoalTree::of(&nodes, &edges);
-        let runs = graph.agent_runs(None, RUN_TAIL)?;
-        let paths = graph
-            .latest_plan()?
-            .map(|plan| plan.paths)
-            .unwrap_or_default();
-
-        let records: Vec<ProcessRecord> = processes
-            .list(true)
-            .map_err(|e| SnapshotError::Sqlite(e.to_string()))?
-            .into_iter()
-            .filter(|p| p.state != ProcessState::Exited)
-            .collect();
-
-        let consumers = Declaration::load(&project.declaration_path())
-            .map(|declaration| {
-                declaration
-                    .consumer
-                    .into_iter()
-                    .map(|(name, consumer)| DeclaredConsumer {
-                        name,
-                        handler: consumer.handler,
-                        replicas: consumer.replicas,
-                        weight: consumer.legacy_weight().unwrap_or(1),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
+        let overview = if project.cluster_path().is_file() {
+            let sibling = std::env::current_exe()?.with_file_name("expl");
+            let executable = if sibling.is_file() {
+                sibling
+            } else {
+                "expl".into()
+            };
+            let output = std::process::Command::new(executable)
+                .arg("-C")
+                .arg(project.root())
+                .arg("runtime-overview")
+                .output()?;
+            if !output.status.success() {
+                return Err(std::io::Error::other(
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                )
+                .into());
+            }
+            serde_json::from_slice::<Overview>(&output.stdout)?
+        } else {
+            Overview::load(project)?
+        };
+        let lineage = Lineage::of(&overview.nodes, &overview.edges);
+        let goal_tree = GoalTree::of(&overview.nodes, &overview.edges);
         Ok(Self {
-            nodes,
-            edges,
-            evaluations,
-            satisfying,
+            overview,
             lineage,
             goal_tree,
-            paths,
-            consumers,
-            processes: records,
-            runs,
         })
     }
 
@@ -260,7 +196,7 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use expl_core::{EventKind, Inbox};
+    use expl_core::{EventKind, Graph, Inbox};
 
     #[test]
     fn reads_nodes_edges_events_and_satisfying() {

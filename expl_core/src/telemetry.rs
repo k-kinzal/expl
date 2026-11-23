@@ -4,23 +4,13 @@
 use std::collections::HashMap;
 
 use opentelemetry::propagation::TextMapPropagator;
-use opentelemetry::trace::{Link, SpanContext, SpanKind, Status, TraceContextExt, Tracer};
+use opentelemetry::trace::{Link, SpanContext, SpanKind, TraceContextExt, Tracer};
 use opentelemetry::{Array, Context, KeyValue, Value, global};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 
 use crate::graph::{Node, NodeId};
 
-pub(crate) const SCOPE: &str = "expl";
-
-pub(crate) fn span(name: &'static str, attributes: Vec<KeyValue>) -> Context {
-    let tracer = global::tracer(SCOPE);
-    let parent = Context::current();
-    let span = tracer
-        .span_builder(name)
-        .with_attributes(attributes)
-        .start_with_context(&tracer, &parent);
-    parent.with_span(span)
-}
+pub(crate) use expl_runtime::telemetry::{SCOPE, error, span};
 
 // A delivery starts its own trace so a continuous exploration cannot grow a
 // trace indefinitely. A link retains the cause across the durable inbox.
@@ -94,10 +84,4 @@ pub(crate) fn operation<T, E>(
         error(&context, error_kind);
     }
     result
-}
-
-pub(crate) fn error(context: &Context, kind: &'static str) {
-    let span = context.span();
-    span.set_attribute(KeyValue::new("error.type", kind));
-    span.set_status(Status::error(kind));
 }

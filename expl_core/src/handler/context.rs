@@ -1,5 +1,7 @@
 //! [`Context`] — the collaborators every reaction shares.
 
+use expl_runtime::cluster::Authority;
+
 use crate::declaration::{Declaration, DeclarationError};
 use crate::event::Consumer;
 use crate::graph::{Graph, GraphError};
@@ -13,6 +15,7 @@ pub struct Context {
     project: Project,
     declaration: Declaration,
     workspaces: Workspaces,
+    authority: Option<Authority>,
 }
 
 impl Context {
@@ -24,7 +27,21 @@ impl Context {
             project,
             declaration,
             workspaces,
+            authority: None,
         }
+    }
+
+    /// Bind orchestration to an elected daemon.
+    #[must_use]
+    pub fn with_authority(mut self, authority: Authority) -> Self {
+        self.authority = Some(authority);
+        self
+    }
+
+    /// The elected daemon for this worker, if it was started through one.
+    #[must_use]
+    pub fn authority(&self) -> Option<&Authority> {
+        self.authority.as_ref()
     }
 
     /// The project.
@@ -52,7 +69,11 @@ impl Context {
     /// [`DeclarationError::UnknownConsumer`], or
     /// [`DeclarationError::Timeout`] for an unusable `timeout`.
     pub fn consumer(&self, name: &str) -> Result<Consumer, DeclarationError> {
-        Consumer::new(name, self.declaration.consumer(name)?)
+        let consumer = Consumer::new(name, self.declaration.consumer(name)?)?;
+        Ok(match &self.authority {
+            Some(authority) => consumer.with_cluster(authority.cluster().clone()),
+            None => consumer,
+        })
     }
 
     /// A fresh connection to the project's graph.
