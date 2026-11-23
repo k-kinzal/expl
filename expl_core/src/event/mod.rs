@@ -7,12 +7,11 @@
 //! [`EventKind`]s of its role, and its reaction changes the graph, which
 //! records new events for other agents.
 //!
-//! Each declared agent has its own [`Inbox`]: every agent sees every event
-//! of the kinds it reacts to (fan-out), while the processes of one agent
-//! compete for them (one [`Delivery`] each). That is where parallelism
-//! comes from — independent events are handled concurrently by as many
-//! processes as are running; events about the same node are handed to one
-//! process of an agent at a time.
+//! Each declared agent has its own [`Inbox`]. For explicitly routed roles,
+//! the inbox records one recipient before issuing a delivery. Otherwise
+//! agents see every event of the kinds they react to. The processes of
+//! each agent compete for deliveries while respecting reaction limits.
+//! Events about the same node go to one process of an agent at a time.
 //!
 //! A delivery is a lease: it is acknowledged only after the reaction
 //! succeeds. If the process dies, the lease expires and the event is
@@ -34,4 +33,5 @@ mod event;
 mod inbox;
 
 pub use event::{Event, EventId, EventKind};
+pub(crate) use inbox::Lease;
 pub use inbox::{Delivery, Inbox, InboxError, LEASE_SECONDS, LeaseToken};

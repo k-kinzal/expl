@@ -1656,6 +1656,83 @@ fn idle_exploration_revisits_random_starting_points() {
 }
 
 #[test]
+fn nested_routers_assign_one_worker_and_share_capacity_across_roles() {
+    let sandbox = sandbox();
+    let repo = &sandbox.repo;
+    let path = repo.join("expl.toml");
+    let base = std::fs::read_to_string(&path).expect("declaration");
+    let fringe = base
+        .split("\n[agent.")
+        .find(|section| section.starts_with("explorer]"))
+        .expect("explorer")
+        .replacen("explorer]", "fringe]", 1);
+    std::fs::write(
+        &path,
+        format!(
+            "{base}\n[agent.{fringe}\n{}",
+            r#"
+[routing]
+exploration = "all"
+verification = "all"
+
+[router.all]
+targets = ["explorers", "verifier"]
+policy = "first"
+concurrency = 1
+
+[router.explorers]
+targets = ["explorer", "fringe"]
+policy = "first"
+concurrency = 1
+"#
+        ),
+    )
+    .expect("declaration");
+
+    ok(repo, &["goal", "add", "G"]);
+    let step = ok(repo, &["node", "add", "Verify first", "--priority", "1"]);
+    sandbox.slow(true);
+    ok(repo, &["run", "verifier", "-d", "--once"]);
+    wait_until(repo, "verification in progress", || {
+        node(repo, &step)["agent_runs"][0]["status"] == "running"
+    });
+    // Another worker records the recipient but cannot lease its event.
+    ok(repo, &["run", "fringe", "--exit-when-idle"]);
+    let rerouted = std::fs::read_to_string(&path)
+        .expect("declaration")
+        .replace(
+            "targets = [\"explorer\", \"fringe\"]",
+            "targets = [\"fringe\", \"explorer\"]",
+        );
+    std::fs::write(&path, rerouted).expect("reordered policy");
+    let explorer = ok(repo, &["run", "explorer", "-d", "--exit-when-idle"]);
+    wait_until(repo, "explorer to wait for the shared slot", || {
+        json(&ok(repo, &["process", "inspect", &explorer]))["activity"] == "waiting for capacity"
+    });
+
+    let db = rusqlite::Connection::open(repo.join(".expl/expl.db")).expect("db");
+    let assigned: (String, i64) = db
+        .query_row(
+            "SELECT a.agent, (SELECT COUNT(*) FROM deliveries d WHERE d.event_id = e.id)
+         FROM assignments a JOIN events e ON e.id = a.event_id WHERE e.kind = 'goal.added'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("assignment");
+    assert_eq!(assigned, ("explorer".to_owned(), 0));
+
+    sandbox.slow(false);
+    wait_until(repo, "explorer to finish after the slot is freed", || {
+        json(&ok(repo, &["process", "inspect", &explorer]))["exit_reason"] == "idle"
+    });
+    assert_eq!(node(repo, &step)["node"]["status"], "completed");
+    let runs = node(repo, "1");
+    let runs = runs["agent_runs"].as_array().expect("runs");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["agent"], "explorer");
+}
+
+#[test]
 fn weighted_agents_of_one_role_split_its_events() {
     let sandbox = sandbox();
     let repo = &sandbox.repo;

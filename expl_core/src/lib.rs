@@ -48,7 +48,8 @@ pub mod workspace;
 
 pub use agent::{Agent, AgentDriver, AgentError, AgentRun, DriverKind};
 pub use declaration::{
-    AgentDeclaration, CliDeclaration, Declaration, DeclarationError, Timeout, TimeoutError,
+    AgentDeclaration, CliDeclaration, Declaration, DeclarationError, RouterDeclaration,
+    RoutingPolicy, Timeout, TimeoutError,
 };
 pub use doctor::{Doctor, DoctorError, Inconsistency, Repair};
 pub use event::{Delivery, Event, EventId, EventKind, Inbox, InboxError, LeaseToken};

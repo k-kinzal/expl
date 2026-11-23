@@ -23,8 +23,8 @@
 # All agents share one cargo target directory so that every clone does
 # not rebuild the dependencies (gpui above all) from scratch.
 #
-# Every agent runs one process (replicas = 1): exploration takes longer, but
-# token use never spikes.
+# Every agent has one worker. The shared router allows one reaction at a time
+# across the whole cycle to keep token use low while we observe it.
 #
 # Agents run unattended inside private clones expl makes for them, so these
 # let the CLIs edit files and run commands without asking.
@@ -39,11 +39,24 @@ trunk = "main"
 [workspace]
 frozen = ["*.md"]
 
-# Exploration is two agents routed by `weight` (each event goes to one of
-# them, 4:1): `explorer` searches where the goal promises the most;
-# `fringe` widens the frame — niche directions inside the goal nobody asked
-# for, and counterexamples that would work against it. Both enumerate
-# broadly; the planner ranks and weeds out.
+[routing]
+exploration = "all"
+planning = "all"
+verification = "all"
+evaluation = "all"
+
+[router.all]
+targets = ["explorers", "planner", "verifier", "evaluator"]
+policy = "first"
+concurrency = 1
+
+# Each exploration event goes to one perspective. The explorer searches
+# from a node, the fringe widens the search, and the surveyor reads the graph.
+[router.explorers]
+targets = ["explorer", "fringe", "surveyor"]
+policy = "weighted"
+weights = { explorer = 4, fringe = 1, surveyor = 1 }
+concurrency = 1
 
 [agent.explorer]
 role = "exploration"
@@ -52,7 +65,7 @@ command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
 env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
 replicas = 1
-weight = 4
+concurrency = 1
 breadth = 8
 speculate = true
 revisit_cooldown = 600
@@ -78,7 +91,7 @@ command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
 env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
 replicas = 1
-weight = 1
+concurrency = 1
 breadth = 8
 speculate = true
 instructions = """
@@ -108,7 +121,7 @@ command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
 env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
 replicas = 1
-weight = 1
+concurrency = 1
 breadth = 8
 instructions = """
 AGENTS.md describes the vision and architecture. You see the whole map at once: look for what
@@ -132,6 +145,7 @@ command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
 env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
 replicas = 1
+concurrency = 1
 instructions = """
 Markdown files (*.md) are frozen. Prune any step whose purpose is to add, edit, or delete a .md
 file. Exploration enumerates broadly on purpose: rank unlikely or counterproductive steps low
@@ -155,6 +169,7 @@ command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
 env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target" }
 replicas = 1
+concurrency = 1
 instructions = """
 This repository is expl itself (Rust workspace: expl_core, expl_cli, expl_ui). Follow AGENTS.md:
 keep its nouns and responsibilities, document public items, keep errors typed (thiserror).
@@ -177,6 +192,7 @@ args = ["--permission-mode", "bypassPermissions"]
 # a binary another clone's build had just overwritten.
 env = { CARGO_TARGET_DIR = "/Users/ab/Projects/expl/.expl/cargo-target-evaluator" }
 replicas = 1
+concurrency = 1
 instructions = """
 For a change: run `cargo clippy --all-targets` and `cargo test`. A goal is never satisfied by a
 branch on which either fails. For an investigation: there is nothing to build; check that the

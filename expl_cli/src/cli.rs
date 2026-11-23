@@ -117,7 +117,7 @@ pub(crate) enum Command {
                       its name is printed."
     )]
     Run(RunArgs),
-    /// Start processes until every agent has `replicas` running.
+    /// Start processes until each assigned agent has `replicas` running.
     Up(UpArgs),
     /// Stop every running process.
     Down(StopArgs),
@@ -364,7 +364,7 @@ pub(crate) struct EventLsArgs {
 /// `expl agent ...`.
 #[derive(Debug, Subcommand)]
 pub(crate) enum AgentCommand {
-    /// List declared agents with their running processes and backlog.
+    /// List declared agents with their concurrency, running processes, and backlog.
     Ls(ListingArgs),
 }
 
@@ -399,7 +399,7 @@ pub(crate) struct RunArgs {
     /// Exit after reacting to one event.
     #[arg(long)]
     pub(crate) once: bool,
-    /// Exit when no event is deliverable.
+    /// Exit when there is no work to deliver. Wait for shared capacity when needed.
     #[arg(long)]
     pub(crate) exit_when_idle: bool,
     /// Adopt a pre-created process record (used by `-d`).

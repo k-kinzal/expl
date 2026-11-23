@@ -34,6 +34,10 @@ pub(crate) fn up(start: &Path, args: &UpArgs) -> Result<(), CliError> {
         if !args.agents.is_empty() && !args.agents.contains(name) {
             continue;
         }
+        if !declaration.is_assigned(name) {
+            status(&format!("{name}: unassigned"));
+            continue;
+        }
         let running = live.iter().filter(|r| &r.agent == name).count();
         if running >= agent.replicas {
             status(&format!("{name}: {running}/{} running", agent.replicas));

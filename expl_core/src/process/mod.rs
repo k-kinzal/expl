@@ -14,6 +14,7 @@
 //! says `running` but stopped beating is reported as dead, and the leases
 //! it held expire so its events are delivered again.
 
+mod capacity;
 mod interrupt;
 // Defining module named for the concept it defines — the path echo is deliberate.
 mod process;

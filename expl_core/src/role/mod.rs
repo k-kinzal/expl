@@ -64,7 +64,7 @@ use crate::event::{Delivery, EventKind};
 use crate::graph::{Graph, GraphError, NodeId};
 
 /// One of the four responsibilities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     /// Identifies nodes that could lead toward goals.

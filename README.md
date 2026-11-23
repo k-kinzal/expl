@@ -58,9 +58,9 @@ expl down
 | `expl hypothesis ls` | Hypotheses evaluated as satisfying a goal: the origin each was explored from, how far behind it is, and whether it is already adopted |
 | `expl origin ls` | The lineage: every origin, oldest first, with what it adopted and how the trunk scored against each goal |
 | `expl event ls [--kind K]… [--agent NAME]` | The event log; with `--agent`, how that agent's deliveries stand |
-| `expl agent ls` | Declared agents: role, replicas, running processes, backlog |
+| `expl agent ls` | Declared agents, concurrency limits, running processes, backlog |
 | `expl run AGENT [-d] [--name N] [--once] [--exit-when-idle]` | Start a process of an agent (foreground, or detached with `-d`) |
-| `expl up [AGENT…]` | Start processes until each agent has `replicas` running |
+| `expl up [AGENT…]` | Start processes until each assigned agent has `replicas` running |
 | `expl down [-t SECS]` | Stop every running process |
 | `expl ps [-a]` (`expl process ls`) | List processes |
 | `expl logs PROC [-f]` | Print (or follow) a process log |
@@ -86,21 +86,49 @@ driver = "claude_code"          # claude_code | codex | generic
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
 replicas = 1                    # processes `expl up` keeps running
+concurrency = 1                 # simultaneous reactions across those processes
 breadth = 3                     # exploration only: proposals per reaction
-max_pending = 6                 # exploration only: pause while this many steps wait
 
 [agent.verifier]
 role = "verification"
 driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
-replicas = 2                    # two hypotheses are verified at once
+replicas = 2
+concurrency = 2
 instructions = "Run the test suite before finishing."
 ```
 
-You can declare several agents for one role, for example a Claude Code verifier and a Codex verifier. Each one receives every `node.ready`, and whichever process claims a step first verifies it. Agents run unattended in private clones under `.expl/worktrees/`, with the whole history and free use of git; the project's refs move only by expl and by you. `[workspace] frozen` lists git pathspecs a step's commit keeps as they were. The default lets Claude Code edit files and run commands without prompting.
+Agents run unattended in private clones under `.expl/worktrees/` with the whole Git history and free use of Git. Expl and the operator control the project's refs. `[workspace] frozen` lists Git pathspecs a step's commit keeps as they were. The default lets Claude Code edit files and run commands without prompting.
 
 A `generic` agent is any command that reads the prompt on stdin and prints a JSON object. expl sets `EXPL_AGENT`, `EXPL_ROLE`, `EXPL_EVENT`, `EXPL_NODE`, and `EXPL_RESPONSE_SCHEMA` for it.
+
+### Routing and concurrency
+
+`[routing]` assigns a role's events to an agent or a named router. A router can target agents and other routers. At each level expl considers the targets with agents for the event's role and applies that router's policy. `first` takes the first eligible target in order. `weighted` distributes events by relative weight, with a default weight of one per target. Expl records the selected agent for each role and event, so retries and restarts keep the same recipient while it is eligible.
+
+```toml
+[routing]
+exploration = "project"
+planning = "project"
+verification = "project"
+evaluation = "project"
+
+[router.project]
+targets = ["explorers", "planner", "verifier", "evaluator"]
+policy = "first"
+concurrency = 1
+
+[router.explorers]
+targets = ["explorer", "fringe"]
+policy = "weighted"
+weights = { explorer = 4, fringe = 1 }
+concurrency = 1
+```
+
+`concurrency` is a positive limit on simultaneous reactions shared by all processes of an agent or all agents under a router. A reaction must have room under the agent's limit and every router limit that covers it. The shared `project` router above limits the four roles to one reaction at a time. Assigning only exploration through `explorers` applies the group limit to exploration alone. `replicas` controls the number of workers started by `expl up`. The same limits apply to workers started with `expl run`. Restart workers after changing the routing or limits.
+
+Roles omitted from `[routing]` retain per-agent event delivery and any existing `weight` settings. Agents may omit `concurrency` to keep their existing execution behavior.
 
 ## License
 

@@ -2,8 +2,9 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, named_params, params};
 
+use crate::declaration::{Declaration, Route};
 use crate::event::{Event, EventId, EventKind};
 use crate::graph::NodeId;
 use crate::process::ProcessId;
@@ -71,6 +72,36 @@ pub enum InboxError {
 /// expired lease remains valid until its token is replaced by a takeover,
 /// revoked by a conflicting lease, or settled.
 const HELD_LEASE: &str = "status = 'leased' AND lease_token = ?3";
+
+// Legacy weighted routing acknowledged deliveries on every peer. Those
+// acknowledgments do not count as reactions when an event is reassigned.
+const ROUTED_AWAY_NOTE: &str = "ignored: routed to `*`";
+
+fn routed_away() -> String {
+    format!("(:role IS NOT NULL AND d.status = 'done' AND d.note GLOB '{ROUTED_AWAY_NOTE}')")
+}
+
+/// A routed event is eligible when unassigned, already ours, or stranded
+/// with a former recipient that neither settled it nor still holds it.
+/// With a NULL role in the join, every event passes (legacy fan-out).
+fn route_filter() -> String {
+    format!(
+        "(a.agent IS NULL OR a.agent = :agent OR (
+             a.agent NOT IN (SELECT value FROM json_each(:members)) AND NOT EXISTS (
+                 SELECT 1 FROM deliveries previous
+                 WHERE previous.event_id = e.id AND previous.agent = a.agent
+                 AND (previous.status = 'failed' OR
+                      (previous.status = 'done' AND
+                       COALESCE(previous.note, '') NOT GLOB '{ROUTED_AWAY_NOTE}') OR
+                      (previous.status = 'leased' AND previous.leased_until >= {EPOCH})))))"
+    )
+}
+
+pub(crate) enum Lease<T> {
+    Idle,
+    AtCapacity,
+    Granted(Delivery, T),
+}
 
 /// The deliveries of one agent. See the [module docs](crate::event).
 pub struct Inbox {
@@ -160,8 +191,33 @@ impl Inbox {
         exclusive: bool,
         max_attempts: i64,
     ) -> Result<Option<Delivery>, rusqlite::Error> {
+        match self.lease_with::<_, rusqlite::Error>(
+            kinds,
+            process,
+            exclusive,
+            max_attempts,
+            None,
+            || Ok(Some(())),
+        )? {
+            Lease::Granted(delivery, ()) => Ok(Some(delivery)),
+            Lease::Idle | Lease::AtCapacity => Ok(None),
+        }
+    }
+
+    /// Find or record an event's recipient before taking a delivery. Try
+    /// to acquire capacity only for work that belongs to this agent, and
+    /// leave the event unleased when no slot is available.
+    pub(crate) fn lease_with<T, E: From<rusqlite::Error>>(
+        &mut self,
+        kinds: &[EventKind],
+        process: ProcessId,
+        exclusive: bool,
+        max_attempts: i64,
+        route: Option<&Route<'_>>,
+        try_capacity: impl FnOnce() -> Result<Option<T>, E>,
+    ) -> Result<Lease<T>, E> {
         if kinds.is_empty() {
-            return Ok(None);
+            return Ok(Lease::Idle);
         }
         let tx = self
             .conn
@@ -176,43 +232,88 @@ impl Inbox {
                 |r| r.get(0),
             )?;
             if busy {
-                return Ok(None);
+                return Ok(Lease::AtCapacity);
             }
         }
-        let candidate = tx
-            .query_row(
-                &format!(
-                    "SELECT e.id, e.kind, e.node_id, e.created_at, COALESCE(d.attempts, 0) \
+        let role = route.map(|route| route.role.as_str());
+        let members = route.map(|route| serde_json::json!(route.members()).to_string());
+        let limit = if route.is_none() { "LIMIT 1" } else { "" };
+        let mut statement = tx.prepare(&format!(
+            "SELECT e.id, e.kind, e.node_id, e.created_at, \
+                    CASE WHEN {routed_away} THEN 0 ELSE COALESCE(d.attempts, 0) END, a.agent \
                      FROM events e \
-                     LEFT JOIN deliveries d ON d.agent = ?1 AND d.event_id = e.id \
+                     LEFT JOIN deliveries d ON d.agent = :agent AND d.event_id = e.id \
+                     LEFT JOIN assignments a ON a.role = :role AND a.event_id = e.id \
                      LEFT JOIN nodes n ON n.id = e.node_id \
                      WHERE e.kind IN ({kinds}) \
-                     AND (d.event_id IS NULL OR d.status = 'pending' \
+                     AND {route_filter} \
+                     AND (d.event_id IS NULL OR d.status = 'pending' OR {routed_away} \
                           OR (d.status = 'leased' AND d.leased_until < {EPOCH} \
-                              AND d.attempts < ?2)) \
+                              AND d.attempts < :max_attempts)) \
                      AND (e.node_id IS NULL OR NOT EXISTS ( \
                           SELECT 1 FROM deliveries x JOIN events y ON y.id = x.event_id \
-                          WHERE x.agent = ?1 AND x.status = 'leased' \
+                          WHERE x.agent = :agent AND x.status = 'leased' \
                           AND x.leased_until >= {EPOCH} \
                           AND y.node_id = e.node_id AND x.event_id <> e.id)) \
                      ORDER BY CASE WHEN e.kind = 'node.ready' THEN n.priority END DESC, \
-                     e.id LIMIT 1",
-                    kinds = kinds_sql(kinds)
-                ),
-                params![self.agent, max_attempts],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<i64>>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, i64>(4)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((id, kind, node, created_at, attempts)) = candidate else {
-            return Ok(None);
+                     e.id {limit}",
+            kinds = kinds_sql(kinds),
+            route_filter = route_filter(),
+            routed_away = routed_away()
+        ))?;
+        let candidates = statement.query_map(named_params! {
+            ":agent": self.agent, ":max_attempts": max_attempts, ":role": role, ":members": members,
+        }, |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        let mut assignments = Vec::new();
+        let mut candidate = None;
+        for next in candidates {
+            let next = next?;
+            let (id, _, _, _, _, owner) = &next;
+            if let Some(route) = route.filter(|_| owner.as_deref() != Some(&self.agent)) {
+                let chosen = route.select(EventId(*id));
+                assignments.push((*id, chosen, owner.clone()));
+                if chosen != self.agent {
+                    continue;
+                }
+            }
+            candidate = Some(next);
+            break;
+        }
+        drop(statement);
+        if !assignments.is_empty() {
+            let mut assign = tx.prepare_cached(
+                "INSERT INTO assignments (role, event_id, agent) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (role, event_id) DO UPDATE SET agent = excluded.agent",
+            )?;
+            let mut revoke = tx.prepare_cached(
+                "UPDATE deliveries SET lease_token = NULL \
+                 WHERE event_id = ?1 AND agent = ?2 AND status = 'leased'",
+            )?;
+            for (id, agent, former) in assignments {
+                if let Some(former) = former {
+                    // A former owner's lease is expired per the route filter.
+                    // It cannot renew after the event moves to another agent.
+                    revoke.execute(params![id, former])?;
+                }
+                assign.execute(params![role, id, agent])?;
+            }
+        }
+        let Some((id, kind, node, created_at, attempts, _)) = candidate else {
+            tx.commit()?;
+            return Ok(Lease::Idle);
+        };
+        let Some(capacity) = try_capacity()? else {
+            tx.commit()?;
+            return Ok(Lease::AtCapacity);
         };
         if exclusive || node.is_some() {
             // The checks above ruled out unexpired conflicts. Revoke the
@@ -232,17 +333,20 @@ impl Inbox {
                  (agent, event_id, status, process_id, attempts, leased_until, lease_token) \
                  VALUES (?1, ?2, 'leased', ?3, 1, {EPOCH} + {LEASE_SECONDS}, ?4) \
                  ON CONFLICT (agent, event_id) DO UPDATE SET status = 'leased', \
-                 process_id = ?3, attempts = attempts + 1, \
+                 process_id = ?3, attempts = ?5, \
                  leased_until = {EPOCH} + {LEASE_SECONDS}, lease_token = ?4, updated_at = {NOW}"
             ),
-            params![self.agent, id, process.0, token],
+            params![self.agent, id, process.0, token, attempts + 1],
         )?;
         tx.commit()?;
-        Ok(Some(Delivery {
-            event: event(id, &kind, node, created_at)?,
-            attempts: attempts + 1,
-            token: LeaseToken(token),
-        }))
+        Ok(Lease::Granted(
+            Delivery {
+                event: event(id, &kind, node, created_at)?,
+                attempts: attempts + 1,
+                token: LeaseToken(token),
+            },
+            capacity,
+        ))
     }
 
     fn lost(&self, delivery: &Delivery) -> InboxError {
@@ -503,18 +607,53 @@ impl Inbox {
     ///
     /// SQLite failure.
     pub fn backlog(&self, kinds: &[EventKind]) -> Result<usize, rusqlite::Error> {
+        self.count_backlog(kinds, None)
+    }
+
+    /// Backlog for an agent under the declaration's role assignments.
+    /// Unassigned events count until a process records their recipient.
+    ///
+    /// # Errors
+    ///
+    /// SQLite failure.
+    pub fn declared_backlog(
+        &self,
+        declaration: &Declaration,
+        role: Role,
+    ) -> Result<usize, rusqlite::Error> {
+        let route = declaration.explicit_route(role);
+        if route
+            .as_ref()
+            .is_some_and(|route| !route.members().contains(self.agent()))
+        {
+            return Ok(0);
+        }
+        self.count_backlog(role.reactions(), route.as_ref())
+    }
+
+    fn count_backlog(
+        &self,
+        kinds: &[EventKind],
+        route: Option<&Route<'_>>,
+    ) -> Result<usize, rusqlite::Error> {
         if kinds.is_empty() {
             return Ok(0);
         }
+        let role = route.map(|route| route.role.as_str());
+        let members = route.map(|route| serde_json::json!(route.members()).to_string());
         let count: i64 = self.conn.query_row(
             &format!(
                 "SELECT COUNT(*) FROM events e \
-                 LEFT JOIN deliveries d ON d.agent = ?1 AND d.event_id = e.id \
+                 LEFT JOIN deliveries d ON d.agent = :agent AND d.event_id = e.id \
+                 LEFT JOIN assignments a ON a.role = :role AND a.event_id = e.id \
                  WHERE e.kind IN ({kinds}) \
-                 AND (d.event_id IS NULL OR d.status IN ('pending', 'leased'))",
-                kinds = kinds_sql(kinds)
+                 AND {route_filter} \
+                 AND (d.event_id IS NULL OR d.status IN ('pending', 'leased') OR {routed_away})",
+                kinds = kinds_sql(kinds),
+                route_filter = route_filter(),
+                routed_away = routed_away()
             ),
-            [&self.agent],
+            named_params! {":agent": self.agent, ":role": role, ":members": members},
             |r| r.get(0),
         )?;
         Ok(count as usize)
@@ -684,6 +823,63 @@ mod tests {
             Err(InboxError::LeaseLost { event: lost, .. }) => assert_eq!(lost, event),
             other => panic!("expected a lost lease on {event}, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_route_reassigns_unfinished_legacy_work_when_its_owner_leaves() {
+        let f = fixture();
+        let role = Role::Planning;
+        let mut former = Inbox::open(&f.db, "former").expect("inbox");
+        let mut planner = Inbox::open(&f.db, "planner").expect("inbox");
+        let lease = |inbox: &mut Inbox| {
+            inbox
+                .lease(PROPOSED, ProcessId(1), false, 3)
+                .expect("lease")
+                .expect("event")
+        };
+        let abandoned = lease(&mut former);
+        former
+            .assign(role, abandoned.event.id, "former")
+            .expect("assignment");
+        let ignored = lease(&mut planner);
+        assert_eq!(ignored.event.id, abandoned.event.id);
+        planner
+            .ack(&ignored, Some("ignored: routed to `former`"))
+            .expect("ack");
+        let complete = lease(&mut former);
+        former
+            .assign(role, complete.event.id, "former")
+            .expect("assignment");
+        former.ack(&complete, Some("planned")).expect("ack");
+
+        let declaration = Declaration::parse(&format!(
+            "{}\n[routing]\nplanning = \"planner\"\n",
+            Declaration::TEMPLATE
+        ))
+        .expect("declaration");
+        let route = declaration.explicit_route(role).expect("route");
+        let take = |inbox: &mut Inbox| {
+            inbox
+                .lease_with::<_, rusqlite::Error>(
+                    PROPOSED,
+                    ProcessId(2),
+                    false,
+                    3,
+                    Some(&route),
+                    || Ok(Some(())),
+                )
+                .expect("lease")
+        };
+        assert!(matches!(take(&mut planner), Lease::Idle));
+        expire(&f.db, "former", abandoned.event.id);
+        let Lease::Granted(reassigned, ()) = take(&mut planner) else {
+            panic!("unfinished event was not reassigned");
+        };
+        assert_eq!(reassigned.event.id, abandoned.event.id);
+        assert_eq!(reassigned.attempts, 1);
+        assert_lost(former.renew(&abandoned), abandoned.event.id);
+        planner.ack(&reassigned, Some("planned")).expect("ack");
+        assert!(matches!(take(&mut planner), Lease::Idle));
     }
 
     #[test]

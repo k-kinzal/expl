@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::agent::Agent;
-use crate::event::{Delivery, Inbox, InboxError};
+use crate::event::{Delivery, Inbox, InboxError, Lease};
 use crate::graph::{Graph, GraphError, NodeId};
+use crate::process::capacity::Capacity;
 use crate::process::{HEARTBEAT_SECONDS, Interrupt, ProcessId, ProcessRecord, Processes};
 use crate::role::{Abandonment, Context, Reaction, Report, Role, RoleError};
 use crate::store::StoreError;
@@ -33,6 +34,9 @@ pub enum ProcessError {
     /// The database failed.
     #[error("process database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// A project-local reaction slot could not be opened or locked.
+    #[error("cannot use reaction slots: {0}")]
+    Capacity(#[from] std::io::Error),
     /// The graph failed.
     #[error(transparent)]
     Graph(#[from] GraphError),
@@ -227,17 +231,29 @@ impl<'a> Process<'a> {
         options: ProcessOptions,
         observer: &dyn ProcessObserver,
     ) -> Result<String, ProcessError> {
-        let database = self.context.project().database_path();
+        let project = self.context.project();
+        let database = project.database_path();
+        let declaration = self.context.declaration();
+        let role = self.agent.role();
+        let route = declaration.explicit_route(role);
+        if route
+            .as_ref()
+            .is_some_and(|route| !route.members().contains(self.agent.name()))
+        {
+            return Ok("agent is not assigned to its role".to_owned());
+        }
+        let capacity = Capacity::new(&project.state_dir(), self.agent, route.as_ref())?;
+        let shared_capacity = route
+            .as_ref()
+            .is_some_and(|route| route.groups(self.agent.name()).next().is_some());
         let mut inbox = Inbox::open(&database, self.agent.name())?;
         let mut graph = Graph::open(&database)?;
-        let role = self.agent.role();
-        let trunk = Trunk::new(
-            self.context.project(),
-            self.context.declaration().trunk.as_deref(),
-        );
+        let trunk = Trunk::new(project, declaration.trunk.as_deref());
+        let weighted =
+            route.is_none() && declaration.shares_with(self.agent.name(), self.agent.name());
+        let mut activity = "";
         let mut followed: Option<Instant> = None;
         let mut unfollowed: Option<String> = None;
-        let mut waiting = false;
         // Starts the first cooldown: a fresh process reacts to its backlog
         // before it wanders.
         let mut last_reaction = Instant::now();
@@ -264,49 +280,61 @@ impl<'a> Process<'a> {
                     }
                 }
             }
-            let weighted = self
-                .context
-                .declaration()
-                .shares_with(self.agent.name(), self.agent.name());
             let owner = weighted.then(|| self.agent.name());
             give_up_abandoned(role, owner, &inbox, &mut graph, observer)?;
-            let Some(delivery) =
-                inbox.lease(role.reactions(), self.id, role.is_exclusive(), MAX_ATTEMPTS)?
-            else {
-                if options.exit_when_idle {
-                    return Ok("idle".to_owned());
-                }
-                // Nothing to react to: after its cooldown, an exploration
-                // explores again from a starting point picked at random,
-                // explored before or not.
-                if role
-                    .revisit_cooldown(self.agent)
-                    .is_some_and(|cooldown| last_reaction.elapsed() >= cooldown)
-                    && revisit_at_random(
-                        &mut graph,
-                        self.agent.declaration().speculate == Some(true),
-                    )?
-                {
-                    // The cooldown runs from the revisit, wherever routing
-                    // sends it, so a role revisits once per cooldown.
-                    last_reaction = Instant::now();
-                    waiting = false;
+            let (delivery, slots) = match inbox.lease_with(
+                role.reactions(),
+                self.id,
+                role.is_exclusive(),
+                MAX_ATTEMPTS,
+                route.as_ref(),
+                || capacity.try_acquire().map_err(ProcessError::from),
+            )? {
+                Lease::Granted(delivery, slots) => (delivery, slots),
+                Lease::AtCapacity => {
+                    if activity != "waiting for capacity" {
+                        activity = "waiting for capacity";
+                        processes.set_activity(self.id, Some(activity))?;
+                    }
+                    thread::sleep(POLL);
                     continue;
                 }
-                if !waiting {
-                    processes.set_activity(self.id, Some("waiting for events"))?;
-                    waiting = true;
+                Lease::Idle => {
+                    if options.exit_when_idle {
+                        return Ok("idle".to_owned());
+                    }
+                    // Nothing to react to: after its cooldown, an exploration
+                    // explores again from a starting point picked at random,
+                    // explored before or not.
+                    if role
+                        .revisit_cooldown(self.agent)
+                        .is_some_and(|cooldown| last_reaction.elapsed() >= cooldown)
+                        && revisit_at_random(
+                            &mut graph,
+                            self.agent.declaration().speculate == Some(true),
+                        )?
+                    {
+                        // The cooldown runs from the revisit, wherever routing
+                        // sends it, so a role revisits once per cooldown.
+                        last_reaction = Instant::now();
+                        continue;
+                    }
+                    if activity != "waiting for events" {
+                        activity = "waiting for events";
+                        processes.set_activity(self.id, Some(activity))?;
+                    }
+                    thread::sleep(POLL);
+                    continue;
                 }
-                thread::sleep(POLL);
-                continue;
             };
-            waiting = false;
             // Agents sharing a role by weight react only to the events
             // assigned to them; the others are theirs to acknowledge. The
             // assignment is recorded before either, so processes that
             // loaded different weights still agree on the one recipient.
-            let declaration = self.context.declaration();
-            let owner = match declaration.route(self.agent.name(), delivery.event.id) {
+            let proposal = weighted
+                .then(|| declaration.route(self.agent.name(), delivery.event.id))
+                .flatten();
+            let owner = match proposal {
                 Some(proposed) => {
                     let owner = inbox.assign(role, delivery.event.id, proposed)?;
                     // Assigned to an agent no longer declared for the role
@@ -335,6 +363,7 @@ impl<'a> Process<'a> {
                 continue;
             }
             processes.set_activity(self.id, Some(&format!("reacting to {}", delivery.event)))?;
+            activity = "";
             observer.observe(&ProcessActivity::Reacting(&delivery));
 
             let covered = graph.last_event()?;
@@ -442,6 +471,12 @@ impl<'a> Process<'a> {
             processes.set_activity(self.id, None)?;
             if options.once {
                 return Ok("reacted to one event".to_owned());
+            }
+            drop(slots);
+            if shared_capacity {
+                // Let workers polling the same router see the slot before a
+                // worker with a deep backlog tries to take it again.
+                thread::sleep(POLL);
             }
         }
     }

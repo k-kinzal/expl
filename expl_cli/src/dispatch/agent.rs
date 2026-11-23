@@ -12,6 +12,7 @@ use crate::output::{Table, json_line, print, println};
 
 pub(crate) fn ls(start: &Path, listing: &ListingArgs) -> Result<(), CliError> {
     let context = load(start)?;
+    let declaration = context.declaration();
     let database = context.project().database_path();
     let live = processes(context.project())?.list(false)?;
     let mut table = Table::new(&[
@@ -19,17 +20,18 @@ pub(crate) fn ls(start: &Path, listing: &ListingArgs) -> Result<(), CliError> {
         "ROLE",
         "DRIVER",
         "REPLICAS",
+        "CONCURRENCY",
         "RUNNING",
         "BACKLOG",
         "REACTS TO",
     ]);
-    for (name, agent) in &context.declaration().agent {
+    for (name, agent) in &declaration.agent {
         if listing.quiet {
             println(name)?;
             continue;
         }
         let reactions = agent.role.reactions();
-        let backlog = Inbox::open(&database, name)?.backlog(reactions)?;
+        let backlog = Inbox::open(&database, name)?.declared_backlog(declaration, agent.role)?;
         let running = live.iter().filter(|r| &r.agent == name).count();
         let kinds: Vec<&str> = reactions.iter().map(|k| k.as_str()).collect();
         let drivers: Vec<_> = agent.clis().iter().map(|cli| cli.driver).collect();
@@ -41,6 +43,7 @@ pub(crate) fn ls(start: &Path, listing: &ListingArgs) -> Result<(), CliError> {
                 "driver": agent.driver,
                 "drivers": drivers,
                 "replicas": agent.replicas,
+                "concurrency": agent.concurrency,
                 "running": running,
                 "backlog": backlog,
                 "reacts_to": kinds,
@@ -52,6 +55,9 @@ pub(crate) fn ls(start: &Path, listing: &ListingArgs) -> Result<(), CliError> {
             agent.role.to_string(),
             labels.join("|"),
             agent.replicas.to_string(),
+            agent
+                .concurrency
+                .map_or_else(|| "-".to_owned(), |limit| limit.to_string()),
             running.to_string(),
             backlog.to_string(),
             kinds.join(", "),

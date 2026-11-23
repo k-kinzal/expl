@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 
@@ -19,6 +20,11 @@ use crate::agent::DriverKind;
 use crate::event::EventId;
 use crate::project::Project;
 use crate::role::Role;
+
+mod routing;
+
+pub(crate) use routing::Route;
+pub use routing::{RouterDeclaration, RoutingPolicy};
 
 /// Reading or validating `expl.toml` failed.
 #[derive(Debug, Error)]
@@ -134,6 +140,12 @@ pub struct Declaration {
     pub workspace: WorkspaceDeclaration,
     /// Named agents.
     pub agent: BTreeMap<String, AgentDeclaration>,
+    /// Named routers, whose targets are agents or other routers.
+    #[serde(default)]
+    pub router: BTreeMap<String, RouterDeclaration>,
+    /// Where to route the events of each explicitly assigned role.
+    #[serde(default)]
+    pub routing: BTreeMap<Role, String>,
 }
 
 /// `[workspace]`.
@@ -168,6 +180,9 @@ pub struct AgentDeclaration {
     pub instructions: Option<String>,
     /// Processes `expl up` keeps running.
     pub replicas: usize,
+    /// Maximum concurrent reactions of this agent across all its processes.
+    #[serde(default)]
+    pub concurrency: Option<NonZeroUsize>,
     /// Share of its role's events. Agents of one role that declare a
     /// weight split that role's events between them in proportion — each
     /// event goes to exactly one of them — instead of each reacting to
@@ -265,7 +280,7 @@ impl Declaration {
     pub const TEMPLATE: &'static str = r#"# expl declaration. See README.md and `expl --help`.
 #
 # Each [agent.<name>] is started as processes (`expl run <name>`, or
-# `expl up` for `replicas` of every agent). An agent reacts to the graph
+# `expl up` for `replicas` of each assigned agent). An agent reacts to the graph
 # events of its role:
 #   exploration  — goal.added, node.evaluated, origin.advanced → proposes hypotheses (steps);
 #                  when idle, every `revisit_cooldown` seconds it explores again
@@ -273,6 +288,12 @@ impl Declaration {
 #   planning     — node.proposed/evaluated/failed, goal.retired, origin.advanced → paths and priorities
 #   verification — node.ready                      → verifies the step: commits on its branch, or a finding
 #   evaluation   — node.completed, origin.advanced → whether it held, verdicts against goals
+#
+# Optional `concurrency` limits simultaneous reactions across an agent's
+# workers, including extra processes started by `expl run`. To route each
+# role's events to one agent, set its target in `[routing]`. A target can be
+# an agent or a `[router.<name>]` with `targets`, `policy` and `concurrency`.
+# Each router shares its concurrency limit across its assigned descendants.
 #
 # `driver` selects how the CLI is spoken to:
 #   claude_code  — `claude --print --output-format json --json-schema ...`
@@ -309,6 +330,7 @@ driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
 replicas = 1
+concurrency = 1
 breadth = 3
 revisit_cooldown = 600          # idle: explore again from a random node every 10 minutes
 
@@ -318,6 +340,7 @@ driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
 replicas = 1
+concurrency = 1
 
 [agent.verifier]
 role = "verification"
@@ -325,6 +348,7 @@ driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
 replicas = 2
+concurrency = 2
 
 [agent.evaluator]
 role = "evaluation"
@@ -332,6 +356,7 @@ driver = "claude_code"
 command = ["claude"]
 args = ["--permission-mode", "bypassPermissions"]
 replicas = 1
+concurrency = 1
 "#;
 
     /// The declaration `expl init` writes, following `trunk` (or with the
@@ -432,7 +457,7 @@ replicas = 1
                 }
             }
         }
-        Ok(())
+        self.validate_routing()
     }
 
     /// When the agent named `agent` shares its role's events by weight,
